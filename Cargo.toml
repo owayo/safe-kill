@@ -6,7 +6,7 @@ rust-version = "1.70"
 authors = ["safe-kill contributors"]
 description = "Safe process termination tool for AI agents with ancestry-based access control"
 license = "MIT"
-repository = "https://github.com/owa/safe-kill"
+repository = "https://github.com/owayo/safe-kill"
 keywords = ["process", "kill", "safety", "ai", "agent"]
 categories = ["command-line-utilities"]
 

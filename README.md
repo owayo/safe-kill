@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/owa/safe-kill/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owa/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main">
+  <a href="https://github.com/owayo/safe-kill/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/owayo/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main">
   </a>
-  <a href="https://github.com/owa/safe-kill/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owa/safe-kill">
+  <a href="https://github.com/owayo/safe-kill/releases/latest">
+    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-kill">
   </a>
   <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owa/safe-kill">
+    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-kill">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ cargo install --path .
 
 ### Binary Download
 
-Download the latest release from [Releases](https://github.com/owa/safe-kill/releases).
+Download the latest release from [Releases](https://github.com/owayo/safe-kill/releases).
 
 ## Quickstart
 
@@ -292,7 +292,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Security
 
-If you discover a security vulnerability, please report it via [GitHub Issues](https://github.com/owa/safe-kill/issues).
+If you discover a security vulnerability, please report it via [GitHub Issues](https://github.com/owayo/safe-kill/issues).
 
 ## License
 

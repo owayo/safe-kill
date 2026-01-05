@@ -5,14 +5,14 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/owa/safe-kill/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owa/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main">
+  <a href="https://github.com/owayo/safe-kill/actions/workflows/ci.yml">
+    <img alt="CI" src="https://github.com/owayo/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main">
   </a>
-  <a href="https://github.com/owa/safe-kill/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owa/safe-kill">
+  <a href="https://github.com/owayo/safe-kill/releases/latest">
+    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-kill">
   </a>
   <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owa/safe-kill">
+    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-kill">
   </a>
 </p>
 
@@ -51,7 +51,7 @@ cargo install --path .
 
 ### バイナリダウンロード
 
-[Releases](https://github.com/owa/safe-kill/releases) から最新版をダウンロード。
+[Releases](https://github.com/owayo/safe-kill/releases) から最新版をダウンロード。
 
 ## クイックスタート
 
@@ -292,7 +292,7 @@ cargo build --release
 
 ## セキュリティ
 
-セキュリティ脆弱性を発見した場合は、[GitHub Issues](https://github.com/owa/safe-kill/issues) で報告してください。
+セキュリティ脆弱性を発見した場合は、[GitHub Issues](https://github.com/owayo/safe-kill/issues) で報告してください。
 
 ## ライセンス
 
