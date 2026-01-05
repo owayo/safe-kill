@@ -76,10 +76,10 @@ safe-kill [OPTIONS] [PID]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--name <NAME>` | `-n` | Kill processes by name (pkill-style) |
+| `--name <NAME>` | `-N` | Kill processes by name (pkill-style) |
 | `--signal <SIGNAL>` | `-s` | Signal to send (default: SIGTERM) |
 | `--list` | `-l` | List killable processes |
-| `--dry-run` | `-d` | Preview without sending signals |
+| `--dry-run` | `-n` | Preview without sending signals |
 | `--help` | `-h` | Show help |
 | `--version` | `-V` | Show version |
 

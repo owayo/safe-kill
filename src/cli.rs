@@ -34,7 +34,7 @@ pub struct CliArgs {
     pub pid: Option<u32>,
 
     /// Kill processes by name (pkill-style)
-    #[arg(short, long, value_name = "NAME")]
+    #[arg(short = 'N', long, value_name = "NAME")]
     pub name: Option<String>,
 
     /// Signal to send (name or number)
