@@ -136,7 +136,8 @@ mod tests {
         // Verify that cargo version is accessible
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
-        assert_eq!(version, "0.1.0");
+        // Version format: YY.M.COUNTER (e.g., 26.1.100)
+        assert!(version.contains('.'), "Version should contain dots");
     }
 
     #[test]

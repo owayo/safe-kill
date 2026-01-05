@@ -2,7 +2,7 @@
 //!
 //! Provides cross-platform process information retrieval.
 
-use sysinfo::{Pid, System};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 /// Information about a single process
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,13 +26,13 @@ impl ProcessInfoProvider {
     /// Create a new ProcessInfoProvider with refreshed process list
     pub fn new() -> Self {
         let mut system = System::new_all();
-        system.refresh_processes();
+        system.refresh_processes(ProcessesToUpdate::All, true);
         Self { system }
     }
 
     /// Refresh the process list
     pub fn refresh(&mut self) {
-        self.system.refresh_processes();
+        self.system.refresh_processes(ProcessesToUpdate::All, true);
     }
 
     /// Get process information by PID
@@ -41,8 +41,12 @@ impl ProcessInfoProvider {
         self.system.process(sysinfo_pid).map(|proc| ProcessInfo {
             pid,
             parent_pid: proc.parent().map(|p| p.as_u32()),
-            name: proc.name().to_string(),
-            cmd: proc.cmd().to_vec(),
+            name: proc.name().to_string_lossy().to_string(),
+            cmd: proc
+                .cmd()
+                .iter()
+                .map(|s| s.to_string_lossy().to_string())
+                .collect(),
         })
     }
 
@@ -51,12 +55,16 @@ impl ProcessInfoProvider {
         self.system
             .processes()
             .iter()
-            .filter(|(_, proc)| proc.name() == name)
+            .filter(|(_, proc)| proc.name().to_string_lossy() == name)
             .map(|(pid, proc)| ProcessInfo {
                 pid: pid.as_u32(),
                 parent_pid: proc.parent().map(|p| p.as_u32()),
-                name: proc.name().to_string(),
-                cmd: proc.cmd().to_vec(),
+                name: proc.name().to_string_lossy().to_string(),
+                cmd: proc
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect(),
             })
             .collect()
     }
@@ -69,8 +77,12 @@ impl ProcessInfoProvider {
             .map(|(pid, proc)| ProcessInfo {
                 pid: pid.as_u32(),
                 parent_pid: proc.parent().map(|p| p.as_u32()),
-                name: proc.name().to_string(),
-                cmd: proc.cmd().to_vec(),
+                name: proc.name().to_string_lossy().to_string(),
+                cmd: proc
+                    .cmd()
+                    .iter()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .collect(),
             })
             .collect()
     }

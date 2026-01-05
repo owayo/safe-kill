@@ -200,7 +200,7 @@ fn test_version_option() {
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("0.1.0"));
+        .stdout(predicate::str::contains("safe-kill"));
 }
 
 #[test]
