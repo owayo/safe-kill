@@ -83,7 +83,7 @@ safe-kill [OPTIONS] [PID]
 | `--name <NAME>` | `-n` | プロセス名で終了（pkill形式） |
 | `--signal <SIGNAL>` | `-s` | 送信するシグナル（デフォルト: SIGTERM） |
 | `--list` | `-l` | 終了可能なプロセス一覧 |
-| `--dry-run` | | シグナルを送信せずにプレビュー |
+| `--dry-run` | `-d` | シグナルを送信せずにプレビュー |
 | `--help` | `-h` | ヘルプ表示 |
 | `--version` | `-V` | バージョン表示 |
 

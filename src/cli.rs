@@ -46,7 +46,7 @@ pub struct CliArgs {
     pub list: bool,
 
     /// Dry run mode (don't actually send signals)
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     pub dry_run: bool,
 }
 
