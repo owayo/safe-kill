@@ -6,6 +6,7 @@ use crate::ancestry::AncestryChecker;
 use crate::config::Config;
 use crate::error::SafeKillError;
 use crate::killer::{BatchKillResult, KillResult, ProcessKiller};
+use crate::port::PortDetector;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use crate::signal::Signal;
 
@@ -45,6 +46,7 @@ pub struct PolicyEngine {
     ancestry: AncestryChecker,
     killer: ProcessKiller,
     provider: ProcessInfoProvider,
+    port_detector: PortDetector,
 }
 
 impl PolicyEngine {
@@ -53,12 +55,14 @@ impl PolicyEngine {
         let provider = ProcessInfoProvider::new();
         let ancestry = AncestryChecker::new(ProcessInfoProvider::new());
         let killer = ProcessKiller::new();
+        let port_detector = PortDetector::new();
 
         Self {
             config,
             ancestry,
             killer,
             provider,
+            port_detector,
         }
     }
 
@@ -71,6 +75,7 @@ impl PolicyEngine {
     pub fn refresh(&mut self) {
         self.provider.refresh();
         self.ancestry.refresh();
+        self.port_detector.refresh();
     }
 
     /// Check if a process can be killed
@@ -166,6 +171,85 @@ impl PolicyEngine {
         }
 
         Ok(batch_result)
+    }
+
+    /// Kill processes by port
+    ///
+    /// Note: This does NOT apply ancestor check - only denylist is applied.
+    /// The rationale is that port-based killing targets specific services
+    /// regardless of process ancestry.
+    pub fn kill_by_port(
+        &self,
+        port: u16,
+        signal: Signal,
+        dry_run: bool,
+    ) -> Result<BatchKillResult, SafeKillError> {
+        // 1. Check if port is allowed by config
+        self.config.check_port_allowed(port)?;
+
+        // 2. Find processes on the port
+        let port_processes = self.port_detector.find_by_port(port)?;
+
+        if port_processes.is_empty() {
+            return Err(SafeKillError::NoProcessOnPort(port));
+        }
+
+        let mut batch_result = BatchKillResult::new();
+
+        // 3. For each process, apply only suicide prevention and denylist checks
+        for pp in port_processes {
+            // Get full process info if available
+            let process_name = self
+                .provider
+                .get(pp.pid)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| pp.name.clone());
+
+            // Check permission (only suicide prevention and denylist)
+            let permission = self.can_kill_for_port(pp.pid, &process_name);
+
+            let result = if permission.is_allowed() {
+                self.killer
+                    .kill_with_result(pp.pid, &process_name, signal, dry_run)
+            } else {
+                let error = match permission {
+                    KillPermission::DeniedByDenylist(ref name) => {
+                        SafeKillError::Denylisted(name.clone())
+                    }
+                    KillPermission::DeniedSuicidePrevention => {
+                        SafeKillError::SuicidePrevention(pp.pid)
+                    }
+                    _ => SafeKillError::SystemError("Unexpected permission".to_string()),
+                };
+                KillResult::failure(pp.pid, &process_name, &error)
+            };
+
+            batch_result.add(result);
+        }
+
+        Ok(batch_result)
+    }
+
+    /// Check if a process can be killed for port-based killing
+    ///
+    /// This is a simplified check that only applies:
+    /// 1. Suicide prevention (cannot kill self or parent)
+    /// 2. Denylist check
+    ///
+    /// It does NOT apply ancestor check or allowlist (those are for PID-based killing).
+    fn can_kill_for_port(&self, pid: u32, name: &str) -> KillPermission {
+        // 1. Check suicide prevention first (highest priority)
+        if self.ancestry.is_suicide(pid) {
+            return KillPermission::DeniedSuicidePrevention;
+        }
+
+        // 2. Check denylist
+        if self.config.is_denied(name) {
+            return KillPermission::DeniedByDenylist(name.to_string());
+        }
+
+        // Port-based killing is allowed if not denied
+        KillPermission::Allowed
     }
 
     /// List all processes that can be killed
@@ -268,6 +352,7 @@ mod tests {
                 processes: vec!["node".to_string()],
             }),
             denylist: None,
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
         assert!(engine.config().is_allowed("node"));
@@ -307,6 +392,7 @@ mod tests {
             denylist: Some(ProcessList {
                 processes: vec!["test_denied_process".to_string()],
             }),
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
 
@@ -332,6 +418,7 @@ mod tests {
                 processes: vec!["test_allowed_process".to_string()],
             }),
             denylist: None,
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
 
@@ -357,6 +444,7 @@ mod tests {
             denylist: Some(ProcessList {
                 processes: vec!["conflicted_process".to_string()],
             }),
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
 
@@ -460,6 +548,7 @@ mod tests {
             denylist: Some(ProcessList {
                 processes: vec!["safe-kill".to_string()], // Add self to denylist
             }),
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
         let current_pid = ProcessInfoProvider::current_pid();
@@ -480,6 +569,7 @@ mod tests {
             denylist: Some(ProcessList {
                 processes: vec!["both_listed".to_string()],
             }),
+            allowed_ports: None,
         };
         let engine = PolicyEngine::new(config);
 
@@ -494,5 +584,144 @@ mod tests {
             KillPermission::DeniedByDenylist(_) => {}
             other => panic!("Expected DeniedByDenylist, got {:?}", other),
         }
+    }
+
+    // kill_by_port tests
+    #[test]
+    fn test_kill_by_port_no_process() {
+        use crate::config::AllowedPorts;
+
+        // Explicit allowed_ports configuration (None means port killing is disabled)
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec!["3000-3010".to_string()],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+        // Port 3009 is allowed but no process on it
+        let result = engine.kill_by_port(3009, Signal::SIGTERM, false);
+        assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(3009))));
+    }
+
+    #[test]
+    fn test_kill_by_port_no_config_disabled() {
+        // When allowed_ports is None, port killing is disabled entirely
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: None,
+        };
+        let engine = PolicyEngine::new(config);
+
+        // Any port should return PortNotAllowed when config is None
+        let result = engine.kill_by_port(3000, Signal::SIGTERM, false);
+        assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
+    }
+
+    #[test]
+    fn test_kill_by_port_port_not_allowed() {
+        use crate::config::AllowedPorts;
+
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec!["3000".to_string(), "8080".to_string()],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+
+        // Port 59996 is not in allowed list
+        let result = engine.kill_by_port(59996, Signal::SIGTERM, false);
+        assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
+    }
+
+    #[test]
+    fn test_kill_by_port_with_allowed_config() {
+        use crate::config::AllowedPorts;
+
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec!["59995".to_string()],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+
+        // Port 59995 is allowed but no process on it
+        let result = engine.kill_by_port(59995, Signal::SIGTERM, false);
+        assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59995))));
+    }
+
+    #[test]
+    fn test_kill_by_port_dry_run_no_process() {
+        use crate::config::AllowedPorts;
+
+        // Explicit allowed_ports configuration (None means port killing is disabled)
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec!["3000-3010".to_string()],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+        // dry_run should still check if process exists
+        let result = engine.kill_by_port(3008, Signal::SIGTERM, true);
+        assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(3008))));
+    }
+
+    // can_kill_for_port tests
+    #[test]
+    fn test_can_kill_for_port_allowed() {
+        let engine = PolicyEngine::with_defaults();
+        // Random PID that's not self and not in denylist
+        let permission = engine.can_kill_for_port(99999, "random_process");
+        assert_eq!(permission, KillPermission::Allowed);
+    }
+
+    #[test]
+    fn test_can_kill_for_port_suicide_prevention() {
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let permission = engine.can_kill_for_port(current_pid, "safe-kill");
+        assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
+    }
+
+    #[test]
+    fn test_can_kill_for_port_denylisted() {
+        let config = Config {
+            allowlist: None,
+            denylist: Some(ProcessList {
+                processes: vec!["denylisted_server".to_string()],
+            }),
+            allowed_ports: None,
+        };
+        let engine = PolicyEngine::new(config);
+
+        let permission = engine.can_kill_for_port(99999, "denylisted_server");
+        match permission {
+            KillPermission::DeniedByDenylist(name) => {
+                assert_eq!(name, "denylisted_server");
+            }
+            other => panic!("Expected DeniedByDenylist, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_can_kill_for_port_no_ancestor_check() {
+        // Verify that can_kill_for_port does NOT check ancestry
+        // This is by design: port-based killing only applies denylist
+        let engine = PolicyEngine::with_defaults();
+
+        // A random process that is definitely NOT a descendant
+        // but should still be allowed if not in denylist
+        // Note: On macOS, "launchd" might be in default denylist
+        // So we use a generic name for this test
+        let permission = engine.can_kill_for_port(99999, "some_random_server");
+        assert_eq!(permission, KillPermission::Allowed);
     }
 }

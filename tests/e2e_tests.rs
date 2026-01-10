@@ -430,3 +430,166 @@ fn test_special_characters_in_name() {
         .failure()
         .stderr(predicate::str::contains("not found").or(predicate::str::contains("No matching")));
 }
+
+// =============================================================================
+// --port オプションのテスト (Task 10.1)
+// =============================================================================
+
+#[test]
+fn test_help_shows_port_option() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--port").and(predicate::str::contains("-p")));
+}
+
+#[test]
+fn test_port_no_process_on_port() {
+    // Use an unlikely port number that should have no process
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port")
+        .arg("59997")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59997")));
+}
+
+#[test]
+fn test_port_with_dry_run_no_process() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port")
+        .arg("59998")
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59998")));
+}
+
+#[test]
+fn test_port_short_option() {
+    // Test -p short form
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("-p")
+        .arg("59996")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59996")));
+}
+
+#[test]
+fn test_port_and_pid_mutually_exclusive() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port")
+        .arg("8080")
+        .arg("12345")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be combined"));
+}
+
+#[test]
+fn test_port_and_name_mutually_exclusive() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port")
+        .arg("8080")
+        .arg("--name")
+        .arg("some_process")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be combined"));
+}
+
+#[test]
+fn test_port_and_list_mutually_exclusive() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port")
+        .arg("8080")
+        .arg("--list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be combined"));
+}
+
+#[test]
+fn test_port_invalid_port_number() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port").arg("not_a_number").assert().failure();
+}
+
+#[test]
+fn test_port_out_of_range() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--port").arg("99999").assert().failure();
+}
+
+// =============================================================================
+// init サブコマンドのテスト (Task 10.2)
+// =============================================================================
+
+#[test]
+fn test_init_help() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("init")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--force").or(predicate::str::contains("-f")));
+}
+
+#[test]
+fn test_init_force_creates_config() {
+    // Test that init --force runs successfully
+    // The actual config file location is determined by dirs crate
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("init")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created").or(predicate::str::contains("config")));
+}
+
+#[test]
+fn test_init_output_shows_hint() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("init")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Hint").and(predicate::str::contains("--port")));
+}
+
+#[test]
+fn test_init_creates_valid_toml() {
+    use std::fs;
+
+    // Run init --force
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("init").arg("--force").assert().success();
+
+    // Get the path from the output and verify the content
+    // The actual path depends on the platform, but we can check the config content
+    // by reading from the expected location
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap();
+        let config_path = format!("{}/Library/Application Support/safe-kill/config.toml", home);
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            // Verify it's valid TOML and contains expected sections
+            assert!(content.contains("[allowed_ports]"));
+            assert!(content.contains("ports ="));
+            assert!(content.contains("# [allowlist]"));
+            assert!(content.contains("# [denylist]"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").unwrap();
+        let config_path = format!("{}/.config/safe-kill/config.toml", home);
+        if let Ok(content) = fs::read_to_string(&config_path) {
+            assert!(content.contains("[allowed_ports]"));
+            assert!(content.contains("ports ="));
+        }
+    }
+}

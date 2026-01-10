@@ -7,6 +7,7 @@ use std::process::ExitCode;
 
 use safe_kill::cli::{CliArgs, ExecutionMode};
 use safe_kill::error::SafeKillError;
+use safe_kill::init::InitCommand;
 use safe_kill::killer::BatchKillResult;
 use safe_kill::policy::PolicyEngine;
 use safe_kill::process_info;
@@ -60,6 +61,25 @@ fn run() -> Result<(), SafeKillError> {
             print_killable_list(&processes);
             Ok(())
         }
+        ExecutionMode::KillByPort(port) => {
+            let batch_result = engine.kill_by_port(port, signal, args.dry_run)?;
+            print_port_kill_result(port, &batch_result);
+            if batch_result.any_success() {
+                Ok(())
+            } else if batch_result.results.is_empty() {
+                Err(SafeKillError::NoProcessOnPort(port))
+            } else {
+                Err(SafeKillError::NoTarget)
+            }
+        }
+        ExecutionMode::InitConfig { force } => {
+            let path = InitCommand::execute(force)?;
+            println!("Created: {}", path.display());
+            println!();
+            println!("Hint: Edit the config file to customize allowed ports and process lists.");
+            println!("      Then use `safe-kill --port <PORT>` to kill processes by port.");
+            Ok(())
+        }
     }
 }
 
@@ -74,6 +94,17 @@ fn print_batch_result(result: &BatchKillResult) {
     println!(
         "Matched {} process(es), killed {}:",
         result.total_matched, result.total_killed
+    );
+    for r in &result.results {
+        print_kill_result(&r.name, r.pid, r.success, &r.message);
+    }
+}
+
+/// Print port kill results
+fn print_port_kill_result(port: u16, result: &BatchKillResult) {
+    println!(
+        "Port {}: Found {} process(es), killed {}:",
+        port, result.total_matched, result.total_killed
     );
     for r in &result.results {
         print_kill_result(&r.name, r.pid, r.success, &r.message);

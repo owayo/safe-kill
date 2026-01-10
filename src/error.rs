@@ -16,6 +16,8 @@ pub enum SafeKillExitCode {
     PermissionDenied = 2,
     /// Configuration file error
     ConfigError = 3,
+    /// Port not allowed by configuration
+    PortNotAllowed = 4,
     /// General/other error
     GeneralError = 255,
 }
@@ -59,6 +61,27 @@ pub enum SafeKillError {
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
 
+    // Port-related errors
+    /// No process found listening on the specified port
+    #[error("No process found on port {0}")]
+    NoProcessOnPort(u16),
+
+    /// Port is not in the allowed ports list
+    #[error("Port {port} is not allowed. {hint}")]
+    PortNotAllowed { port: u16, hint: String },
+
+    /// Failed to detect processes on port
+    #[error("Failed to detect process on port {port}: {reason}")]
+    PortDetectionError { port: u16, reason: String },
+
+    /// Invalid port range format
+    #[error("Invalid port range format: {0}")]
+    InvalidPortRange(String),
+
+    /// Failed to create configuration file
+    #[error("Failed to create config file: {0}")]
+    ConfigCreationError(String),
+
     // System errors
     /// Permission denied for operation
     #[error("Permission denied for PID {0}")]
@@ -77,11 +100,14 @@ impl SafeKillError {
     /// Get the appropriate exit code for this error
     pub fn exit_code(&self) -> SafeKillExitCode {
         match self {
-            SafeKillError::NoTarget | SafeKillError::ProcessNotFound(_) => {
-                SafeKillExitCode::NoTarget
-            }
+            SafeKillError::NoTarget
+            | SafeKillError::ProcessNotFound(_)
+            | SafeKillError::NoProcessOnPort(_) => SafeKillExitCode::NoTarget,
             SafeKillError::PermissionDenied(_) => SafeKillExitCode::PermissionDenied,
-            SafeKillError::ConfigError(_) => SafeKillExitCode::ConfigError,
+            SafeKillError::ConfigError(_) | SafeKillError::ConfigCreationError(_) => {
+                SafeKillExitCode::ConfigError
+            }
+            SafeKillError::PortNotAllowed { .. } => SafeKillExitCode::PortNotAllowed,
             _ => SafeKillExitCode::GeneralError,
         }
     }
@@ -97,6 +123,7 @@ mod tests {
         assert_eq!(SafeKillExitCode::NoTarget as u8, 1);
         assert_eq!(SafeKillExitCode::PermissionDenied as u8, 2);
         assert_eq!(SafeKillExitCode::ConfigError as u8, 3);
+        assert_eq!(SafeKillExitCode::PortNotAllowed as u8, 4);
         assert_eq!(SafeKillExitCode::GeneralError as u8, 255);
     }
 
@@ -179,6 +206,52 @@ mod tests {
         assert_eq!(err.to_string(), "System error: IO error");
     }
 
+    // Port-related error tests
+    #[test]
+    fn test_no_process_on_port_error_message() {
+        let err = SafeKillError::NoProcessOnPort(8080);
+        assert_eq!(err.to_string(), "No process found on port 8080");
+    }
+
+    #[test]
+    fn test_port_not_allowed_error_message() {
+        let err = SafeKillError::PortNotAllowed {
+            port: 22,
+            hint: "Add 22 to [allowed_ports] in config.toml".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Port 22 is not allowed. Add 22 to [allowed_ports] in config.toml"
+        );
+    }
+
+    #[test]
+    fn test_port_detection_error_message() {
+        let err = SafeKillError::PortDetectionError {
+            port: 3000,
+            reason: "permission denied".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Failed to detect process on port 3000: permission denied"
+        );
+    }
+
+    #[test]
+    fn test_invalid_port_range_error_message() {
+        let err = SafeKillError::InvalidPortRange("abc-def".to_string());
+        assert_eq!(err.to_string(), "Invalid port range format: abc-def");
+    }
+
+    #[test]
+    fn test_config_creation_error_message() {
+        let err = SafeKillError::ConfigCreationError("directory not found".to_string());
+        assert_eq!(
+            err.to_string(),
+            "Failed to create config file: directory not found"
+        );
+    }
+
     #[test]
     fn test_error_to_exit_code_no_target() {
         assert_eq!(
@@ -208,6 +281,54 @@ mod tests {
         assert_eq!(
             SafeKillError::ConfigError("error".to_string()).exit_code(),
             SafeKillExitCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_no_process_on_port() {
+        assert_eq!(
+            SafeKillError::NoProcessOnPort(8080).exit_code(),
+            SafeKillExitCode::NoTarget
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_port_not_allowed() {
+        assert_eq!(
+            SafeKillError::PortNotAllowed {
+                port: 22,
+                hint: "hint".to_string()
+            }
+            .exit_code(),
+            SafeKillExitCode::PortNotAllowed
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_config_creation_error() {
+        assert_eq!(
+            SafeKillError::ConfigCreationError("error".to_string()).exit_code(),
+            SafeKillExitCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_port_detection_error() {
+        assert_eq!(
+            SafeKillError::PortDetectionError {
+                port: 3000,
+                reason: "error".to_string()
+            }
+            .exit_code(),
+            SafeKillExitCode::GeneralError
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_invalid_port_range() {
+        assert_eq!(
+            SafeKillError::InvalidPortRange("bad".to_string()).exit_code(),
+            SafeKillExitCode::GeneralError
         );
     }
 

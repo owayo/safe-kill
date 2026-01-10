@@ -82,6 +82,7 @@ safe-kill [OPTIONS] [PID]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--name <NAME>` | `-N` | Kill processes by name (pkill-style) |
+| `--port <PORT>` | `-p` | Kill process using the specified port |
 | `--signal <SIGNAL>` | `-s` | Signal to send (default: SIGTERM) |
 | `--list` | `-l` | List killable processes |
 | `--dry-run` | `-n` | Preview without sending signals |
@@ -115,13 +116,16 @@ safe-kill -s 9 12345
 # Kill all node processes in session
 safe-kill --name node
 
+# Kill process using port 3000
+safe-kill --port 3000
+
 # List what would be killed
 safe-kill --name python --dry-run
 ```
 
 ## Configuration
 
-Create `~/.safe-kill.toml` to customize behavior:
+Initialize configuration with `safe-kill init`, or create `~/.config/safe-kill/config.toml` manually:
 
 ```toml
 # Processes that bypass ancestry checks (use with caution)
@@ -131,6 +135,14 @@ processes = ["my-trusted-app"]
 # Processes that can never be killed (takes precedence over allowlist)
 [denylist]
 processes = ["launchd", "systemd", "init", "kernel_task"]
+
+# Allowed ports for --port option
+# If not specified, --port option is disabled (no ports can be killed)
+[allowed_ports]
+ports = ["1420", "3000-3010", "8080"]
+#   - 1420: Tauri dev server
+#   - 3000-3010: Node.js dev servers
+#   - 8080: HTTP alternative port
 ```
 
 ### Default Denylist
@@ -171,15 +183,15 @@ flowchart TB
         window["WindowServer"]
     end
 
-    subgraph other["Other User Processes 🛡️"]
+    subgraph other["Other User Processes"]
         vscode["VS Code<br/>(node)"]
         browser["Browser<br/>(chrome)"]
-        slack["Slack"]
+        otherdev["Other terminal<br/>(node :3000) 🔓"]
     end
 
     subgraph session["AI Agent Session ✅"]
         shell["Claude Code<br/>(shell)"]
-        shell --> server["npm run dev<br/>(node)"]
+        shell --> server["npm run dev<br/>(node :3000)"]
         shell --> test["cargo test"]
         shell --> build["npm run build"]
         server --> worker["worker.js"]
@@ -188,22 +200,28 @@ flowchart TB
     init --> shell
     init --> vscode
     init --> browser
+    init --> otherdev
 
     style system fill:#ffcccc,stroke:#cc0000,color:#000000
-    style other fill:#ffcccc,stroke:#cc0000,color:#000000
+    style other fill:#ffffcc,stroke:#cc9900,color:#000000
     style session fill:#ccffcc,stroke:#00cc00,color:#000000
+    style otherdev fill:#ccffcc,stroke:#00cc00,color:#000000
 ```
 
-| Process | Killable | Reason |
-|---------|----------|--------|
-| `npm run dev` | ✅ Yes | Descendant of current session |
-| `worker.js` | ✅ Yes | Child of session process |
-| `cargo test` | ✅ Yes | Descendant of current session |
-| VS Code (`node`) | ❌ No | Not a descendant |
-| Browser | ❌ No | Not a descendant |
-| `launchd`/`systemd` | ❌ No | System process (denylist) |
+| Process | Killable by `--name` | Killable by `--port` | Reason |
+|---------|---------------------|----------------------|--------|
+| `npm run dev` (:3000) | ✅ Yes | ✅ Yes | Descendant of session |
+| `worker.js` | ✅ Yes | - | Child of session process |
+| `cargo test` | ✅ Yes | - | Descendant of session |
+| Other terminal (:3000) | ❌ No | ✅ Yes | Port in allowed_ports (bypasses ancestry) |
+| VS Code (`node`) | ❌ No | ❌ No | Not a descendant, no allowed port |
+| Browser | ❌ No | ❌ No | Not a descendant |
+| `launchd`/`systemd` | ❌ No | ❌ No | System process (denylist) |
 
-**Key Point**: Even if you run `safe-kill -n node`, only the `node` processes within your session (green area) are terminated. VS Code and other applications using `node` are protected.
+**Key Points**:
+- `safe-kill --name node`: Only `node` processes within your session (green area) are terminated. Requires ancestry check.
+- `safe-kill --port 3000`: Kills process using port 3000 **regardless of ancestry** if port is in `allowed_ports`. Useful for killing orphaned dev servers started in other terminals.
+- `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled.
 
 ## Exit Codes
 
@@ -257,12 +275,13 @@ Add to your `CLAUDE.md`:
 ## Process Management Rules
 
 - Do NOT use `kill`, `pkill`, or `killall`. These are restricted for safety.
-- Use `safe-kill <PID>` or `safe-kill --name <PROCESS_NAME>` to terminate processes.
+- Use `safe-kill <PID>`, `safe-kill --name <PROCESS_NAME>`, or `safe-kill --port <PORT>` to terminate processes.
 - `safe-kill` will automatically verify that the target process is a child of your session.
 - If `safe-kill` fails, the process is likely not owned by you.
 
 ### Examples
 - Terminate a test server: `safe-kill --name node`
+- Terminate a process using port 3000: `safe-kill --port 3000`
 - Force kill a stuck process: `safe-kill -s 9 <PID>`
 - Preview what would be killed: `safe-kill --name python --dry-run`
 ```

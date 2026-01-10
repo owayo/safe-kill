@@ -82,6 +82,7 @@ safe-kill [OPTIONS] [PID]
 | オプション | 短縮形 | 説明 |
 |-----------|-------|------|
 | `--name <NAME>` | `-N` | プロセス名で終了（pkill形式） |
+| `--port <PORT>` | `-p` | 指定したポートを使用するプロセスを終了 |
 | `--signal <SIGNAL>` | `-s` | 送信するシグナル（デフォルト: SIGTERM） |
 | `--list` | `-l` | 終了可能なプロセス一覧 |
 | `--dry-run` | `-n` | シグナルを送信せずにプレビュー |
@@ -115,13 +116,16 @@ safe-kill -s 9 12345
 # セッション内のすべてのnodeプロセスを終了
 safe-kill --name node
 
+# ポート3000を使用するプロセスを終了
+safe-kill --port 3000
+
 # 終了対象をプレビュー
 safe-kill --name python --dry-run
 ```
 
 ## 設定
 
-`~/.safe-kill.toml` を作成して動作をカスタマイズ:
+`safe-kill init` で設定を初期化するか、`~/.config/safe-kill/config.toml` を手動で作成:
 
 ```toml
 # 親子関係チェックをバイパスするプロセス（慎重に使用）
@@ -131,6 +135,14 @@ processes = ["my-trusted-app"]
 # 絶対に終了できないプロセス（許可リストより優先）
 [denylist]
 processes = ["launchd", "systemd", "init", "kernel_task"]
+
+# --port オプションで許可するポート
+# 指定しない場合、--port オプションは無効（ポート指定でのkillは不可）
+[allowed_ports]
+ports = ["1420", "3000-3010", "8080"]
+#   - 1420: Tauri開発サーバー
+#   - 3000-3010: Node.js開発サーバー
+#   - 8080: HTTP代替ポート
 ```
 
 ### デフォルト拒否リスト
@@ -171,15 +183,15 @@ flowchart TB
         window["WindowServer"]
     end
 
-    subgraph other["他のユーザープロセス 🛡️"]
+    subgraph other["他のユーザープロセス"]
         vscode["VS Code<br/>(node)"]
         browser["ブラウザ<br/>(chrome)"]
-        slack["Slack"]
+        otherdev["別ターミナル<br/>(node :3000) 🔓"]
     end
 
     subgraph session["AIエージェントセッション ✅"]
         shell["Claude Code<br/>(shell)"]
-        shell --> server["npm run dev<br/>(node)"]
+        shell --> server["npm run dev<br/>(node :3000)"]
         shell --> test["cargo test"]
         shell --> build["npm run build"]
         server --> worker["worker.js"]
@@ -188,22 +200,28 @@ flowchart TB
     init --> shell
     init --> vscode
     init --> browser
+    init --> otherdev
 
     style system fill:#ffcccc,stroke:#cc0000,color:#000000
-    style other fill:#ffcccc,stroke:#cc0000,color:#000000
+    style other fill:#ffffcc,stroke:#cc9900,color:#000000
     style session fill:#ccffcc,stroke:#00cc00,color:#000000
+    style otherdev fill:#ccffcc,stroke:#00cc00,color:#000000
 ```
 
-| プロセス | 終了可能 | 理由 |
-|---------|----------|------|
-| `npm run dev` | ✅ 可能 | 現在のセッションの子孫 |
-| `worker.js` | ✅ 可能 | セッションプロセスの子 |
-| `cargo test` | ✅ 可能 | 現在のセッションの子孫 |
-| VS Code (`node`) | ❌ 不可 | 子孫ではない |
-| ブラウザ | ❌ 不可 | 子孫ではない |
-| `launchd`/`systemd` | ❌ 不可 | システムプロセス（拒否リスト） |
+| プロセス | `--name`で終了 | `--port`で終了 | 理由 |
+|---------|---------------------|----------------------|--------|
+| `npm run dev` (:3000) | ✅ 可能 | ✅ 可能 | セッションの子孫 |
+| `worker.js` | ✅ 可能 | - | セッションプロセスの子 |
+| `cargo test` | ✅ 可能 | - | セッションの子孫 |
+| 別ターミナル (:3000) | ❌ 不可 | ✅ 可能 | allowed_portsに含まれる（親子関係をバイパス） |
+| VS Code (`node`) | ❌ 不可 | ❌ 不可 | 子孫ではない、許可ポートなし |
+| ブラウザ | ❌ 不可 | ❌ 不可 | 子孫ではない |
+| `launchd`/`systemd` | ❌ 不可 | ❌ 不可 | システムプロセス（拒否リスト） |
 
-**ポイント**: `safe-kill -n node` を実行しても、セッション内（緑のエリア）の `node` プロセスのみが終了されます。VS Code など他のアプリケーションの `node` は保護されます。
+**ポイント**:
+- `safe-kill --name node`: セッション内（緑のエリア）の `node` プロセスのみが終了。親子関係チェック必須。
+- `safe-kill --port 3000`: ポート3000が `allowed_ports` に設定されていれば、**親子関係に関係なく**終了可能。別ターミナルで起動したままの開発サーバー等を終了する場合に便利。
+- `--port` オプションは `config.toml` での明示的な設定が必要です。設定がない場合、ポート指定でのkillは無効です。
 
 ## 終了コード
 
@@ -257,12 +275,13 @@ Claude Code で `kill`/`pkill` コマンドの代わりに `safe-kill` を使用
 ## プロセス管理ルール
 
 - `kill`、`pkill`、`killall` を直接使用しないでください。安全のため制限されています。
-- プロセスを終了するには `safe-kill <PID>` または `safe-kill --name <プロセス名>` を使用してください。
+- プロセスを終了するには `safe-kill <PID>`、`safe-kill --name <プロセス名>`、または `safe-kill --port <ポート>` を使用してください。
 - `safe-kill` はターゲットプロセスがセッションの子孫であることを自動的に検証します。
 - `safe-kill` が失敗した場合、そのプロセスはあなたの管理下にない可能性があります。
 
 ### 使用例
 - テストサーバーを終了: `safe-kill --name node`
+- ポート3000を使用するプロセスを終了: `safe-kill --port 3000`
 - スタックしたプロセスを強制終了: `safe-kill -s 9 <PID>`
 - 終了対象をプレビュー: `safe-kill --name python --dry-run`
 ```

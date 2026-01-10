@@ -123,6 +123,7 @@ fn test_config_apply_in_policy_engine() {
         denylist: Some(ProcessList {
             processes: vec!["denied_test".to_string()],
         }),
+        allowed_ports: None,
     };
 
     let engine = PolicyEngine::new(config);
@@ -174,6 +175,7 @@ fn test_config_denylist_precedence_over_allowlist() {
         denylist: Some(ProcessList {
             processes: vec!["conflict".to_string()],
         }),
+        allowed_ports: None,
     };
 
     // Denylist takes precedence
@@ -310,6 +312,7 @@ fn test_policy_engine_with_dry_run() {
             processes: vec!["safe_kill_test_target".to_string()],
         }),
         denylist: None,
+        allowed_ports: None,
     };
 
     let engine = PolicyEngine::new(config);
