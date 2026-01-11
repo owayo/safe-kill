@@ -568,28 +568,12 @@ fn test_init_creates_valid_toml() {
     cmd.arg("init").arg("--force").assert().success();
 
     // Get the path from the output and verify the content
-    // The actual path depends on the platform, but we can check the config content
-    // by reading from the expected location
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var("HOME").unwrap();
-        let config_path = format!("{}/Library/Application Support/safe-kill/config.toml", home);
-        if let Ok(content) = fs::read_to_string(&config_path) {
-            // Verify it's valid TOML and contains expected sections
-            assert!(content.contains("[allowed_ports]"));
-            assert!(content.contains("ports ="));
-            assert!(content.contains("# [allowlist]"));
-            assert!(content.contains("# [denylist]"));
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = std::env::var("HOME").unwrap();
-        let config_path = format!("{}/.config/safe-kill/config.toml", home);
-        if let Ok(content) = fs::read_to_string(&config_path) {
-            assert!(content.contains("[allowed_ports]"));
-            assert!(content.contains("ports ="));
-        }
+    let home = std::env::var("HOME").unwrap();
+    let config_path = format!("{}/.config/safe-kill/config.toml", home);
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        assert!(content.contains("[allowed_ports]"));
+        assert!(content.contains("ports ="));
+        assert!(content.contains("# [allowlist]"));
+        assert!(content.contains("# [denylist]"));
     }
 }

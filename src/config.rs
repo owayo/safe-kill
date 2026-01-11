@@ -130,16 +130,16 @@ impl Config {
         }
     }
 
-    /// Get the default config file path (XDG-compliant)
+    /// Get the default config file path
     ///
     /// Returns `~/.config/safe-kill/config.toml` on Linux/macOS
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|config_dir| config_dir.join("safe-kill").join("config.toml"))
+        dirs::home_dir().map(|home| home.join(".config").join("safe-kill").join("config.toml"))
     }
 
     /// Get the config directory path
     pub fn config_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|config_dir| config_dir.join("safe-kill"))
+        dirs::home_dir().map(|home| home.join(".config").join("safe-kill"))
     }
 
     /// Create config with default denylist
