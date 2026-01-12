@@ -130,7 +130,7 @@ safe-kill --name python --dry-run
 ```toml
 # 親子関係チェックをバイパスするプロセス（慎重に使用）
 [allowlist]
-processes = ["my-trusted-app"]
+processes = ["my-trusted-app", "next-server"]
 
 # 絶対に終了できないプロセス（許可リストより優先）
 [denylist]

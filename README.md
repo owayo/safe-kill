@@ -130,7 +130,7 @@ Initialize configuration with `safe-kill init`, or create `~/.config/safe-kill/c
 ```toml
 # Processes that bypass ancestry checks (use with caution)
 [allowlist]
-processes = ["my-trusted-app"]
+processes = ["my-trusted-app", "next-server"]
 
 # Processes that can never be killed (takes precedence over allowlist)
 [denylist]

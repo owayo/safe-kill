@@ -70,7 +70,7 @@ impl InitCommand {
 # Allowlist: Only processes matching these names can be killed.
 # If not specified, all processes (except denylisted) are allowed.
 # [allowlist]
-# processes = ["node", "python", "ruby"]
+# processes = ["next-server"]
 
 # Denylist: Processes matching these names can never be killed.
 # System processes are always protected by default.
