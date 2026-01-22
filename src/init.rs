@@ -82,9 +82,10 @@ impl InitCommand {
 # Supports individual ports and ranges (e.g., "3000", "8080-8090").
 #   - 1420: Tauri dev server
 #   - 3000-3010: Node.js dev servers
+#   - 5173: Vite dev server
 #   - 8080: HTTP alternative port
 [allowed_ports]
-ports = ["1420", "3000-3010", "8080"]
+ports = ["1420", "3000-3010", "5173", "8080"]
 "#
         .to_string()
     }
@@ -132,6 +133,7 @@ mod tests {
         let content = InitCommand::default_config_content();
         assert!(content.contains("1420"));
         assert!(content.contains("3000-3010"));
+        assert!(content.contains("5173"));
         assert!(content.contains("8080"));
     }
 
