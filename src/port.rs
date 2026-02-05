@@ -228,4 +228,61 @@ mod tests {
         detector.refresh();
         // Should not panic
     }
+
+    // =============================================================================
+    // 境界値テスト（Codex分析により追加）
+    // =============================================================================
+
+    #[test]
+    fn test_find_by_port_zero() {
+        let detector = PortDetector::new();
+        // ポート0は有効な値だが、通常は使用されていない
+        let result = detector.find_by_port(0);
+        assert!(result.is_ok());
+        // 結果は空か、何かのシステムプロセスが使っている可能性
+    }
+
+    #[test]
+    fn test_find_by_port_max() {
+        let detector = PortDetector::new();
+        // ポート65535は最大有効値
+        let result = detector.find_by_port(65535);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_find_by_port_common_ports() {
+        let detector = PortDetector::new();
+
+        // 一般的なポート番号でテスト（プロセスがあるかは環境依存）
+        // エラーにならないことを確認
+        assert!(detector.find_by_port(22).is_ok()); // SSH
+        assert!(detector.find_by_port(80).is_ok()); // HTTP
+        assert!(detector.find_by_port(443).is_ok()); // HTTPS
+        assert!(detector.find_by_port(3000).is_ok()); // 開発用
+        assert!(detector.find_by_port(8080).is_ok()); // 代替HTTP
+    }
+
+    #[test]
+    fn test_port_protocol_debug() {
+        let tcp = PortProtocol::Tcp;
+        let udp = PortProtocol::Udp;
+        assert!(format!("{:?}", tcp).contains("Tcp"));
+        assert!(format!("{:?}", udp).contains("Udp"));
+    }
+
+    #[test]
+    fn test_port_process_fields() {
+        let pp = PortProcess {
+            pid: 12345,
+            name: "test_process".to_string(),
+            port: 8080,
+            protocol: PortProtocol::Tcp,
+        };
+
+        assert_eq!(pp.pid, 12345);
+        assert_eq!(pp.name, "test_process");
+        assert_eq!(pp.port, 8080);
+        assert_eq!(pp.protocol, PortProtocol::Tcp);
+    }
 }

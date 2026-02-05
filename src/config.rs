@@ -580,6 +580,81 @@ processes = ["node"]
         assert!(PortRange::parse("1-2-3").is_err());
     }
 
+    // =============================================================================
+    // 境界値テスト（Codex分析により追加）
+    // =============================================================================
+
+    #[test]
+    fn test_port_range_boundary_values() {
+        // ポート0は有効
+        assert!(PortRange::parse("0").is_ok());
+        assert_eq!(PortRange::parse("0").unwrap(), PortRange::Single(0));
+        assert!(PortRange::parse("0").unwrap().contains(0));
+
+        // ポート65535は最大有効値
+        assert!(PortRange::parse("65535").is_ok());
+        assert_eq!(PortRange::parse("65535").unwrap(), PortRange::Single(65535));
+        assert!(PortRange::parse("65535").unwrap().contains(65535));
+
+        // 最大範囲
+        assert!(PortRange::parse("0-65535").is_ok());
+        let full_range = PortRange::parse("0-65535").unwrap();
+        assert!(full_range.contains(0));
+        assert!(full_range.contains(32768));
+        assert!(full_range.contains(65535));
+    }
+
+    #[test]
+    fn test_port_range_overflow_values() {
+        // 65536はu16の範囲外なのでエラー
+        assert!(PortRange::parse("65536").is_err());
+
+        // 範囲の終端が65536を超える場合
+        assert!(PortRange::parse("1-65536").is_err());
+        assert!(PortRange::parse("65535-65536").is_err());
+
+        // 非常に大きな値
+        assert!(PortRange::parse("99999").is_err());
+        assert!(PortRange::parse("999999999").is_err());
+    }
+
+    #[test]
+    fn test_port_range_edge_cases() {
+        // 同じポートの範囲（start == end）
+        assert!(PortRange::parse("8080-8080").is_ok());
+        let same_range = PortRange::parse("8080-8080").unwrap();
+        assert!(same_range.contains(8080));
+        assert!(!same_range.contains(8079));
+        assert!(!same_range.contains(8081));
+
+        // 1ポート違いの範囲
+        assert!(PortRange::parse("8080-8081").is_ok());
+
+        // 範囲の端だけ使用
+        let range = PortRange::parse("3000-3010").unwrap();
+        assert!(range.contains(3000)); // start
+        assert!(range.contains(3010)); // end
+        assert!(!range.contains(2999)); // before start
+        assert!(!range.contains(3011)); // after end
+    }
+
+    #[test]
+    fn test_port_range_empty_and_whitespace() {
+        // 空文字列
+        assert!(PortRange::parse("").is_err());
+
+        // 空白のみ
+        assert!(PortRange::parse("   ").is_err());
+
+        // ハイフンのみ
+        assert!(PortRange::parse("-").is_err());
+        assert!(PortRange::parse("--").is_err());
+
+        // 片方のみ指定
+        assert!(PortRange::parse("-3000").is_err());
+        assert!(PortRange::parse("3000-").is_err());
+    }
+
     #[test]
     fn test_port_range_contains_single() {
         let range = PortRange::Single(3306);

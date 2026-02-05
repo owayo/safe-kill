@@ -301,4 +301,86 @@ mod tests {
         assert_eq!(result.pid, 12345);
         assert_eq!(result.name, "myprocess");
     }
+
+    #[test]
+    fn test_kill_result_success_all_signals() {
+        let signals = [
+            (Signal::SIGHUP, "SIGHUP"),
+            (Signal::SIGINT, "SIGINT"),
+            (Signal::SIGQUIT, "SIGQUIT"),
+            (Signal::SIGKILL, "SIGKILL"),
+            (Signal::SIGTERM, "SIGTERM"),
+            (Signal::SIGUSR1, "SIGUSR1"),
+            (Signal::SIGUSR2, "SIGUSR2"),
+        ];
+        for (signal, name) in &signals {
+            let result = KillResult::success(100, "proc", *signal);
+            assert!(result.success);
+            assert!(
+                result.message.contains(name),
+                "Message should contain signal name {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_kill_result_dry_run_all_signals() {
+        let signals = [
+            Signal::SIGHUP,
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+            Signal::SIGKILL,
+            Signal::SIGTERM,
+            Signal::SIGUSR1,
+            Signal::SIGUSR2,
+        ];
+        for signal in &signals {
+            let result = KillResult::dry_run(100, "proc", *signal);
+            assert!(result.success);
+            assert!(result.message.contains("dry run"));
+            assert!(result.message.contains(signal.name()));
+        }
+    }
+
+    #[test]
+    fn test_kill_result_failure_various_errors() {
+        let errors = [
+            SafeKillError::ProcessNotFound(100),
+            SafeKillError::PermissionDenied(100),
+            SafeKillError::Denylisted("test".to_string()),
+            SafeKillError::SuicidePrevention(100),
+            SafeKillError::NotDescendant(100, "test".to_string()),
+        ];
+        for error in &errors {
+            let result = KillResult::failure(100, "proc", error);
+            assert!(!result.success);
+            assert!(!result.message.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_batch_kill_result_clone() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::success(100, "a", Signal::SIGTERM));
+        batch.add(KillResult::dry_run(200, "b", Signal::SIGKILL));
+        let cloned = batch.clone();
+        assert_eq!(cloned.total_matched, 2);
+        assert_eq!(cloned.total_killed, 2);
+        assert_eq!(cloned.results.len(), 2);
+    }
+
+    #[test]
+    fn test_batch_kill_result_multiple_failures() {
+        let mut batch = BatchKillResult::new();
+        let err = SafeKillError::ProcessNotFound(1);
+        batch.add(KillResult::failure(1, "a", &err));
+        let err2 = SafeKillError::PermissionDenied(2);
+        batch.add(KillResult::failure(2, "b", &err2));
+
+        assert_eq!(batch.total_matched, 2);
+        assert_eq!(batch.total_killed, 0);
+        assert!(!batch.all_success());
+        assert!(!batch.any_success());
+    }
 }

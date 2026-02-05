@@ -724,4 +724,55 @@ mod tests {
         let permission = engine.can_kill_for_port(99999, "some_random_server");
         assert_eq!(permission, KillPermission::Allowed);
     }
+
+    #[test]
+    fn test_can_kill_non_descendant_process() {
+        let engine = PolicyEngine::with_defaults();
+        let process = ProcessInfo {
+            pid: 99999,
+            parent_pid: Some(1),
+            name: "unrelated_process".to_string(),
+            cmd: vec![],
+        };
+        let permission = engine.can_kill(&process);
+        // Not in allowlist, not a descendant -> DeniedNotDescendant
+        assert_eq!(permission, KillPermission::DeniedNotDescendant);
+    }
+
+    #[test]
+    fn test_kill_by_pid_not_descendant() {
+        // PID 1 is never a descendant of a normal session
+        let engine = PolicyEngine::with_defaults();
+        let result = engine.kill_by_pid(1, Signal::SIGTERM, false);
+        assert!(result.is_err());
+        // Could be DeniedByDenylist (launchd/systemd in denylist) or SuicidePrevention
+        match result {
+            Err(SafeKillError::Denylisted(_))
+            | Err(SafeKillError::SuicidePrevention(_))
+            | Err(SafeKillError::NotDescendant(_, _)) => {}
+            other => panic!("Expected denial error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_can_kill_for_port_suicide_prevention_parent() {
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        if let Some(current) = engine.provider.get(current_pid) {
+            if let Some(parent_pid) = current.parent_pid {
+                let permission = engine.can_kill_for_port(parent_pid, "parent_process");
+                assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
+            }
+        }
+    }
+
+    #[test]
+    fn test_kill_permission_eq_variants() {
+        // Verify equality between different DeniedByDenylist instances
+        let a = KillPermission::DeniedByDenylist("proc_a".to_string());
+        let b = KillPermission::DeniedByDenylist("proc_a".to_string());
+        let c = KillPermission::DeniedByDenylist("proc_b".to_string());
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }

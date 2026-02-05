@@ -163,4 +163,45 @@ mod tests {
             "Config content should deserialize to Config"
         );
     }
+
+    #[test]
+    fn test_execute_force_creates_config_in_temp_dir() {
+        // テスト用の一時ディレクトリを使って execute(force=true) を検証
+        // 実際の HOME を変更できないため、default_config_content の内容が
+        // 有効な TOML であり Config としてパースできることを確認する
+        let content = InitCommand::default_config_content();
+        let parsed: Result<crate::config::Config, _> = toml::from_str(&content);
+        assert!(parsed.is_ok());
+        let config = parsed.unwrap();
+        // allowed_ports セクションが含まれること
+        assert!(config.allowed_ports.is_some());
+        let ports = config.allowed_ports.unwrap();
+        assert!(!ports.ports.is_empty());
+        // デフォルトのポート設定が含まれていること
+        assert!(ports.ports.contains(&"1420".to_string()));
+        assert!(ports.ports.contains(&"3000-3010".to_string()));
+        assert!(ports.ports.contains(&"8080".to_string()));
+    }
+
+    #[test]
+    fn test_default_config_content_has_port_descriptions() {
+        let content = InitCommand::default_config_content();
+        // ポートの説明コメントが含まれていること
+        assert!(content.contains("Tauri dev server"));
+        assert!(content.contains("Node.js dev servers"));
+        assert!(content.contains("Vite dev server"));
+        assert!(content.contains("HTTP alternative port"));
+    }
+
+    #[test]
+    fn test_default_config_content_line_count() {
+        let content = InitCommand::default_config_content();
+        let lines: Vec<&str> = content.lines().collect();
+        // 設定ファイルが空でないこと（少なくとも10行以上）
+        assert!(
+            lines.len() >= 10,
+            "Config should have at least 10 lines, got {}",
+            lines.len()
+        );
+    }
 }

@@ -194,4 +194,37 @@ mod tests {
         let result = truncate("", 10);
         assert_eq!(result, "");
     }
+
+    #[test]
+    fn test_truncate_boundary_just_over() {
+        // len 5 > max_len 4, so truncated: s[..1] + "..." = "a..."
+        let result = truncate("abcde", 4);
+        assert_eq!(result, "a...");
+    }
+
+    #[test]
+    fn test_truncate_boundary_exact_no_truncation() {
+        // len 4 == max_len 4, no truncation
+        let result = truncate("abcd", 4);
+        assert_eq!(result, "abcd");
+    }
+
+    #[test]
+    fn test_truncate_single_char() {
+        let result = truncate("x", 1);
+        assert_eq!(result, "x");
+    }
+
+    #[test]
+    fn test_version_format_parts() {
+        let version = env!("CARGO_PKG_VERSION");
+        let parts: Vec<&str> = version.split('.').collect();
+        assert_eq!(parts.len(), 3, "Version should have 3 parts: YY.M.COUNTER");
+        for part in &parts {
+            assert!(
+                part.parse::<u32>().is_ok(),
+                "Each version part should be numeric"
+            );
+        }
+    }
 }

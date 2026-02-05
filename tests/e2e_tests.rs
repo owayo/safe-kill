@@ -416,6 +416,17 @@ fn test_very_large_pid() {
 }
 
 #[test]
+fn test_pid_zero() {
+    // PID 0はUnixで特殊な意味を持つ（プロセスグループ全体にシグナルを送る）
+    // safe-killでは拒否すべき
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No such")));
+}
+
+#[test]
 fn test_empty_name() {
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("--name").arg("").assert().failure();
@@ -576,4 +587,164 @@ fn test_init_creates_valid_toml() {
         assert!(content.contains("# [allowlist]"));
         assert!(content.contains("# [denylist]"));
     }
+}
+
+// =============================================================================
+// 終了コードの追加テスト（Codex分析により追加）
+// =============================================================================
+
+#[test]
+fn test_exit_code_port_not_allowed_without_config() {
+    // 設定ファイルがない場合、ポートは許可されていないのでエラー
+    let temp = tempfile::tempdir().unwrap();
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--port")
+        .arg("3000")
+        .assert()
+        .code(4) // PortNotAllowed exit code
+        .stderr(predicate::str::contains("not allowed"));
+}
+
+#[test]
+fn test_exit_code_port_allowed_but_no_process() {
+    use std::fs;
+
+    // 一時ディレクトリに設定ファイルを作成
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[allowed_ports]\nports = [\"59997\"]",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--port")
+        .arg("59997")
+        .assert()
+        .code(1) // NoTarget exit code (NoProcessOnPort)
+        .stderr(predicate::str::contains("No process"));
+}
+
+#[test]
+fn test_init_cancel_preserves_existing_config() {
+    use std::fs;
+
+    // 一時ディレクトリに既存の設定ファイルを作成
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "# existing config\ndummy = 1").unwrap();
+
+    // "n"を入力してキャンセル
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .write_stdin("n\n")
+        .assert()
+        .code(3) // ConfigError exit code
+        .stderr(predicate::str::contains("cancelled"));
+
+    // 既存のファイルが保持されていることを確認
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("dummy = 1"));
+}
+
+#[test]
+fn test_init_overwrite_yes() {
+    use std::fs;
+
+    // 一時ディレクトリに既存の設定ファイルを作成
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "# old config\nold = 1").unwrap();
+
+    // "y"を入力して上書き承認
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .write_stdin("y\n")
+        .assert()
+        .success();
+
+    // 新しい設定が書き込まれていることを確認
+    let content = fs::read_to_string(&config_path).unwrap();
+    assert!(content.contains("[allowed_ports]"));
+    assert!(!content.contains("old = 1"));
+}
+
+// =============================================================================
+// シグナルの境界値・異常入力テスト（Codex分析により追加）
+// =============================================================================
+
+#[test]
+fn test_signal_option_zero() {
+    // シグナル番号0は無効
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--signal")
+        .arg("0")
+        .arg("12345")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid signal"));
+}
+
+#[test]
+fn test_signal_option_negative() {
+    // 負のシグナル番号は無効
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--signal")
+        .arg("-1")
+        .arg("12345")
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_signal_option_sig_only() {
+    // "SIG"のみは無効
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--signal")
+        .arg("SIG")
+        .arg("12345")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid signal"));
+}
+
+#[test]
+fn test_signal_option_whitespace() {
+    // 空白のみは無効（clapがトリムする前にエラーになる可能性）
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--signal")
+        .arg("   ")
+        .arg("12345")
+        .assert()
+        .failure();
+}
+
+// =============================================================================
+// ポート範囲の境界値テスト（Codex分析により追加）
+// =============================================================================
+
+#[test]
+fn test_port_boundary_zero() {
+    // ポート0は有効な指定だが、プロセスがないはず
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    // ポート0が許可設定されていない場合はPortNotAllowed
+    cmd.arg("--port").arg("0").assert().failure();
+}
+
+#[test]
+fn test_port_boundary_max() {
+    // ポート65535は有効な最大値
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    // 許可設定されていない場合はPortNotAllowed
+    cmd.arg("--port").arg("65535").assert().failure();
 }

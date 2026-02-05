@@ -453,3 +453,229 @@ fn test_end_to_end_workflow_dry_run() {
         Err(SafeKillError::SuicidePrevention(_))
     ));
 }
+
+// =============================================================================
+// 異常入力テスト（Codex分析により追加）
+// =============================================================================
+
+#[cfg(unix)]
+#[test]
+fn test_config_load_permission_denied_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let file = NamedTempFile::new().unwrap();
+    let path = file.path().to_path_buf();
+
+    // ファイルに何か書き込む
+    std::fs::write(&path, "[allowlist]\nprocesses = [\"test\"]").unwrap();
+
+    // パーミッションを読み取り不可に設定
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // 読み込みを試みる（デフォルトにフォールバックすべき）
+    let config = Config::load_from_path(Some(path.clone()));
+
+    // デフォルトのdenylistが適用されているはず
+    assert!(config.denylist.is_some());
+
+    // クリーンアップ: パーミッションを戻す
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+#[test]
+fn test_config_load_invalid_types_fallback() {
+    let mut file = NamedTempFile::new().unwrap();
+    // portsが文字列の配列でなく数値の配列になっている（誤った型）
+    writeln!(file, "[allowed_ports]\nports = [3000, 8080]").unwrap();
+
+    let config = Config::load_from_path(Some(file.path().to_path_buf()));
+
+    // TOMLのパースは成功するが、型が合わないためデフォルトにフォールバック
+    // またはallowed_portsがNoneになるかデフォルトが適用される
+    // この場合、tomlは数値配列を文字列配列として読めないのでパースエラーになり
+    // デフォルトにフォールバックする
+    assert!(config.denylist.is_some());
+}
+
+#[test]
+fn test_config_is_port_allowed_ignores_invalid_specs() {
+    use safe_kill::config::AllowedPorts;
+
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec![
+                "invalid".to_string(),   // 無効なポート指定
+                "3000-3001".to_string(), // 有効な範囲
+                "also-bad".to_string(),  // 無効なポート指定
+            ],
+        }),
+    };
+
+    // 有効な範囲内のポートは許可される
+    assert!(config.is_port_allowed(3000));
+    assert!(config.is_port_allowed(3001));
+
+    // 無効な指定は無視され、その範囲外は許可されない
+    assert!(!config.is_port_allowed(22));
+    assert!(!config.is_port_allowed(8080));
+}
+
+#[test]
+fn test_signal_parsing_edge_cases() {
+    // 正常なケース（大文字小文字混在）
+    assert_eq!(
+        SignalSender::parse_signal("SigTerm").unwrap(),
+        Signal::SIGTERM
+    );
+
+    // 空白を含む場合（trimされる）
+    assert_eq!(
+        SignalSender::parse_signal("  SIGKILL  ").unwrap(),
+        Signal::SIGKILL
+    );
+
+    // 無効なシグナル名
+    assert!(SignalSender::parse_signal("SIGINVALID").is_err());
+
+    // 空文字列
+    assert!(SignalSender::parse_signal("").is_err());
+}
+
+// =============================================================================
+// ポート機能の境界値テスト（Codex分析により追加）
+// =============================================================================
+
+#[test]
+fn test_port_range_boundary_in_config() {
+    use safe_kill::config::AllowedPorts;
+
+    // 最大ポート値のテスト
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["65535".to_string()],
+        }),
+    };
+
+    assert!(config.is_port_allowed(65535));
+    assert!(!config.is_port_allowed(65534));
+
+    // 最小ポート値のテスト
+    let config_min = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["0".to_string()],
+        }),
+    };
+
+    assert!(config_min.is_port_allowed(0));
+    assert!(!config_min.is_port_allowed(1));
+}
+
+#[test]
+fn test_port_full_range_config() {
+    use safe_kill::config::AllowedPorts;
+
+    // 全ポート範囲のテスト
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["0-65535".to_string()],
+        }),
+    };
+
+    // 境界値
+    assert!(config.is_port_allowed(0));
+    assert!(config.is_port_allowed(65535));
+
+    // 中間値
+    assert!(config.is_port_allowed(80));
+    assert!(config.is_port_allowed(443));
+    assert!(config.is_port_allowed(3000));
+    assert!(config.is_port_allowed(8080));
+}
+
+// =============================================================================
+// PolicyEngine kill_by_port 統合テスト
+// =============================================================================
+
+#[test]
+fn test_policy_engine_kill_by_port_not_allowed_default() {
+    // Default config has no allowed_ports, so port-based killing is disabled
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_port(3000, Signal::SIGTERM, false);
+    assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
+}
+
+#[test]
+fn test_policy_engine_kill_by_port_allowed_but_empty() {
+    use safe_kill::config::AllowedPorts;
+
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["59990".to_string()],
+        }),
+    };
+    let engine = PolicyEngine::new(config);
+
+    // Port is allowed but no process on it
+    let result = engine.kill_by_port(59990, Signal::SIGTERM, false);
+    assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59990))));
+}
+
+// =============================================================================
+// init コマンド設定ファイルの整合性テスト
+// =============================================================================
+
+#[test]
+fn test_init_config_parses_as_valid_config() {
+    use safe_kill::init::InitCommand;
+
+    let content = InitCommand::default_config_content();
+    let config: Config = toml::from_str(&content).expect("Default config should be valid");
+
+    // Should have allowed_ports section
+    assert!(config.allowed_ports.is_some());
+    let ports = config.allowed_ports.unwrap();
+    assert!(!ports.ports.is_empty());
+}
+
+// =============================================================================
+// ProcessInfoProvider 統合テスト
+// =============================================================================
+
+#[test]
+fn test_process_info_find_by_name_matches_exact() {
+    let provider = ProcessInfoProvider::new();
+    let current = provider.get(ProcessInfoProvider::current_pid()).unwrap();
+
+    // Finding by exact current process name should include current PID
+    let results = provider.find_by_name(&current.name);
+    assert!(results
+        .iter()
+        .any(|p| p.pid == ProcessInfoProvider::current_pid()));
+}
+
+#[test]
+fn test_process_info_get_pid_1() {
+    let provider = ProcessInfoProvider::new();
+    // PID 1 should exist on any Unix system
+    let info = provider.get(1);
+    assert!(info.is_some(), "PID 1 should exist");
+    let info = info.unwrap();
+    assert_eq!(info.pid, 1);
+    assert!(!info.name.is_empty());
+}

@@ -100,8 +100,8 @@ safe-kill [OPTIONS] [PID]
 | SIGHUP | 1 | ハングアップ |
 | SIGINT | 2 | 割り込み |
 | SIGQUIT | 3 | 終了 |
-| SIGUSR1 | 10 | ユーザー定義シグナル1 |
-| SIGUSR2 | 12 | ユーザー定義シグナル2 |
+| SIGUSR1 | 10/30 | ユーザー定義シグナル1（Linux: 10, macOS: 30） |
+| SIGUSR2 | 12/31 | ユーザー定義シグナル2（Linux: 12, macOS: 31） |
 
 ### 使用例
 
@@ -139,9 +139,10 @@ processes = ["launchd", "systemd", "init", "kernel_task"]
 # --port オプションで許可するポート
 # 指定しない場合、--port オプションは無効（ポート指定でのkillは不可）
 [allowed_ports]
-ports = ["1420", "3000-3010", "8080"]
+ports = ["1420", "3000-3010", "5173", "8080"]
 #   - 1420: Tauri開発サーバー
 #   - 3000-3010: Node.js開発サーバー
+#   - 5173: Vite開発サーバー
 #   - 8080: HTTP代替ポート
 ```
 
@@ -151,7 +152,7 @@ ports = ["1420", "3000-3010", "8080"]
 
 **macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
 
-**Linux**: `systemd`, `init`, `kthreadd`, `rcu_sched`, `migration`
+**Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
 
 ## アーキテクチャ
 
@@ -231,6 +232,7 @@ flowchart TB
 | 1 | 対象が見つからない |
 | 2 | 権限エラー |
 | 3 | 設定エラー |
+| 4 | ポート不許可 |
 | 255 | 一般エラー（無効なシグナル、自己破壊試行など） |
 
 ## 環境変数
@@ -301,9 +303,9 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ユニットテスト**: 全モジュールを網羅する161テスト
-- **統合テスト**: 実際のプロセスツリーを使用した27テスト
-- **E2Eテスト**: CLI動作を検証する30テスト
+- **ユニットテスト**: 全モジュールを網羅する263テスト
+- **統合テスト**: 実際のプロセスツリーを使用した38テスト
+- **E2Eテスト**: CLI動作を検証する54テスト
 
 ## コントリビュート
 

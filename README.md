@@ -100,8 +100,8 @@ Supported signals can be specified by name or number:
 | SIGHUP | 1 | Hangup |
 | SIGINT | 2 | Interrupt |
 | SIGQUIT | 3 | Quit |
-| SIGUSR1 | 10 | User-defined signal 1 |
-| SIGUSR2 | 12 | User-defined signal 2 |
+| SIGUSR1 | 10/30 | User-defined signal 1 (Linux: 10, macOS: 30) |
+| SIGUSR2 | 12/31 | User-defined signal 2 (Linux: 12, macOS: 31) |
 
 ### Examples
 
@@ -139,9 +139,10 @@ processes = ["launchd", "systemd", "init", "kernel_task"]
 # Allowed ports for --port option
 # If not specified, --port option is disabled (no ports can be killed)
 [allowed_ports]
-ports = ["1420", "3000-3010", "8080"]
+ports = ["1420", "3000-3010", "5173", "8080"]
 #   - 1420: Tauri dev server
 #   - 3000-3010: Node.js dev servers
+#   - 5173: Vite dev server
 #   - 8080: HTTP alternative port
 ```
 
@@ -151,7 +152,7 @@ The following system processes are protected by default:
 
 **macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
 
-**Linux**: `systemd`, `init`, `kthreadd`, `rcu_sched`, `migration`
+**Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
 
 ## Architecture
 
@@ -231,6 +232,7 @@ flowchart TB
 | 1 | No target found |
 | 2 | Permission denied |
 | 3 | Configuration error |
+| 4 | Port not allowed |
 | 255 | General error (invalid signal, suicide attempt, etc.) |
 
 ## Environment Variables
@@ -301,9 +303,9 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 161 tests covering all modules
-- **Integration Tests**: 27 tests with real process trees
-- **E2E Tests**: 30 tests for CLI behavior
+- **Unit Tests**: 263 tests covering all modules
+- **Integration Tests**: 38 tests with real process trees
+- **E2E Tests**: 54 tests for CLI behavior
 
 ## Contributing
 

@@ -230,4 +230,106 @@ mod tests {
         let _result = provider.get(1);
         // This test passes regardless - we're just testing the API works
     }
+
+    #[test]
+    fn test_find_by_name_finds_current_process() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        // 現在のプロセス名を取得
+        let current_info = provider
+            .get(current_pid)
+            .expect("Current process should exist");
+        // 名前で検索して現在のプロセスが含まれることを確認
+        let results = provider.find_by_name(&current_info.name);
+        assert!(
+            results.iter().any(|p| p.pid == current_pid),
+            "find_by_name should find the current process by its name"
+        );
+    }
+
+    #[test]
+    fn test_find_by_name_results_have_correct_name() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let current_info = provider
+            .get(current_pid)
+            .expect("Current process should exist");
+        let results = provider.find_by_name(&current_info.name);
+        // 結果の全プロセスが検索名と一致すること
+        for result in &results {
+            assert_eq!(
+                result.name, current_info.name,
+                "All find_by_name results should have the searched name"
+            );
+        }
+    }
+
+    #[test]
+    fn test_process_info_parent_pid_some() {
+        let info = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec![],
+        };
+        assert_eq!(info.parent_pid, Some(1));
+    }
+
+    #[test]
+    fn test_process_info_parent_pid_none() {
+        let info = ProcessInfo {
+            pid: 1,
+            parent_pid: None,
+            name: "init".to_string(),
+            cmd: vec![],
+        };
+        assert_eq!(info.parent_pid, None);
+    }
+
+    #[test]
+    fn test_process_info_equality() {
+        let a = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec!["arg1".to_string()],
+        };
+        let b = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec!["arg1".to_string()],
+        };
+        let c = ProcessInfo {
+            pid: 200,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec!["arg1".to_string()],
+        };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_process_info_debug_output() {
+        let info = ProcessInfo {
+            pid: 42,
+            parent_pid: Some(1),
+            name: "test_proc".to_string(),
+            cmd: vec!["test".to_string()],
+        };
+        let debug_str = format!("{:?}", info);
+        assert!(debug_str.contains("42"));
+        assert!(debug_str.contains("test_proc"));
+    }
+
+    #[test]
+    fn test_all_processes_have_valid_pids() {
+        let provider = ProcessInfoProvider::new();
+        let all = provider.all();
+        for p in &all {
+            assert!(p.pid > 0, "All processes should have PID > 0");
+            assert!(!p.name.is_empty(), "All processes should have a name");
+        }
+    }
 }

@@ -278,6 +278,67 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // =============================================================================
+    // 異常入力テスト（Codex分析により追加）
+    // =============================================================================
+
+    #[test]
+    fn test_parse_signal_only_sig_prefix() {
+        // "SIG"のみの場合はエラー
+        let result = SignalSender::parse_signal("SIG");
+        assert!(result.is_err());
+        match result {
+            Err(SafeKillError::InvalidSignal(s)) => assert_eq!(s, "SIG"),
+            _ => panic!("Expected InvalidSignal error"),
+        }
+    }
+
+    #[test]
+    fn test_parse_signal_whitespace_only() {
+        // 空白のみの場合はエラー
+        let result = SignalSender::parse_signal("   ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_signal_negative_number() {
+        // 負の数はエラー
+        let result = SignalSender::parse_signal("-1");
+        assert!(result.is_err());
+
+        let result = SignalSender::parse_signal("-15");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_signal_zero() {
+        // シグナル番号0はサポートされていない
+        let result = SignalSender::parse_signal("0");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_signal_very_large_number() {
+        // 非常に大きな数はエラー
+        let result = SignalSender::parse_signal("999999");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_signal_special_characters() {
+        // 特殊文字を含む場合はエラー
+        assert!(SignalSender::parse_signal("SIGTERM!").is_err());
+        assert!(SignalSender::parse_signal("SIG@TERM").is_err());
+        assert!(SignalSender::parse_signal("15#").is_err());
+    }
+
+    #[test]
+    fn test_parse_signal_mixed_number_and_name() {
+        // 数字と名前の混合はエラー
+        assert!(SignalSender::parse_signal("SIG15").is_err());
+        assert!(SignalSender::parse_signal("15TERM").is_err());
+    }
+
     // Send signal tests
     #[test]
     fn test_send_to_nonexistent_process() {
