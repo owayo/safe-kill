@@ -61,6 +61,14 @@ pub enum SafeKillError {
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
 
+    /// No process found for the specified name
+    #[error("No process found with name: {0}")]
+    ProcessNameNotFound(String),
+
+    /// Processes were matched, but none were killable due to policy checks
+    #[error("No killable process found for {0}")]
+    NoKillableTarget(String),
+
     // Port-related errors
     /// No process found listening on the specified port
     #[error("No process found on port {0}")]
@@ -102,6 +110,8 @@ impl SafeKillError {
         match self {
             SafeKillError::NoTarget
             | SafeKillError::ProcessNotFound(_)
+            | SafeKillError::ProcessNameNotFound(_)
+            | SafeKillError::NoKillableTarget(_)
             | SafeKillError::NoProcessOnPort(_) => SafeKillExitCode::NoTarget,
             SafeKillError::PermissionDenied(_) => SafeKillExitCode::PermissionDenied,
             SafeKillError::ConfigError(_) | SafeKillError::ConfigCreationError(_) => {
@@ -189,6 +199,21 @@ mod tests {
     }
 
     #[test]
+    fn test_process_name_not_found_error_message() {
+        let err = SafeKillError::ProcessNameNotFound("node-dev".to_string());
+        assert_eq!(err.to_string(), "No process found with name: node-dev");
+    }
+
+    #[test]
+    fn test_no_killable_target_error_message() {
+        let err = SafeKillError::NoKillableTarget("name 'launchd'".to_string());
+        assert_eq!(
+            err.to_string(),
+            "No killable process found for name 'launchd'"
+        );
+    }
+
+    #[test]
     fn test_permission_denied_error_message() {
         let err = SafeKillError::PermissionDenied(1);
         assert_eq!(err.to_string(), "Permission denied for PID 1");
@@ -264,6 +289,22 @@ mod tests {
     fn test_error_to_exit_code_process_not_found() {
         assert_eq!(
             SafeKillError::ProcessNotFound(123).exit_code(),
+            SafeKillExitCode::NoTarget
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_process_name_not_found() {
+        assert_eq!(
+            SafeKillError::ProcessNameNotFound("node".to_string()).exit_code(),
+            SafeKillExitCode::NoTarget
+        );
+    }
+
+    #[test]
+    fn test_error_to_exit_code_no_killable_target() {
+        assert_eq!(
+            SafeKillError::NoKillableTarget("name 'launchd'".to_string()).exit_code(),
             SafeKillExitCode::NoTarget
         );
     }

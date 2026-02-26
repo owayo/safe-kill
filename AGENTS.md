@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (unit 263 + integration 38 + E2E 54)
+make test               # 全テスト実行 (unit 281 + integration 42 + E2E 61)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -39,9 +39,10 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 ### Safety Layers（優先順）
 
 1. **自殺防止**: 自プロセス・親プロセスの kill 禁止
-2. **Denylist**: システムプロセスは常に保護
-3. **Ancestry検証**: セッションの子孫のみ kill 可能
-4. **Allowlist**: 信頼プロセスは ancestry チェックをバイパス
+2. **PID検証**: `0` や `i32::MAX` を超える PID は拒否
+3. **Denylist**: システムプロセスは常に保護
+4. **Ancestry検証**: セッションの子孫のみ kill 可能
+5. **Allowlist**: 信頼プロセスは ancestry チェックをバイパス
 
 ### Port-based killing の特殊性
 
@@ -55,7 +56,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID` env or grandparent をルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応 |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist |
-| `signal.rs` | Unix シグナル解析。名前/番号両対応、macOS/Linux でシグナル番号が異なる点を吸収 |
+| `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux の番号差異吸収、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決 |
 | `init.rs` | `safe-kill init` で config.toml を生成 |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |

@@ -5,6 +5,7 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use safe_kill::process_info::ProcessInfoProvider;
 use std::io::Write;
 use std::process::Stdio;
 use tempfile::NamedTempFile;
@@ -66,7 +67,11 @@ fn test_dry_run_with_name() {
         .arg("--dry-run")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No matching")));
+        .stderr(
+            predicate::str::contains("No process found with name")
+                .or(predicate::str::contains("not found"))
+                .or(predicate::str::contains("No matching")),
+        );
 }
 
 #[test]
@@ -169,6 +174,46 @@ fn test_exit_code_no_target() {
         .arg("__nonexistent_process_xyz__")
         .assert()
         .code(1); // NoTarget exit code
+}
+
+#[test]
+fn test_name_not_found_reports_name() {
+    let missing_name = "__nonexistent_process_xyz__";
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--name").arg(missing_name).assert().code(1).stderr(
+        predicate::str::contains(missing_name)
+            .and(predicate::str::contains("No process found with name:")),
+    );
+}
+
+#[test]
+fn test_name_all_denied_reports_no_killable_target() {
+    use std::fs;
+
+    let pid1_name = ProcessInfoProvider::new()
+        .get(1)
+        .expect("PID 1 should exist")
+        .name;
+    let escaped_name = pid1_name.replace('\\', "\\\\").replace('"', "\\\"");
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        format!("[denylist]\nprocesses = [\"{}\"]\n", escaped_name),
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--name")
+        .arg(&pid1_name)
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "No killable process found for name",
+        ));
 }
 
 // =============================================================================
@@ -439,7 +484,11 @@ fn test_special_characters_in_name() {
         .arg("process*with?special[chars]")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No matching")));
+        .stderr(
+            predicate::str::contains("No process found with name")
+                .or(predicate::str::contains("not found"))
+                .or(predicate::str::contains("No matching")),
+        );
 }
 
 // =============================================================================
@@ -551,9 +600,11 @@ fn test_init_help() {
 #[test]
 fn test_init_force_creates_config() {
     // Test that init --force runs successfully
-    // The actual config file location is determined by dirs crate
+    // Use temporary HOME to avoid writing to real user config
+    let temp = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
-    cmd.arg("init")
+    cmd.env("HOME", temp.path())
+        .arg("init")
         .arg("--force")
         .assert()
         .success()
@@ -562,8 +613,10 @@ fn test_init_force_creates_config() {
 
 #[test]
 fn test_init_output_shows_hint() {
+    let temp = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
-    cmd.arg("init")
+    cmd.env("HOME", temp.path())
+        .arg("init")
         .arg("--force")
         .assert()
         .success()
@@ -574,19 +627,28 @@ fn test_init_output_shows_hint() {
 fn test_init_creates_valid_toml() {
     use std::fs;
 
+    let temp = tempfile::tempdir().unwrap();
+
     // Run init --force
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
-    cmd.arg("init").arg("--force").assert().success();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success();
 
     // Get the path from the output and verify the content
-    let home = std::env::var("HOME").unwrap();
-    let config_path = format!("{}/.config/safe-kill/config.toml", home);
-    if let Ok(content) = fs::read_to_string(&config_path) {
-        assert!(content.contains("[allowed_ports]"));
-        assert!(content.contains("ports ="));
-        assert!(content.contains("# [allowlist]"));
-        assert!(content.contains("# [denylist]"));
-    }
+    let config_path = temp
+        .path()
+        .join(".config")
+        .join("safe-kill")
+        .join("config.toml");
+    let content =
+        fs::read_to_string(config_path).expect("init --force should create config.toml in HOME");
+    assert!(content.contains("[allowed_ports]"));
+    assert!(content.contains("ports ="));
+    assert!(content.contains("# [allowlist]"));
+    assert!(content.contains("# [denylist]"));
 }
 
 // =============================================================================
@@ -747,4 +809,109 @@ fn test_port_boundary_max() {
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     // 許可設定されていない場合はPortNotAllowed
     cmd.arg("--port").arg("65535").assert().failure();
+}
+
+// =============================================================================
+// SAFE_KILL_ROOT_PID 環境変数テスト
+// =============================================================================
+
+#[test]
+fn test_env_var_root_pid_override() {
+    // SAFE_KILL_ROOT_PID=1 を設定すると、すべてのプロセスが子孫とみなされる
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("SAFE_KILL_ROOT_PID", "1")
+        .arg("--list")
+        .assert()
+        .success();
+}
+
+#[test]
+fn test_env_var_root_pid_invalid_ignored() {
+    // 無効な値は無視され、デフォルトの挙動になる
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("SAFE_KILL_ROOT_PID", "not_a_number")
+        .arg("--list")
+        .assert()
+        .success();
+}
+
+// =============================================================================
+// SIGKILL での子プロセス終了テスト
+// =============================================================================
+
+#[test]
+fn test_kill_child_with_sigkill() {
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(mut child) = child {
+        let child_pid = child.id();
+
+        let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+        cmd.arg("--signal")
+            .arg("SIGKILL")
+            .arg(child_pid.to_string())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("SIGKILL"));
+
+        let _ = child.wait();
+    }
+}
+
+#[test]
+fn test_kill_child_with_signal_number() {
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Ok(mut child) = child {
+        let child_pid = child.id();
+
+        let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+        cmd.arg("--signal")
+            .arg("15") // SIGTERM by number
+            .arg(child_pid.to_string())
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("SIGTERM"));
+
+        let _ = child.wait();
+    }
+}
+
+// =============================================================================
+// init サブコマンド追加テスト
+// =============================================================================
+
+#[test]
+fn test_init_creates_config_dir() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+
+    // ディレクトリがまだ存在しないことを確認
+    assert!(!config_dir.exists());
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success();
+
+    // ディレクトリとファイルが作成されたことを確認
+    assert!(config_dir.exists());
+    assert!(config_dir.join("config.toml").exists());
+
+    // ファイルの内容が有効なTOMLであることを確認
+    let content = fs::read_to_string(config_dir.join("config.toml")).unwrap();
+    let parsed: Result<toml::Value, _> = toml::from_str(&content);
+    assert!(parsed.is_ok());
 }

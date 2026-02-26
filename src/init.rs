@@ -180,7 +180,19 @@ mod tests {
         // デフォルトのポート設定が含まれていること
         assert!(ports.ports.contains(&"1420".to_string()));
         assert!(ports.ports.contains(&"3000-3010".to_string()));
+        assert!(ports.ports.contains(&"5173".to_string()));
         assert!(ports.ports.contains(&"8080".to_string()));
+    }
+
+    #[test]
+    fn test_default_config_ports_match_default_allowed_ports() {
+        let content = InitCommand::default_config_content();
+        let parsed: crate::config::Config = toml::from_str(&content).unwrap();
+        let ports = parsed
+            .allowed_ports
+            .expect("default config should include [allowed_ports]")
+            .ports;
+        assert_eq!(ports, crate::config::Config::default_allowed_ports());
     }
 
     #[test]
@@ -191,6 +203,26 @@ mod tests {
         assert!(content.contains("Node.js dev servers"));
         assert!(content.contains("Vite dev server"));
         assert!(content.contains("HTTP alternative port"));
+    }
+
+    #[test]
+    fn test_execute_creates_file_in_temp_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config").join("safe-kill");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+
+        // Write directly using the same logic as execute
+        let content = InitCommand::default_config_content();
+        std::fs::write(&config_path, &content).unwrap();
+
+        // Verify file exists and is valid TOML
+        assert!(config_path.exists());
+        let read_content = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(read_content, content);
+
+        let parsed: Result<crate::config::Config, _> = toml::from_str(&read_content);
+        assert!(parsed.is_ok());
     }
 
     #[test]

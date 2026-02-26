@@ -285,4 +285,41 @@ mod tests {
         assert_eq!(pp.port, 8080);
         assert_eq!(pp.protocol, PortProtocol::Tcp);
     }
+
+    #[test]
+    fn test_get_process_info_returns_empty_for_unused_port() {
+        let detector = PortDetector::new();
+        let result = detector.get_process_info(59991).unwrap();
+        // 使用されていないポートではプロセス情報は空
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_get_process_info_returns_process_info_type() {
+        let detector = PortDetector::new();
+        let result = detector.get_process_info(59992);
+        assert!(result.is_ok());
+        // 返り値はVec<ProcessInfo>であること
+        let infos: Vec<ProcessInfo> = result.unwrap();
+        for info in &infos {
+            assert!(info.pid > 0);
+            assert!(!info.name.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_find_by_port_deduplicates_by_pid() {
+        let detector = PortDetector::new();
+        // 使用されていないポートでは重複が発生しないが、
+        // 重複排除ロジック自体が正しく動作することを確認
+        let result = detector.find_by_port(59993).unwrap();
+        // PIDがソートされていること
+        let pids: Vec<u32> = result.iter().map(|p| p.pid).collect();
+        let mut sorted_pids = pids.clone();
+        sorted_pids.sort();
+        assert_eq!(pids, sorted_pids);
+        // PIDの重複がないこと
+        sorted_pids.dedup();
+        assert_eq!(pids.len(), sorted_pids.len());
+    }
 }

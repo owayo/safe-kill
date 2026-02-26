@@ -24,7 +24,7 @@ install-hooks: ## Show Claude Code hook setup instructions
 	@echo "Claude Code Integration Setup"
 	@echo ""
 	@echo "1. Add to .claude/settings.json:"
-	@echo '   {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"if echo \"$$TOOL_INPUT\" | grep -qE '"'"'(^|[;&|])\\s*(kill|pkill|killall)\\s'"'"'; then echo '"'"'🚫 Use safe-kill instead: safe-kill <PID> or safe-kill -n <name> (like pkill). Use -s <signal> for signal.'"'"' >&2; exit 2; fi"}]}]}}'
+	@echo '   {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"if echo \"$$TOOL_INPUT\" | grep -qE '"'"'(^|[;&|])\\s*(kill|pkill|killall)\\s'"'"'; then echo '"'"'🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <name> (like pkill). Use -s <signal> for signal.'"'"' >&2; exit 2; fi"}]}]}}'
 	@echo ""
 	@echo "2. Add process management rules to CLAUDE.md (see README.md)"
 	@echo ""

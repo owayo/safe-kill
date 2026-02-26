@@ -113,6 +113,12 @@ impl SignalSender {
 
     /// Send signal to process
     pub fn send(pid: u32, signal: Signal) -> Result<(), SafeKillError> {
+        // PID 0 and values beyond i32 are unsafe for nix::Pid::from_raw usage.
+        // PID 0 has special semantics (process group), so reject explicitly.
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(SafeKillError::InvalidPid(pid.to_string()));
+        }
+
         let nix_pid = Pid::from_raw(pid as i32);
         let nix_signal = signal.to_nix();
 
@@ -353,6 +359,19 @@ mod tests {
             Err(e) => panic!("Unexpected error: {:?}", e),
             Ok(_) => panic!("Expected error for nonexistent process"),
         }
+    }
+
+    #[test]
+    fn test_send_rejects_pid_zero() {
+        let result = SignalSender::send(0, Signal::SIGTERM);
+        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
+    }
+
+    #[test]
+    fn test_send_rejects_pid_over_i32_max() {
+        let overflow_pid = i32::MAX as u32 + 1;
+        let result = SignalSender::send(overflow_pid, Signal::SIGTERM);
+        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
     }
 
     #[test]

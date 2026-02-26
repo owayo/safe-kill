@@ -139,7 +139,7 @@ impl PolicyEngine {
         let processes = self.provider.find_by_name(name);
 
         if processes.is_empty() {
-            return Err(SafeKillError::ProcessNotFound(0));
+            return Err(SafeKillError::ProcessNameNotFound(name.to_string()));
         }
 
         let mut batch_result = BatchKillResult::new();
@@ -490,7 +490,7 @@ mod tests {
     fn test_kill_by_name_not_found() {
         let engine = PolicyEngine::with_defaults();
         let result = engine.kill_by_name("__nonexistent_process__", Signal::SIGTERM, false);
-        assert!(matches!(result, Err(SafeKillError::ProcessNotFound(_))));
+        assert!(matches!(result, Err(SafeKillError::ProcessNameNotFound(_))));
     }
 
     // list_killable tests

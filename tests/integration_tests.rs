@@ -374,8 +374,8 @@ fn test_policy_engine_kill_by_name_not_found() {
 
     assert!(result.is_err());
     match result {
-        Err(SafeKillError::ProcessNotFound(_)) => {}
-        _ => panic!("Expected ProcessNotFound"),
+        Err(SafeKillError::ProcessNameNotFound(_)) => {}
+        _ => panic!("Expected ProcessNameNotFound"),
     }
 }
 
@@ -668,6 +668,97 @@ fn test_process_info_find_by_name_matches_exact() {
         .iter()
         .any(|p| p.pid == ProcessInfoProvider::current_pid()));
 }
+
+// =============================================================================
+// SAFE_KILL_ROOT_PID 環境変数テスト
+// =============================================================================
+
+#[test]
+fn test_ancestry_with_explicit_root_pid() {
+    use safe_kill::ancestry::AncestryChecker;
+
+    let provider = ProcessInfoProvider::new();
+    let current_pid = ProcessInfoProvider::current_pid();
+
+    // 現在のプロセスをルートPIDとして設定
+    let checker = AncestryChecker::with_root_pid(provider, current_pid);
+
+    // 自身はルートの子孫として判定される
+    assert!(checker.is_descendant(current_pid));
+
+    // PID 1 は現在のプロセスの子孫ではない
+    assert!(!checker.is_descendant(1));
+}
+
+#[test]
+fn test_ancestry_root_pid_is_consistent() {
+    use safe_kill::ancestry::AncestryChecker;
+
+    let provider1 = ProcessInfoProvider::new();
+    let provider2 = ProcessInfoProvider::new();
+
+    let root1 = AncestryChecker::get_root_pid(&provider1);
+    let root2 = AncestryChecker::get_root_pid(&provider2);
+
+    // 同じプロセスから取得したルートPIDは一致する
+    assert_eq!(root1, root2);
+}
+
+// =============================================================================
+// PolicyEngine 混合バッチ結果テスト
+// =============================================================================
+
+#[test]
+fn test_policy_engine_kill_by_name_denylisted_returns_batch() {
+    use safe_kill::config::ProcessList;
+
+    // PID 1 のプロセス名を取得 (launchd or systemd)
+    let provider = ProcessInfoProvider::new();
+    let pid1_info = provider.get(1).expect("PID 1 should exist");
+
+    let config = Config {
+        allowlist: None,
+        denylist: Some(ProcessList {
+            processes: vec![pid1_info.name.clone()],
+        }),
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    // denylist に入っているプロセスを名前で kill しようとする
+    let result = engine.kill_by_name(&pid1_info.name, Signal::SIGTERM, true);
+
+    // プロセスは見つかるが kill は拒否される → Ok(batch) で返る
+    assert!(result.is_ok());
+    let batch = result.unwrap();
+    assert!(batch.total_matched > 0);
+    assert_eq!(batch.total_killed, 0);
+    assert!(!batch.any_success());
+}
+
+#[test]
+fn test_config_with_allowed_ports_in_policy_engine() {
+    use safe_kill::config::AllowedPorts;
+
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["59989".to_string()],
+        }),
+    };
+    let engine = PolicyEngine::new(config);
+
+    // 設定に含まれるポートは許可される
+    assert!(engine.config().is_port_allowed(59989));
+
+    // 設定に含まれないポートは拒否される
+    assert!(!engine.config().is_port_allowed(59988));
+}
+
+// =============================================================================
+// ProcessInfoProvider 追加テスト
+// =============================================================================
 
 #[test]
 fn test_process_info_get_pid_1() {

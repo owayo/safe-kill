@@ -53,7 +53,7 @@ fn run() -> Result<(), SafeKillError> {
             if batch_result.any_success() {
                 Ok(())
             } else {
-                Err(SafeKillError::NoTarget)
+                Err(SafeKillError::NoKillableTarget(format!("name '{}'", name)))
             }
         }
         ExecutionMode::ListKillable => {
@@ -69,7 +69,7 @@ fn run() -> Result<(), SafeKillError> {
             } else if batch_result.results.is_empty() {
                 Err(SafeKillError::NoProcessOnPort(port))
             } else {
-                Err(SafeKillError::NoTarget)
+                Err(SafeKillError::NoKillableTarget(format!("port {}", port)))
             }
         }
         ExecutionMode::InitConfig { force } => {
@@ -128,12 +128,8 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
         } else {
             p.cmd.join(" ")
         };
-        // Truncate command if too long
-        let cmd_display = if cmd.len() > 30 {
-            format!("{}...", &cmd[..27])
-        } else {
-            cmd
-        };
+        // Truncate command safely for Unicode
+        let cmd_display = truncate(&cmd, 30);
         println!(
             "{:>8}  {:<20}  {}",
             p.pid,
@@ -145,11 +141,17 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
 
 /// Truncate a string to max length
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len - 3])
-    } else {
-        s.to_string()
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s.to_string();
     }
+
+    if max_len <= 3 {
+        return s.chars().take(max_len).collect();
+    }
+
+    let prefix: String = s.chars().take(max_len - 3).collect();
+    format!("{}...", prefix)
 }
 
 #[cfg(test)]
@@ -213,6 +215,30 @@ mod tests {
     fn test_truncate_single_char() {
         let result = truncate("x", 1);
         assert_eq!(result, "x");
+    }
+
+    #[test]
+    fn test_truncate_unicode_safe() {
+        let result = truncate("あいうえお", 4);
+        assert_eq!(result, "あ...");
+    }
+
+    #[test]
+    fn test_truncate_small_limit_without_ellipsis() {
+        let result = truncate("abcdef", 2);
+        assert_eq!(result, "ab");
+    }
+
+    #[test]
+    fn test_truncate_zero_limit() {
+        let result = truncate("abcdef", 0);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_truncate_three_limit_without_ellipsis() {
+        let result = truncate("abcdef", 3);
+        assert_eq!(result, "abc");
     }
 
     #[test]

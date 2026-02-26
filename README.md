@@ -31,6 +31,7 @@
 
 - **Ancestry Verification**: Only kill processes spawned by your session
 - **Suicide Prevention**: Cannot kill self or parent processes
+- **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`)
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
@@ -169,9 +170,10 @@ flowchart TB
 ### Safety Layers
 
 1. **Suicide Prevention**: Cannot kill own process or parent
-2. **Denylist Check**: System processes are always protected
-3. **Ancestry Verification**: Only descendants of root session are killable
-4. **Allowlist Bypass**: Trusted processes can skip ancestry check
+2. **PID Validation**: Reject unsafe PID values (`0`, out-of-range) before signal dispatch
+3. **Denylist Check**: System processes are always protected
+4. **Ancestry Verification**: Only descendants of root session are killable
+5. **Allowlist Bypass**: Trusted processes can skip ancestry check
 
 ### Process Tree and Killable Scope
 
@@ -229,7 +231,7 @@ flowchart TB
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | No target found |
+| 1 | No target found (no name match, no process on allowed port, or no killable match) |
 | 2 | Permission denied |
 | 3 | Configuration error |
 | 4 | Port not allowed |
@@ -258,7 +260,7 @@ Add to `.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 Use safe-kill instead: safe-kill <PID> or safe-kill -n <name> (like pkill). Use -s <signal> for signal.' >&2; exit 2; fi"
+            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <name> (like pkill). Use -s <signal> for signal.' >&2; exit 2; fi"
           }
         ]
       }
@@ -303,9 +305,9 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 263 tests covering all modules
-- **Integration Tests**: 38 tests with real process trees
-- **E2E Tests**: 54 tests for CLI behavior
+- **Unit Tests**: 281 tests covering all modules
+- **Integration Tests**: 42 tests with real process trees
+- **E2E Tests**: 61 tests for CLI behavior
 
 ## Contributing
 

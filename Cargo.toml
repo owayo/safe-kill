@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI parsing
-clap = { version = "4.5.59", features = ["derive"] }
+clap = { version = "4.5.60", features = ["derive"] }
 
 # Process information (cross-platform)
 sysinfo = "0.38.2"
