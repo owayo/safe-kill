@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+このファイルは、このリポジトリで作業するエージェント向けのガイドです。
 
 ## Project Overview
 
@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (unit 281 + integration 42 + E2E 61)
+make test               # 全テスト実行 (lib 269 + bin 14 + integration 42 + E2E 62)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -53,7 +53,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | Module | Role |
 |--------|------|
 | `policy.rs` | Kill 許可判定のオーケストレーション。`KillPermission` enum を返す |
-| `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID` env or grandparent をルートとする |
+| `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応 |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux の番号差異吸収、危険 PID 値の拒否 |
@@ -69,4 +69,4 @@ YY.M.COUNTER 形式（例: 26.1.105）。リリースは GitHub Actions の work
 
 - E2E テストは `assert_cmd` を使用し、実際のバイナリを実行する
 - 統合テストは実プロセスツリーを使ったテスト
-- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能
+- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0` や無効値は無視）

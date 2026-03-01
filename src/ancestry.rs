@@ -1,50 +1,59 @@
-//! Ancestry checker for process tree verification
+//! プロセスツリー検証用の ancestry チェッカー
 //!
-//! Provides functionality to verify if a process is a descendant of the current session.
+//! プロセスが現在セッションの子孫かどうかを判定する。
 
 use crate::process_info::ProcessInfoProvider;
 use std::env;
 
-/// Maximum depth for ancestry traversal to prevent infinite loops
+/// 無限ループを防ぐための ancestry 走査最大深度
 const MAX_ANCESTRY_DEPTH: u32 = 100;
 
-/// Environment variable to override the root PID
+/// ルート PID を上書きする環境変数名
 const ROOT_PID_ENV_VAR: &str = "SAFE_KILL_ROOT_PID";
 
-/// Ancestry checker for process tree verification
+/// プロセスツリー検証用 ancestry チェッカー
 pub struct AncestryChecker {
     provider: ProcessInfoProvider,
     root_pid: u32,
 }
 
 impl AncestryChecker {
-    /// Create a new AncestryChecker with automatic root PID detection
+    /// ルート PID を自動検出して `AncestryChecker` を生成する
     pub fn new(provider: ProcessInfoProvider) -> Self {
         let root_pid = Self::get_root_pid(&provider);
         Self { provider, root_pid }
     }
 
-    /// Create a new AncestryChecker with a specific root PID
+    /// ルート PID を明示指定して `AncestryChecker` を生成する
     pub fn with_root_pid(provider: ProcessInfoProvider, root_pid: u32) -> Self {
         Self { provider, root_pid }
     }
 
-    /// Get the root PID (trust root)
+    /// 環境変数からルート PID を解析する
+    fn parse_root_pid(value: &str) -> Option<u32> {
+        let pid = value.trim().parse::<u32>().ok()?;
+        if pid == 0 {
+            return None;
+        }
+        Some(pid)
+    }
+
+    /// ルート PID（信頼ルート）を取得する
     ///
-    /// Priority:
-    /// 1. SAFE_KILL_ROOT_PID environment variable
-    /// 2. Parent of the calling shell (grandparent of current process)
-    /// 3. Current process PID as fallback
+    /// 優先順位:
+    /// 1. `SAFE_KILL_ROOT_PID` 環境変数
+    /// 2. 呼び出しシェルの親（現在プロセスの祖父）
+    /// 3. 現在プロセス PID（フォールバック）
     pub fn get_root_pid(provider: &ProcessInfoProvider) -> u32 {
-        // Check environment variable first
+        // まず環境変数を確認する
         if let Ok(env_pid) = env::var(ROOT_PID_ENV_VAR) {
-            if let Ok(pid) = env_pid.parse::<u32>() {
+            if let Some(pid) = Self::parse_root_pid(&env_pid) {
                 return pid;
             }
         }
 
-        // Get the grandparent (shell's parent) as the trust root
-        // Current process -> Shell -> Trust root
+        // 祖父プロセス（シェルの親）を信頼ルートとして採用する
+        // 現在プロセス -> シェル -> 信頼ルート
         let current_pid = ProcessInfoProvider::current_pid();
 
         if let Some(current_info) = provider.get(current_pid) {
@@ -58,29 +67,29 @@ impl AncestryChecker {
             }
         }
 
-        // Fallback to current PID
+        // フォールバックとして現在 PID を使用する
         current_pid
     }
 
-    /// Get the configured root PID
+    /// 設定済みルート PID を返す
     pub fn root_pid(&self) -> u32 {
         self.root_pid
     }
 
-    /// Check if target_pid is a descendant of root_pid
+    /// `target_pid` が `root_pid` の子孫か判定する
     ///
-    /// Traverses the PPID chain from target_pid upward until:
-    /// - root_pid is found (returns true)
-    /// - PID 1 (init) is reached (returns false)
-    /// - Maximum depth is exceeded (returns false)
-    /// - Process not found (returns false)
+    /// `target_pid` から親 PID チェーンをたどり、以下の条件で停止する:
+    /// - `root_pid` に到達した（`true`）
+    /// - PID 1（init/launchd）に到達した（`false`）
+    /// - 最大深度を超えた（`false`）
+    /// - プロセス情報が取得できない（`false`）
     pub fn is_descendant(&self, target_pid: u32) -> bool {
         self.is_descendant_of(target_pid, self.root_pid)
     }
 
-    /// Check if target_pid is a descendant of a specific ancestor_pid
+    /// `target_pid` が特定の `ancestor_pid` の子孫か判定する
     pub fn is_descendant_of(&self, target_pid: u32, ancestor_pid: u32) -> bool {
-        // If target is the ancestor itself, consider it a descendant
+        // 同一 PID の場合は子孫とみなす
         if target_pid == ancestor_pid {
             return true;
         }
@@ -89,24 +98,24 @@ impl AncestryChecker {
         let mut depth = 0u32;
 
         while depth < MAX_ANCESTRY_DEPTH {
-            // Get process info for current PID
+            // 現在 PID のプロセス情報を取得
             let Some(info) = self.provider.get(current_pid) else {
-                // Process not found
+                // プロセスが見つからない
                 return false;
             };
 
-            // Get parent PID
+            // 親 PID を取得
             let Some(parent_pid) = info.parent_pid else {
-                // No parent (orphan or init)
+                // 親なし（孤立プロセスまたは init）
                 return false;
             };
 
-            // Check if parent is the ancestor we're looking for
+            // 親が目的の祖先か確認
             if parent_pid == ancestor_pid {
                 return true;
             }
 
-            // Stop if we've reached PID 1 (init/launchd)
+            // PID 1（init/launchd）到達時は探索終了
             if parent_pid == 1 {
                 return false;
             }
@@ -115,20 +124,20 @@ impl AncestryChecker {
             depth += 1;
         }
 
-        // Max depth exceeded
+        // 最大深度超過
         false
     }
 
-    /// Check if killing target_pid would be suicide (killing self or parent)
+    /// `target_pid` の kill が自殺行為（自分または親の kill）か判定する
     pub fn is_suicide(&self, target_pid: u32) -> bool {
         let current_pid = ProcessInfoProvider::current_pid();
 
-        // Check if target is self
+        // 自分自身か確認
         if target_pid == current_pid {
             return true;
         }
 
-        // Check if target is parent
+        // 親プロセスか確認
         if let Some(info) = self.provider.get(current_pid) {
             if let Some(parent_pid) = info.parent_pid {
                 if target_pid == parent_pid {
@@ -140,7 +149,7 @@ impl AncestryChecker {
         false
     }
 
-    /// Refresh process information
+    /// プロセス情報を再取得する
     pub fn refresh(&mut self) {
         self.provider.refresh();
     }
@@ -150,7 +159,7 @@ impl AncestryChecker {
 mod tests {
     use super::*;
 
-    // Basic construction tests
+    // 基本的な生成テスト
     #[test]
     fn test_ancestry_checker_new() {
         let provider = ProcessInfoProvider::new();
@@ -165,7 +174,7 @@ mod tests {
         assert_eq!(checker.root_pid(), 12345);
     }
 
-    // Root PID detection tests
+    // ルート PID 検出テスト
     #[test]
     fn test_get_root_pid_returns_valid() {
         let provider = ProcessInfoProvider::new();
@@ -173,34 +182,37 @@ mod tests {
         assert!(root_pid > 0);
     }
 
-    // Note: Environment variable tests are tricky in parallel execution.
-    // We test the parsing logic directly instead.
+    // 補足: 環境変数の直接テストは並列実行時に競合しやすいため、
+    // ここではパース関数を直接検証する。
 
     #[test]
-    fn test_root_pid_env_var_parsing() {
-        // Test that when a valid number is provided, it would be parsed
-        let test_value = "12345";
-        let parsed: Result<u32, _> = test_value.parse();
-        assert!(parsed.is_ok());
-        assert_eq!(parsed.unwrap(), 12345);
+    fn test_parse_root_pid_valid() {
+        assert_eq!(AncestryChecker::parse_root_pid("12345"), Some(12345));
     }
 
     #[test]
-    fn test_root_pid_env_var_invalid_parsing() {
-        // Test that invalid values would fail to parse
-        let test_value = "not_a_number";
-        let parsed: Result<u32, _> = test_value.parse();
-        assert!(parsed.is_err());
+    fn test_parse_root_pid_invalid() {
+        assert_eq!(AncestryChecker::parse_root_pid("not_a_number"), None);
     }
 
-    // is_descendant tests
+    #[test]
+    fn test_parse_root_pid_zero_rejected() {
+        assert_eq!(AncestryChecker::parse_root_pid("0"), None);
+    }
+
+    #[test]
+    fn test_parse_root_pid_trimmed() {
+        assert_eq!(AncestryChecker::parse_root_pid("  42  "), Some(42));
+    }
+
+    // is_descendant テスト
     #[test]
     fn test_current_process_is_descendant_of_root() {
         let provider = ProcessInfoProvider::new();
         let checker = AncestryChecker::new(provider);
         let current_pid = ProcessInfoProvider::current_pid();
 
-        // Current process should be a descendant of its detected root
+        // 現在プロセスは検出されたルートの子孫であるはず
         assert!(checker.is_descendant(current_pid));
     }
 
@@ -218,7 +230,7 @@ mod tests {
         let provider = ProcessInfoProvider::new();
         let checker = AncestryChecker::new(provider);
 
-        // Very high PID unlikely to exist
+        // 存在しない可能性が高い PID
         assert!(!checker.is_descendant(999999999));
     }
 
@@ -228,18 +240,18 @@ mod tests {
         let current_pid = ProcessInfoProvider::current_pid();
         let checker = AncestryChecker::with_root_pid(provider, current_pid);
 
-        // PID 1 (init) is never a descendant of a normal process
+        // PID 1（init）は通常プロセスの子孫にならない
         assert!(!checker.is_descendant(1));
     }
 
-    // is_descendant_of tests
+    // is_descendant_of テスト
     #[test]
     fn test_is_descendant_of_self() {
         let provider = ProcessInfoProvider::new();
         let checker = AncestryChecker::new(provider);
         let current_pid = ProcessInfoProvider::current_pid();
 
-        // A process is a descendant of itself
+        // プロセスは自分自身の子孫とみなす
         assert!(checker.is_descendant_of(current_pid, current_pid));
     }
 
@@ -249,7 +261,7 @@ mod tests {
         let checker = AncestryChecker::new(provider);
         let current_pid = ProcessInfoProvider::current_pid();
 
-        // Current process should be a descendant of its parent
+        // 現在プロセスは親プロセスの子孫であるはず
         if let Some(info) = checker.provider.get(current_pid) {
             if let Some(parent_pid) = info.parent_pid {
                 assert!(checker.is_descendant_of(current_pid, parent_pid));
@@ -257,7 +269,7 @@ mod tests {
         }
     }
 
-    // is_suicide tests
+    // is_suicide テスト
     #[test]
     fn test_is_suicide_self() {
         let provider = ProcessInfoProvider::new();
@@ -285,21 +297,20 @@ mod tests {
         let provider = ProcessInfoProvider::new();
         let checker = AncestryChecker::new(provider);
 
-        // Some random process should not be suicide
-        // Using a high PID that's unlikely to be self or parent
+        // 自分や親でない可能性が高い PID は自殺判定にならない
         assert!(!checker.is_suicide(999999999));
     }
 
-    // Refresh tests
+    // refresh テスト
     #[test]
     fn test_refresh() {
         let provider = ProcessInfoProvider::new();
         let mut checker = AncestryChecker::new(provider);
 
-        // Just verify refresh doesn't panic
+        // panic しないことのみ確認
         checker.refresh();
 
-        // Root PID should remain the same
+        // ルート PID が有効値であることを確認
         let root = checker.root_pid();
         assert!(root > 0);
     }
@@ -311,7 +322,7 @@ mod tests {
 
         assert!(checker.is_descendant(1));
 
-        // Result varies by environment (process tree depth) - just verify no panic
+        // 結果は実行環境に依存するため、panic しないことのみ確認
         let current_pid = ProcessInfoProvider::current_pid();
         let _result = checker.is_descendant(current_pid);
     }
@@ -325,18 +336,19 @@ mod tests {
 
         let _result = checker.is_descendant(current_pid);
 
-        assert!(MAX_ANCESTRY_DEPTH >= 10);
-        assert!(MAX_ANCESTRY_DEPTH <= 1000);
+        let depth = MAX_ANCESTRY_DEPTH;
+        assert!(depth >= 10);
+        assert!(depth <= 1000);
         assert!(root > 0);
     }
 
-    // Environment variable constant test
+    // 環境変数定数テスト
     #[test]
     fn test_env_var_name() {
         assert_eq!(ROOT_PID_ENV_VAR, "SAFE_KILL_ROOT_PID");
     }
 
-    // Max depth constant test
+    // 最大深度定数テスト
     #[test]
     fn test_max_depth_constant() {
         assert_eq!(MAX_ANCESTRY_DEPTH, 100);

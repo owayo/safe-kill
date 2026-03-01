@@ -26,7 +26,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 sysinfo = "0.38.2"
 
 # Unix signal handling
-nix = { version = "0.31.1", features = ["signal", "process"] }
+nix = { version = "0.31.2", features = ["signal", "process"] }
 
 # Configuration file parsing
 toml = "1.0.3"
@@ -44,7 +44,7 @@ thiserror = "2.0.18"
 [dev-dependencies]
 assert_cmd = "2.1.2"
 predicates = "3.1.4"
-tempfile = "3.25.0"
+tempfile = "3.26.0"
 
 [profile.release]
 lto = true

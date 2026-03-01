@@ -835,6 +835,16 @@ fn test_env_var_root_pid_invalid_ignored() {
         .success();
 }
 
+#[test]
+fn test_env_var_root_pid_zero_ignored() {
+    // PID 0 は無効値として無視され、デフォルトの挙動になる
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("SAFE_KILL_ROOT_PID", "0")
+        .arg("--list")
+        .assert()
+        .success();
+}
+
 // =============================================================================
 // SIGKILL での子プロセス終了テスト
 // =============================================================================

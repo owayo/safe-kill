@@ -241,7 +241,7 @@ flowchart TB
 
 | Variable | Description |
 |----------|-------------|
-| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks |
+| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0` or invalid values are ignored) |
 
 ## Claude Code Integration
 
@@ -305,9 +305,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Unit Tests**: 281 tests covering all modules
+- **Library Unit Tests**: 269 tests covering all modules
+- **Binary Unit Tests**: 14 tests for CLI output utilities and version checks
 - **Integration Tests**: 42 tests with real process trees
-- **E2E Tests**: 61 tests for CLI behavior
+- **E2E Tests**: 62 tests for CLI behavior
 
 ## Contributing
 
