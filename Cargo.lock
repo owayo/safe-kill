@@ -728,7 +728,7 @@ dependencies = [
 
 [[package]]
 name = "safe-kill"
-version = "26.1.105"
+version = "26.3.100"
 dependencies = [
  "assert_cmd",
  "clap",
