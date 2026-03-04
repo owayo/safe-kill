@@ -40,7 +40,7 @@
 ## Requirements
 
 - **OS**: macOS, Linux
-- **Rust**: 1.70+ (for building from source)
+- **Rust**: 1.85+ (for building from source)
 
 ## Installation
 

@@ -4,7 +4,7 @@
 
 use crate::error::SafeKillError;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
-use netstat2::{get_sockets_info, AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo};
+use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
 
 /// Information about a process using a specific port
 #[derive(Debug, Clone)]

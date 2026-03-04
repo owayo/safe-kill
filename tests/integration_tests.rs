@@ -664,9 +664,11 @@ fn test_process_info_find_by_name_matches_exact() {
 
     // Finding by exact current process name should include current PID
     let results = provider.find_by_name(&current.name);
-    assert!(results
-        .iter()
-        .any(|p| p.pid == ProcessInfoProvider::current_pid()));
+    assert!(
+        results
+            .iter()
+            .any(|p| p.pid == ProcessInfoProvider::current_pid())
+    );
 }
 
 // =============================================================================
