@@ -35,7 +35,7 @@ impl ProcessInfoProvider {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
     }
 
-    /// Get process information by PID
+    /// PID でプロセス情報を取得
     pub fn get(&self, pid: u32) -> Option<ProcessInfo> {
         let sysinfo_pid = Pid::from_u32(pid);
         self.system.process(sysinfo_pid).map(|proc| ProcessInfo {
@@ -50,7 +50,7 @@ impl ProcessInfoProvider {
         })
     }
 
-    /// Find all processes matching the given name (exact match)
+    /// 指定名に一致するすべてのプロセスを検索（完全一致）
     pub fn find_by_name(&self, name: &str) -> Vec<ProcessInfo> {
         self.system
             .processes()
@@ -69,7 +69,7 @@ impl ProcessInfoProvider {
             .collect()
     }
 
-    /// Get all processes
+    /// すべてのプロセスを取得
     pub fn all(&self) -> Vec<ProcessInfo> {
         self.system
             .processes()
@@ -87,12 +87,12 @@ impl ProcessInfoProvider {
             .collect()
     }
 
-    /// Get current process PID
+    /// 現在のプロセスの PID を取得
     pub fn current_pid() -> u32 {
         std::process::id()
     }
 
-    /// Get parent PID of current process
+    /// 現在のプロセスの親 PID を取得
     pub fn current_parent_pid(&self) -> Option<u32> {
         self.get(Self::current_pid()).and_then(|p| p.parent_pid)
     }
@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn test_provider_new() {
         let provider = ProcessInfoProvider::new();
-        // Should have at least some processes
+        // 少なくともいくつかのプロセスが存在するはず
         assert!(!provider.all().is_empty());
     }
 
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn test_get_nonexistent_process() {
         let provider = ProcessInfoProvider::new();
-        // Use a very high PID that's unlikely to exist
+        // 存在しない可能性の高い大きな PID を使用
         let info = provider.get(999999999);
         assert!(info.is_none());
     }

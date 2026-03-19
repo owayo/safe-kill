@@ -647,7 +647,7 @@ fn test_init_config_parses_as_valid_config() {
     let content = InitCommand::default_config_content();
     let config: Config = toml::from_str(&content).expect("Default config should be valid");
 
-    // Should have allowed_ports section
+    // allowed_ports セクションが存在するべき
     assert!(config.allowed_ports.is_some());
     let ports = config.allowed_ports.unwrap();
     assert!(!ports.ports.is_empty());
@@ -662,7 +662,7 @@ fn test_process_info_find_by_name_matches_exact() {
     let provider = ProcessInfoProvider::new();
     let current = provider.get(ProcessInfoProvider::current_pid()).unwrap();
 
-    // Finding by exact current process name should include current PID
+    // 現在のプロセス名で正確に検索すると、現在の PID が含まれるべき
     let results = provider.find_by_name(&current.name);
     assert!(
         results
@@ -765,7 +765,7 @@ fn test_config_with_allowed_ports_in_policy_engine() {
 #[test]
 fn test_process_info_get_pid_1() {
     let provider = ProcessInfoProvider::new();
-    // PID 1 should exist on any Unix system
+    // PID 1 はすべての Unix システムで存在するべき
     let info = provider.get(1);
     assert!(info.is_some(), "PID 1 should exist");
     let info = info.unwrap();

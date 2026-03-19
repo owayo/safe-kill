@@ -555,7 +555,7 @@ mod tests {
 
         if let Some(process) = engine.provider.get(current_pid) {
             let permission = engine.can_kill(&process);
-            // Suicide prevention should take precedence
+            // 自殺防止が優先されるべき
             assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
         }
     }
@@ -586,12 +586,12 @@ mod tests {
         }
     }
 
-    // kill_by_port tests
+    // kill_by_port のテスト
     #[test]
     fn test_kill_by_port_no_process() {
         use crate::config::AllowedPorts;
 
-        // Explicit allowed_ports configuration (None means port killing is disabled)
+        // 明示的な allowed_ports 設定（None はポート kill 無効を意味する）
         let config = Config {
             allowlist: None,
             denylist: None,
@@ -600,14 +600,14 @@ mod tests {
             }),
         };
         let engine = PolicyEngine::new(config);
-        // Port 3009 is allowed but no process on it
+        // ポート 3009 は許可されているがプロセスが存在しない
         let result = engine.kill_by_port(3009, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(3009))));
     }
 
     #[test]
     fn test_kill_by_port_no_config_disabled() {
-        // When allowed_ports is None, port killing is disabled entirely
+        // allowed_ports が None の場合、ポート kill は完全に無効
         let config = Config {
             allowlist: None,
             denylist: None,
@@ -615,7 +615,7 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // Any port should return PortNotAllowed when config is None
+        // config が None の場合、すべてのポートで PortNotAllowed を返す
         let result = engine.kill_by_port(3000, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
     }
@@ -633,7 +633,7 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // Port 59996 is not in allowed list
+        // ポート 59996 は許可リストに含まれていない
         let result = engine.kill_by_port(59996, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
     }
