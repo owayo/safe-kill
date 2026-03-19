@@ -924,4 +924,47 @@ ports = ["3000-3100", "3306", "5432"]
             _ => panic!("Expected PortNotAllowed error"),
         }
     }
+
+    #[test]
+    fn test_is_port_allowed_invalid_spec_skipped() {
+        // 無効なポート指定が混在しても、有効な指定は機能する
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec![
+                    "not-a-port".to_string(),
+                    "8080".to_string(),
+                    "abc".to_string(),
+                ],
+            }),
+        };
+        assert!(config.is_port_allowed(8080));
+        assert!(!config.is_port_allowed(3000));
+    }
+
+    #[test]
+    fn test_get_port_ranges_skips_invalid() {
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec![
+                    "invalid".to_string(),
+                    "3000-3010".to_string(),
+                    "".to_string(),
+                ],
+            }),
+        };
+        let ranges = config.get_port_ranges();
+        // 有効な範囲のみ返される
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(
+            ranges[0],
+            PortRange::Range {
+                start: 3000,
+                end: 3010
+            }
+        );
+    }
 }

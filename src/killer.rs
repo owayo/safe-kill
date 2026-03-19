@@ -1,73 +1,78 @@
-//! Process killer for safe-kill
+//! safe-kill のプロセス終了処理
 //!
-//! Handles the actual process termination after safety checks have passed.
+//! 安全性チェック通過後の実際のシグナル送信を担当する。
 
 use crate::error::SafeKillError;
 use crate::signal::{Signal, SignalSender};
 
-/// Result of a kill operation
+/// 1 件の kill 実行結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KillResult {
-    /// Target process ID
+    /// 対象プロセス ID
     pub pid: u32,
-    /// Process name (if known)
+    /// プロセス名（取得できた場合）
     pub name: String,
-    /// Whether the operation succeeded
+    /// 実行成否
     pub success: bool,
-    /// Detailed message about the result
+    /// 表示用メッセージ
     pub message: String,
+    /// エラー本体。成功時と dry-run 時は `None`
+    pub error: Option<SafeKillError>,
 }
 
 impl KillResult {
-    /// Create a successful kill result
+    /// 成功結果を生成する
     pub fn success(pid: u32, name: impl Into<String>, signal: Signal) -> Self {
         Self {
             pid,
             name: name.into(),
             success: true,
             message: format!("Sent {} to process", signal.name()),
+            error: None,
         }
     }
 
-    /// Create a failed kill result
+    /// 失敗結果を生成する
     pub fn failure(pid: u32, name: impl Into<String>, error: &SafeKillError) -> Self {
         Self {
             pid,
             name: name.into(),
             success: false,
             message: error.to_string(),
+            error: Some(error.clone()),
         }
     }
 
-    /// Create a dry-run result
+    /// dry-run 結果を生成する
     pub fn dry_run(pid: u32, name: impl Into<String>, signal: Signal) -> Self {
         Self {
             pid,
             name: name.into(),
             success: true,
             message: format!("Would send {} to process (dry run)", signal.name()),
+            error: None,
         }
     }
 }
 
-/// Result of a batch kill operation
+/// 複数件の kill 実行結果
 #[derive(Debug, Clone, Default)]
 pub struct BatchKillResult {
-    /// Individual results for each process
+    /// 各プロセスの結果
     pub results: Vec<KillResult>,
-    /// Total number of processes matched
+    /// 一致したプロセス総数
     pub total_matched: usize,
-    /// Total number of processes successfully killed
+    /// 成功したプロセス総数
     pub total_killed: usize,
 }
 
 impl BatchKillResult {
-    /// Create a new empty batch result
+    /// 空の結果を生成する
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Add a result to the batch
+    /// 結果を追加する
     pub fn add(&mut self, result: KillResult) {
         if result.success {
             self.total_killed += 1;
@@ -76,40 +81,54 @@ impl BatchKillResult {
         self.results.push(result);
     }
 
-    /// Check if all operations succeeded
+    /// 全件成功か判定する
     pub fn all_success(&self) -> bool {
         self.total_matched > 0 && self.total_killed == self.total_matched
     }
 
-    /// Check if any operations succeeded
+    /// 1 件でも成功したか判定する
     pub fn any_success(&self) -> bool {
         self.total_killed > 0
     }
 
-    /// Check if the batch is empty
+    /// 結果が空か判定する
     pub fn is_empty(&self) -> bool {
         self.results.is_empty()
     }
+
+    /// ポリシー拒否ではない最初の実行時エラーを返す
+    pub fn first_operational_error(&self) -> Option<&SafeKillError> {
+        self.results
+            .iter()
+            .filter_map(|result| result.error.as_ref())
+            .find(|error| {
+                !matches!(
+                    error,
+                    SafeKillError::Denylisted(_)
+                        | SafeKillError::NotDescendant(_, _)
+                        | SafeKillError::SuicidePrevention(_)
+                )
+            })
+    }
 }
 
-/// Process killer that sends signals to processes
+/// プロセスへシグナルを送る実行器
 pub struct ProcessKiller;
 
 impl ProcessKiller {
-    /// Create a new ProcessKiller
+    /// `ProcessKiller` を生成する
     pub fn new() -> Self {
         Self
     }
 
-    /// Kill a process with the specified signal
+    /// 指定シグナルを送る
     ///
-    /// This function only handles the signal sending.
-    /// Safety checks should be performed by the caller (PolicyEngine).
+    /// 安全性チェックは呼び出し側（`PolicyEngine`）で行う。
     pub fn kill(&self, pid: u32, signal: Signal) -> Result<(), SafeKillError> {
         SignalSender::send(pid, signal)
     }
 
-    /// Kill a process with result tracking
+    /// 表示用結果を伴って kill を実行する
     pub fn kill_with_result(
         &self,
         pid: u32,
@@ -140,7 +159,7 @@ impl Default for ProcessKiller {
 mod tests {
     use super::*;
 
-    // KillResult tests
+    // KillResult のテスト
     #[test]
     fn test_kill_result_success() {
         let result = KillResult::success(1234, "test", Signal::SIGTERM);
@@ -148,6 +167,7 @@ mod tests {
         assert_eq!(result.name, "test");
         assert!(result.success);
         assert!(result.message.contains("SIGTERM"));
+        assert!(result.error.is_none());
     }
 
     #[test]
@@ -158,6 +178,7 @@ mod tests {
         assert_eq!(result.name, "test");
         assert!(!result.success);
         assert!(result.message.contains("not found"));
+        assert_eq!(result.error, Some(error));
     }
 
     #[test]
@@ -168,6 +189,7 @@ mod tests {
         assert!(result.success);
         assert!(result.message.contains("dry run"));
         assert!(result.message.contains("SIGKILL"));
+        assert!(result.error.is_none());
     }
 
     #[test]
@@ -185,7 +207,7 @@ mod tests {
         assert!(debug_str.contains("100"));
     }
 
-    // BatchKillResult tests
+    // BatchKillResult のテスト
     #[test]
     fn test_batch_kill_result_new() {
         let batch = BatchKillResult::new();
@@ -225,6 +247,43 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_kill_result_first_operational_error() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            100,
+            "denylisted",
+            &SafeKillError::Denylisted("denylisted".to_string()),
+        ));
+        batch.add(KillResult::failure(
+            200,
+            "worker",
+            &SafeKillError::PermissionDenied(200),
+        ));
+
+        assert_eq!(
+            batch.first_operational_error(),
+            Some(&SafeKillError::PermissionDenied(200))
+        );
+    }
+
+    #[test]
+    fn test_batch_kill_result_first_operational_error_none_for_policy_only() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            100,
+            "denylisted",
+            &SafeKillError::Denylisted("denylisted".to_string()),
+        ));
+        batch.add(KillResult::failure(
+            200,
+            "parent",
+            &SafeKillError::SuicidePrevention(200),
+        ));
+
+        assert_eq!(batch.first_operational_error(), None);
+    }
+
+    #[test]
     fn test_batch_kill_result_mixed() {
         let mut batch = BatchKillResult::new();
         batch.add(KillResult::success(100, "a", Signal::SIGTERM));
@@ -250,15 +309,15 @@ mod tests {
     #[test]
     fn test_batch_kill_result_all_success_empty() {
         let batch = BatchKillResult::new();
-        // Empty batch should not be considered "all success"
+        // 空の結果は「全件成功」とはみなさない
         assert!(!batch.all_success());
     }
 
-    // ProcessKiller tests
+    // ProcessKiller のテスト
     #[test]
     fn test_process_killer_new() {
         let killer = ProcessKiller::new();
-        // Just verify it can be created
+        // 生成できることだけ確認する
         let _ = killer;
     }
 
@@ -282,6 +341,7 @@ mod tests {
 
         assert!(result.success);
         assert!(result.message.contains("dry run"));
+        assert!(result.error.is_none());
     }
 
     #[test]
@@ -289,8 +349,12 @@ mod tests {
         let killer = ProcessKiller::new();
         let result = killer.kill_with_result(999999999, "test", Signal::SIGTERM, false);
 
-        // Should fail because process doesn't exist
+        // プロセスが存在しないため失敗する
         assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(SafeKillError::ProcessNotFound(999999999))
+        );
     }
 
     #[test]
@@ -382,5 +446,68 @@ mod tests {
         assert_eq!(batch.total_killed, 0);
         assert!(!batch.all_success());
         assert!(!batch.any_success());
+    }
+
+    #[test]
+    fn test_first_operational_error_empty_batch() {
+        let batch = BatchKillResult::new();
+        assert_eq!(batch.first_operational_error(), None);
+    }
+
+    #[test]
+    fn test_first_operational_error_skips_not_descendant() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            1,
+            "a",
+            &SafeKillError::NotDescendant(1, "a".to_string()),
+        ));
+        batch.add(KillResult::failure(
+            2,
+            "b",
+            &SafeKillError::ProcessNotFound(2),
+        ));
+        assert_eq!(
+            batch.first_operational_error(),
+            Some(&SafeKillError::ProcessNotFound(2))
+        );
+    }
+
+    #[test]
+    fn test_first_operational_error_returns_first_among_multiple() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            1,
+            "a",
+            &SafeKillError::Denylisted("a".to_string()),
+        ));
+        batch.add(KillResult::failure(
+            2,
+            "b",
+            &SafeKillError::PermissionDenied(2),
+        ));
+        batch.add(KillResult::failure(
+            3,
+            "c",
+            &SafeKillError::ProcessNotFound(3),
+        ));
+        // ポリシーエラー以外の最初 = PermissionDenied(2)
+        assert_eq!(
+            batch.first_operational_error(),
+            Some(&SafeKillError::PermissionDenied(2))
+        );
+    }
+
+    #[test]
+    fn test_first_operational_error_success_results_ignored() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::success(1, "a", Signal::SIGTERM));
+        batch.add(KillResult::failure(
+            2,
+            "b",
+            &SafeKillError::Denylisted("b".to_string()),
+        ));
+        // 成功結果には error がなく、Denylisted はポリシーエラー → None
+        assert_eq!(batch.first_operational_error(), None);
     }
 }

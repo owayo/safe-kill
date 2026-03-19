@@ -1,39 +1,39 @@
-//! CLI argument parser for safe-kill
+//! safe-kill の CLI 引数パーサー
 //!
-//! Provides type-safe argument parsing using clap derive.
+//! clap derive を使用した型安全な引数解析を提供する。
 
 use clap::{Parser, Subcommand};
 
 use crate::error::SafeKillError;
 use crate::signal::{Signal, SignalSender};
 
-/// Execution mode determined from CLI arguments
+/// CLI 引数から決定される実行モード
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutionMode {
-    /// Kill a process by PID
+    /// PID 指定でプロセスを kill
     KillByPid(u32),
-    /// Kill processes by name (pkill-style)
+    /// 名前指定でプロセスを kill（pkill 風）
     KillByName(String),
-    /// Kill process using a specific port
+    /// ポート指定でプロセスを kill
     KillByPort(u16),
-    /// List killable processes
+    /// kill 可能なプロセスを一覧表示
     ListKillable,
-    /// Initialize configuration file
+    /// 設定ファイルを初期化
     InitConfig { force: bool },
 }
 
-/// Subcommands for safe-kill
+/// safe-kill のサブコマンド
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Initialize configuration file at ~/.config/safe-kill/config.toml
+    /// ~/.config/safe-kill/config.toml に設定ファイルを初期化
     Init {
-        /// Force overwrite existing config file without prompting
+        /// 既存の設定ファイルを確認なしで上書き
         #[arg(long)]
         force: bool,
     },
 }
 
-/// CLI arguments for safe-kill
+/// safe-kill の CLI 引数
 #[derive(Parser, Debug)]
 #[command(
     name = "safe-kill",
@@ -44,48 +44,48 @@ pub enum Command {
                   preventing accidental termination of system or unrelated processes."
 )]
 pub struct CliArgs {
-    /// Subcommand (e.g., init)
+    /// サブコマンド（例: init）
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Target PID to kill
+    /// kill 対象の PID
     #[arg(value_name = "PID")]
     pub pid: Option<u32>,
 
-    /// Kill processes by name (pkill-style)
+    /// 名前指定でプロセスを kill（pkill 風）
     #[arg(short = 'N', long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Kill process using the specified port
+    /// 指定ポートを使用するプロセスを kill
     #[arg(short = 'p', long, value_name = "PORT")]
     pub port: Option<u16>,
 
-    /// Signal to send (name or number)
+    /// 送信するシグナル（名前または番号）
     #[arg(short, long, default_value = "SIGTERM", value_name = "SIGNAL")]
     pub signal: String,
 
-    /// List killable processes
+    /// kill 可能なプロセスを一覧表示
     #[arg(short, long)]
     pub list: bool,
 
-    /// Dry run mode (don't actually send signals)
+    /// dry-run モード（実際にはシグナルを送信しない）
     #[arg(short = 'n', long)]
     pub dry_run: bool,
 }
 
 impl CliArgs {
-    /// Parse CLI arguments from command line
+    /// コマンドラインから CLI 引数を解析
     pub fn parse_args() -> Self {
         Self::parse()
     }
 
-    /// Validate arguments and determine execution mode
+    /// 引数を検証し、実行モードを決定する
     ///
-    /// Returns an error if:
-    /// - No target is specified (neither PID, --name, --port, nor --list)
-    /// - Multiple targets are specified (PID and --name/--port, or --list with others)
+    /// 以下の場合にエラーを返す:
+    /// - ターゲットが指定されていない（PID、--name、--port、--list のいずれもなし）
+    /// - 複数のターゲットが指定されている（PID と --name/--port、または --list と他の組み合わせ）
     pub fn validate(&self) -> Result<ExecutionMode, SafeKillError> {
-        // Handle subcommands first
+        // サブコマンドを先に処理
         if let Some(ref cmd) = self.command {
             match cmd {
                 Command::Init { force } => {
@@ -94,13 +94,13 @@ impl CliArgs {
             }
         }
 
-        // Count how many target options are specified
+        // ターゲットオプションの指定数をカウント
         let has_pid = self.pid.is_some();
         let has_name = self.name.is_some();
         let has_port = self.port.is_some();
         let has_list = self.list;
 
-        // Check for mutual exclusivity
+        // 排他性チェック
         let target_count = [has_pid, has_name, has_port, has_list]
             .iter()
             .filter(|&&b| b)
@@ -118,12 +118,12 @@ impl CliArgs {
                 } else if let Some(port) = self.port {
                     Ok(ExecutionMode::KillByPort(port))
                 } else {
-                    // This should never happen given the logic above
+                    // 上記のロジックからここには到達しないはず
                     Err(SafeKillError::NoTarget)
                 }
             }
             _ => {
-                // Multiple targets specified - this is an error
+                // 複数ターゲット指定はエラー
                 if has_list {
                     Err(SafeKillError::InvalidPid(
                         "--list cannot be combined with PID, --name, or --port".to_string(),
@@ -141,7 +141,7 @@ impl CliArgs {
         }
     }
 
-    /// Parse the signal argument into a Signal enum
+    /// シグナル引数を Signal enum に解析する
     pub fn parse_signal(&self) -> Result<Signal, SafeKillError> {
         SignalSender::parse_signal(&self.signal)
     }
@@ -151,7 +151,7 @@ impl CliArgs {
 mod tests {
     use super::*;
 
-    // Helper to create CliArgs for testing
+    // テスト用の CliArgs を作成するヘルパー
     fn make_args(
         pid: Option<u32>,
         name: Option<String>,
@@ -171,7 +171,7 @@ mod tests {
         }
     }
 
-    // Helper to create CliArgs with subcommand
+    // サブコマンド付きの CliArgs を作成するヘルパー
     fn make_args_with_command(command: Command) -> CliArgs {
         CliArgs {
             command: Some(command),
@@ -184,7 +184,7 @@ mod tests {
         }
     }
 
-    // ExecutionMode tests
+    // ExecutionMode テスト
     #[test]
     fn test_execution_mode_debug() {
         let mode = ExecutionMode::KillByPid(1234);
@@ -207,7 +207,7 @@ mod tests {
         assert_ne!(ExecutionMode::KillByPid(100), ExecutionMode::KillByPid(200));
     }
 
-    // CliArgs validation tests
+    // CliArgs バリデーションテスト
     #[test]
     fn test_validate_no_target() {
         let args = make_args(None, None, None, "SIGTERM", false, false);
@@ -341,7 +341,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // parse_signal tests
+    // parse_signal テスト
     #[test]
     fn test_parse_signal_default() {
         let args = make_args(Some(1234), None, None, "SIGTERM", false, false);
@@ -384,7 +384,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // dry_run tests
+    // dry_run テスト
     #[test]
     fn test_dry_run_flag() {
         let args = make_args(Some(1234), None, None, "SIGTERM", false, true);
@@ -397,7 +397,7 @@ mod tests {
         assert!(!args.dry_run);
     }
 
-    // CliArgs struct tests
+    // CliArgs 構造体テスト
     #[test]
     fn test_cli_args_debug() {
         let args = make_args(Some(1234), None, None, "SIGTERM", false, false);
@@ -424,20 +424,20 @@ mod tests {
         assert!(args.dry_run);
     }
 
-    // Integration-like tests
+    // 統合的テスト
     #[test]
     fn test_workflow_pid_kill() {
         let args = make_args(Some(1234), None, None, "SIGTERM", false, false);
 
-        // Validate
+        // バリデーション
         let mode = args.validate().unwrap();
         assert!(matches!(mode, ExecutionMode::KillByPid(1234)));
 
-        // Parse signal
+        // シグナル解析
         let signal = args.parse_signal().unwrap();
         assert_eq!(signal, Signal::SIGTERM);
 
-        // Check dry_run
+        // dry_run 確認
         assert!(!args.dry_run);
     }
 
@@ -445,18 +445,18 @@ mod tests {
     fn test_workflow_name_kill_dry_run() {
         let args = make_args(None, Some("node".to_string()), None, "SIGKILL", false, true);
 
-        // Validate
+        // バリデーション
         let mode = args.validate().unwrap();
         match mode {
             ExecutionMode::KillByName(name) => assert_eq!(name, "node"),
             _ => panic!("Expected KillByName"),
         }
 
-        // Parse signal
+        // シグナル解析
         let signal = args.parse_signal().unwrap();
         assert_eq!(signal, Signal::SIGKILL);
 
-        // Check dry_run
+        // dry_run 確認
         assert!(args.dry_run);
     }
 
@@ -464,15 +464,15 @@ mod tests {
     fn test_workflow_port_kill() {
         let args = make_args(None, None, Some(8080), "SIGTERM", false, false);
 
-        // Validate
+        // バリデーション
         let mode = args.validate().unwrap();
         assert!(matches!(mode, ExecutionMode::KillByPort(8080)));
 
-        // Parse signal
+        // シグナル解析
         let signal = args.parse_signal().unwrap();
         assert_eq!(signal, Signal::SIGTERM);
 
-        // Check dry_run
+        // dry_run 確認
         assert!(!args.dry_run);
     }
 
@@ -480,12 +480,12 @@ mod tests {
     fn test_workflow_list() {
         let args = make_args(None, None, None, "SIGTERM", true, false);
 
-        // Validate
+        // バリデーション
         let mode = args.validate().unwrap();
         assert!(matches!(mode, ExecutionMode::ListKillable));
     }
 
-    // Init subcommand tests
+    // Init サブコマンドテスト
     #[test]
     fn test_init_command() {
         let args = make_args_with_command(Command::Init { force: false });

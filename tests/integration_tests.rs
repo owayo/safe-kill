@@ -1,6 +1,6 @@
-//! Integration tests for safe-kill
+//! safe-kill の統合テスト
 //!
-//! Tests the public API with real process trees, configuration files, and signal operations.
+//! 実際のプロセスツリー、設定ファイル、シグナル操作を使って公開 API をテストする。
 
 use safe_kill::ancestry::AncestryChecker;
 use safe_kill::config::Config;
@@ -24,7 +24,7 @@ fn test_real_process_tree_current_is_descendant() {
     let checker = AncestryChecker::new(provider);
     let current_pid = ProcessInfoProvider::current_pid();
 
-    // Current process should be a descendant of detected root
+    // 現在のプロセスは検出されたルートの子孫であるべき
     assert!(checker.is_descendant(current_pid));
 }
 
@@ -33,13 +33,13 @@ fn test_real_process_tree_parent_chain() {
     let provider = ProcessInfoProvider::new();
     let current_pid = ProcessInfoProvider::current_pid();
 
-    // Get current process info first
+    // まず現在のプロセス情報を取得
     let parent_pid = provider.get(current_pid).and_then(|info| info.parent_pid);
 
-    // Create checker after we're done with provider
+    // provider の使用が終わった後に checker を作成
     let checker = AncestryChecker::new(ProcessInfoProvider::new());
 
-    // Current should be descendant of its parent
+    // 現在のプロセスは親の子孫であるべき
     if let Some(parent_pid) = parent_pid {
         assert!(checker.is_descendant_of(current_pid, parent_pid));
     }
@@ -51,7 +51,7 @@ fn test_real_process_tree_unrelated_process() {
     let current_pid = ProcessInfoProvider::current_pid();
     let checker = AncestryChecker::with_root_pid(provider, current_pid);
 
-    // PID 1 (init/launchd) is not a descendant of current process
+    // PID 1 (init/launchd) は現在のプロセスの子孫ではない
     assert!(!checker.is_descendant(1));
 }
 
@@ -60,13 +60,13 @@ fn test_real_process_tree_grandparent_ancestor() {
     let provider = ProcessInfoProvider::new();
     let current_pid = ProcessInfoProvider::current_pid();
 
-    // Get grandparent
+    // 祖父プロセスを取得
     if let Some(current_info) = provider.get(current_pid) {
         if let Some(parent_pid) = current_info.parent_pid {
             if let Some(parent_info) = provider.get(parent_pid) {
                 if let Some(grandparent_pid) = parent_info.parent_pid {
                     let checker = AncestryChecker::new(ProcessInfoProvider::new());
-                    // Current should be descendant of grandparent
+                    // 現在のプロセスは祖父プロセスの子孫であるべき
                     assert!(checker.is_descendant_of(current_pid, grandparent_pid));
                 }
             }
@@ -76,8 +76,8 @@ fn test_real_process_tree_grandparent_ancestor() {
 
 #[test]
 fn test_real_process_tree_env_var_override() {
-    // Test that the root PID env var would be respected
-    // (We don't actually set it to avoid side effects, but verify the parsing logic)
+    // ルート PID 環境変数が尊重されることをテスト
+    // （副作用を避けるため実際には設定せず、パースロジックのみ検証）
     let env_value = "12345";
     let parsed: Result<u32, _> = env_value.parse();
     assert!(parsed.is_ok());
@@ -128,7 +128,7 @@ fn test_config_apply_in_policy_engine() {
 
     let engine = PolicyEngine::new(config);
 
-    // Verify config is applied
+    // 設定が適用されていることを確認
     assert!(engine.config().is_allowed("allowed_test"));
     assert!(engine.config().is_denied("denied_test"));
 }
@@ -136,11 +136,11 @@ fn test_config_apply_in_policy_engine() {
 #[test]
 fn test_config_defaults_applied_when_missing() {
     let file = NamedTempFile::new().unwrap();
-    // Empty config file
+    // 空の設定ファイル
 
     let config = Config::load_from_path(Some(file.path().to_path_buf()));
 
-    // Default denylist should be applied
+    // デフォルトの denylist が適用されるべき
     assert!(config.denylist.is_some());
     let denylist = config.denylist.unwrap();
     assert!(!denylist.processes.is_empty());
@@ -153,7 +153,7 @@ fn test_config_fallback_on_invalid_toml() {
 
     let config = Config::load_from_path(Some(file.path().to_path_buf()));
 
-    // Should fall back to defaults
+    // デフォルトにフォールバックすべき
     assert!(config.denylist.is_some());
 }
 
@@ -178,9 +178,9 @@ fn test_config_denylist_precedence_over_allowlist() {
         allowed_ports: None,
     };
 
-    // Denylist takes precedence
+    // denylist が優先される
     assert!(config.is_denied("conflict"));
-    // Even though it's in allowlist, denylist check comes first
+    // allowlist に含まれていても、denylist のチェックが先に行われる
 }
 
 // =============================================================================
@@ -195,7 +195,7 @@ fn test_signal_send_to_nonexistent_process() {
     match result {
         Err(SafeKillError::ProcessNotFound(pid)) => assert_eq!(pid, 999999999),
         Err(SafeKillError::PermissionDenied(_)) => {
-            // Some systems return permission denied instead
+            // 一部のシステムでは permission denied が返る
         }
         _ => panic!("Expected ProcessNotFound or PermissionDenied"),
     }
@@ -276,7 +276,7 @@ fn test_process_killer_dry_run() {
 fn test_dry_run_does_not_send_signal() {
     let killer = ProcessKiller::new();
 
-    // Even with a valid signal, dry run shouldn't actually send
+    // 有効なシグナルでも dry-run では実際に送信しない
     let result = killer.kill_with_result(
         ProcessInfoProvider::current_pid(),
         "self",
@@ -284,10 +284,10 @@ fn test_dry_run_does_not_send_signal() {
         true,
     );
 
-    // Should succeed (in dry-run mode)
+    // dry-run モードでは成功するべき
     assert!(result.success);
     assert!(result.message.contains("dry run"));
-    // Process should still be alive (we're still running!)
+    // プロセスはまだ生存しているはず（まだ実行中！）
 }
 
 #[test]
@@ -306,7 +306,7 @@ fn test_dry_run_result_format() {
 fn test_policy_engine_with_dry_run() {
     use safe_kill::config::ProcessList;
 
-    // Create a config that allows a specific process
+    // 特定のプロセスを許可する設定を作成
     let config = Config {
         allowlist: Some(ProcessList {
             processes: vec!["safe_kill_test_target".to_string()],
@@ -317,8 +317,8 @@ fn test_policy_engine_with_dry_run() {
 
     let engine = PolicyEngine::new(config);
 
-    // Try to kill a non-existent process with dry_run=true
-    // This should fail because the process doesn't exist, not because of dry_run
+    // 存在しないプロセスを dry_run=true で kill しようとする
+    // dry_run ではなく、プロセスが存在しないために失敗するべき
     let result = engine.kill_by_pid(999999999, Signal::SIGTERM, true);
     assert!(result.is_err());
     match result {
@@ -352,10 +352,10 @@ fn test_policy_engine_list_killable() {
 
     let current_pid = ProcessInfoProvider::current_pid();
 
-    // Should not include self
+    // 自プロセスは含まれないべき
     assert!(!killable.iter().any(|p| p.pid == current_pid));
 
-    // Should not include denylisted processes
+    // denylist のプロセスは含まれないべき
     #[cfg(target_os = "macos")]
     {
         assert!(!killable.iter().any(|p| p.name == "launchd"));
@@ -388,10 +388,10 @@ fn test_process_info_real_processes() {
     let provider = ProcessInfoProvider::new();
     let all = provider.all();
 
-    // Should have multiple processes
+    // 複数のプロセスが存在するべき
     assert!(all.len() > 1);
 
-    // All should have valid PIDs
+    // すべて有効な PID を持つべき
     for proc in &all {
         assert!(proc.pid > 0);
         assert!(!proc.name.is_empty());
@@ -406,7 +406,7 @@ fn test_process_info_refresh() {
     provider.refresh();
     let after = provider.all().len();
 
-    // Should still have processes after refresh
+    // リフレッシュ後もプロセスが存在するべき
     assert!(before > 0);
     assert!(after > 0);
 }
@@ -417,7 +417,7 @@ fn test_process_info_current_has_parent() {
     let current_pid = ProcessInfoProvider::current_pid();
     let info = provider.get(current_pid).unwrap();
 
-    // Current process should have a parent
+    // 現在のプロセスは親を持つべき
     assert!(info.parent_pid.is_some());
 }
 
@@ -427,25 +427,25 @@ fn test_process_info_current_has_parent() {
 
 #[test]
 fn test_end_to_end_workflow_dry_run() {
-    // Simulate the full workflow with dry_run
+    // dry_run での完全なワークフローをシミュレート
 
-    // 1. Load configuration
+    // 1. 設定を読み込み
     let config = Config::load();
     assert!(config.denylist.is_some());
 
-    // 2. Create policy engine
+    // 2. PolicyEngine を作成
     let engine = PolicyEngine::new(config);
     assert!(engine.root_pid() > 0);
 
-    // 3. List killable processes
+    // 3. kill 可能なプロセスを一覧表示
     let _killable = engine.list_killable();
-    // May or may not have killable processes, but should not panic
+    // kill 可能なプロセスがあるかは不定だが、パニックしないこと
 
-    // 4. Try dry-run on non-existent process
+    // 4. 存在しないプロセスに dry-run を試行
     let result = engine.kill_by_pid(999999999, Signal::SIGTERM, true);
-    assert!(result.is_err()); // Not found
+    assert!(result.is_err()); // 見つからない
 
-    // 5. Check suicide prevention
+    // 5. 自殺防止チェック
     let current = ProcessInfoProvider::current_pid();
     let suicide_result = engine.kill_by_pid(current, Signal::SIGTERM, true);
     assert!(matches!(
@@ -606,7 +606,7 @@ fn test_port_full_range_config() {
 
 #[test]
 fn test_policy_engine_kill_by_port_not_allowed_default() {
-    // Default config has no allowed_ports, so port-based killing is disabled
+    // デフォルト設定には allowed_ports がないため、ポートベースの kill は無効
     let config = Config {
         allowlist: None,
         denylist: None,
@@ -631,7 +631,7 @@ fn test_policy_engine_kill_by_port_allowed_but_empty() {
     };
     let engine = PolicyEngine::new(config);
 
-    // Port is allowed but no process on it
+    // ポートは許可されているがプロセスが存在しない
     let result = engine.kill_by_port(59990, Signal::SIGTERM, false);
     assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59990))));
 }

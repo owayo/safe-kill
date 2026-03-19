@@ -1,24 +1,24 @@
-//! Error types and exit codes for safe-kill
+//! safe-kill のエラー型と終了コード定義
 //!
-//! Provides user-friendly error messages and standardized exit codes.
+//! 利用者向けのエラーメッセージと標準化した終了コードを提供する。
 
 use std::process::ExitCode;
 use thiserror::Error;
 
-/// Exit codes for safe-kill command
+/// `safe-kill` コマンドの終了コード
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SafeKillExitCode {
-    /// Successful execution
+    /// 正常終了
     Success = 0,
-    /// No target process found or specified
+    /// 対象未指定または対象プロセスなし
     NoTarget = 1,
-    /// Permission denied
+    /// 権限不足
     PermissionDenied = 2,
-    /// Configuration file error
+    /// 設定ファイルエラー
     ConfigError = 3,
-    /// Port not allowed by configuration
+    /// 設定上許可されていないポート
     PortNotAllowed = 4,
-    /// General/other error
+    /// その他の一般エラー
     GeneralError = 255,
 }
 
@@ -28,84 +28,84 @@ impl From<SafeKillExitCode> for ExitCode {
     }
 }
 
-/// Error types for safe-kill operations
-#[derive(Error, Debug)]
+/// `safe-kill` のエラー型
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum SafeKillError {
-    // User input errors
-    /// Invalid PID format
+    // 入力値エラー
+    /// PID の形式が不正
     #[error("Invalid PID: {0}")]
     InvalidPid(String),
 
-    /// Invalid signal specification
+    /// シグナル指定が不正
     #[error("Invalid signal: {0}")]
     InvalidSignal(String),
 
-    /// No target specified
+    /// 対象未指定
     #[error("No target specified. Use --help for usage.")]
     NoTarget,
 
-    // Business logic errors
-    /// Target is not a descendant of current session
+    // ポリシー判定エラー
+    /// 対象が現在セッションの子孫ではない
     #[error("Process {0} ({1}) is not a descendant of the current session")]
     NotDescendant(u32, String),
 
-    /// Process is in denylist
+    /// denylist に含まれている
     #[error("Process {0} is in denylist and cannot be killed")]
     Denylisted(String),
 
-    /// Attempted to kill self or parent (suicide prevention)
+    /// 自分または親を kill しようとした
     #[error("Cannot kill self or parent process (PID: {0})")]
     SuicidePrevention(u32),
 
-    /// Process not found
+    /// プロセスが見つからない
     #[error("Process {0} not found")]
     ProcessNotFound(u32),
 
-    /// No process found for the specified name
+    /// 指定名のプロセスが見つからない
     #[error("No process found with name: {0}")]
     ProcessNameNotFound(String),
 
-    /// Processes were matched, but none were killable due to policy checks
+    /// 一致はしたがポリシー上 kill できる対象がなかった
     #[error("No killable process found for {0}")]
     NoKillableTarget(String),
 
-    // Port-related errors
-    /// No process found listening on the specified port
+    // ポート関連エラー
+    /// 指定ポートで待ち受けるプロセスが見つからない
     #[error("No process found on port {0}")]
     NoProcessOnPort(u16),
 
-    /// Port is not in the allowed ports list
+    /// 設定上許可されていないポート
     #[error("Port {port} is not allowed. {hint}")]
     PortNotAllowed { port: u16, hint: String },
 
-    /// Failed to detect processes on port
+    /// ポート使用プロセスの検出に失敗
     #[error("Failed to detect process on port {port}: {reason}")]
     PortDetectionError { port: u16, reason: String },
 
-    /// Invalid port range format
+    /// ポート範囲指定の形式が不正
     #[error("Invalid port range format: {0}")]
     InvalidPortRange(String),
 
-    /// Failed to create configuration file
+    /// 設定ファイル作成に失敗
     #[error("Failed to create config file: {0}")]
     ConfigCreationError(String),
 
-    // System errors
-    /// Permission denied for operation
+    // システムエラー
+    /// OS レベルで権限不足
     #[error("Permission denied for PID {0}")]
     PermissionDenied(u32),
 
-    /// Configuration file parse error
+    /// 設定ファイルの解析エラー
     #[error("Config parse error: {0}")]
     ConfigError(String),
 
-    /// Generic system error
+    /// その他のシステムエラー
     #[error("System error: {0}")]
     SystemError(String),
 }
 
 impl SafeKillError {
-    /// Get the appropriate exit code for this error
+    /// このエラーに対応する終了コードを返す
     pub fn exit_code(&self) -> SafeKillExitCode {
         match self {
             SafeKillError::NoTarget
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn test_exit_code_conversion() {
         let code: ExitCode = SafeKillExitCode::Success.into();
-        // ExitCode doesn't expose its value, but we verify it compiles and runs
+        // `ExitCode` は数値を直接取り出せないため、生成できることだけ確認する
         let _ = code;
     }
 
@@ -231,7 +231,7 @@ mod tests {
         assert_eq!(err.to_string(), "System error: IO error");
     }
 
-    // Port-related error tests
+    // ポート関連エラーのテスト
     #[test]
     fn test_no_process_on_port_error_message() {
         let err = SafeKillError::NoProcessOnPort(8080);

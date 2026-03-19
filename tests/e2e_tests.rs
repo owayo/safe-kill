@@ -1,7 +1,7 @@
-//! End-to-end tests for safe-kill CLI
+//! safe-kill CLI の E2E テスト
 //!
-//! Tests the CLI binary with real command execution, output verification, and exit codes.
-#![allow(deprecated)] // cargo_bin is deprecated but still functional
+//! 実バイナリを起動し、出力と終了コードを検証する。
+#![allow(deprecated)] // `cargo_bin` は非推奨だが現状のテストでは実用上問題ない
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -27,7 +27,7 @@ fn test_list_command_shows_header_format() {
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     let assert = cmd.arg("--list").assert();
 
-    // Should contain either the header or "No killable processes" message
+    // ヘッダーか「終了可能なプロセスなし」のどちらかを表示する
     assert.success().stdout(
         predicate::str::contains("PID")
             .and(predicate::str::contains("NAME"))
@@ -37,7 +37,7 @@ fn test_list_command_shows_header_format() {
 
 #[test]
 fn test_list_with_dry_run_is_invalid() {
-    // --list and --dry-run together should work (dry-run is ignored for list)
+    // `--list` では `--dry-run` が指定されても一覧表示として成功する
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("--list").arg("--dry-run").assert().success();
 }
@@ -49,11 +49,11 @@ fn test_list_with_dry_run_is_invalid() {
 #[test]
 fn test_dry_run_with_pid() {
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
-    // Use a non-existent PID to test dry-run behavior
+    // 存在しない PID で dry-run 時のエラー経路を確認する
     cmd.arg("999999999")
         .arg("--dry-run")
         .assert()
-        .failure() // Should fail because process doesn't exist
+        .failure() // 対象が存在しないため失敗する
         .stderr(
             predicate::str::contains("not found").or(predicate::str::contains("No such process")),
         );
@@ -76,7 +76,7 @@ fn test_dry_run_with_name() {
 
 #[test]
 fn test_dry_run_does_not_kill_self() {
-    // Even in dry-run mode, trying to kill self should be prevented
+    // dry-run でも自分自身の kill は拒否される
     let current_pid = std::process::id();
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg(current_pid.to_string())
@@ -98,7 +98,7 @@ fn test_signal_option_sigterm() {
         .arg("999999999")
         .arg("--dry-run")
         .assert()
-        .failure(); // Process doesn't exist
+        .failure(); // 対象が存在しないため失敗する
 }
 
 #[test]
@@ -109,7 +109,7 @@ fn test_signal_option_sigkill() {
         .arg("999999999")
         .arg("--dry-run")
         .assert()
-        .failure(); // Process doesn't exist
+        .failure(); // 対象が存在しないため失敗する
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn test_pid_and_list_mutually_exclusive() {
 
 #[test]
 fn test_kill_child_process_dry_run() {
-    // Spawn a child process that sleeps
+    // 待機する子プロセスを起動する
     let child = std::process::Command::new("sleep")
         .arg("60")
         .stdout(Stdio::null())
@@ -280,14 +280,14 @@ fn test_kill_child_process_dry_run() {
     if let Ok(child) = child {
         let child_pid = child.id();
 
-        // Try to kill with dry-run - should succeed without actually killing
+        // dry-run では実際に終了せず成功する
         let mut cmd = Command::cargo_bin("safe-kill").unwrap();
         let result = cmd.arg(child_pid.to_string()).arg("--dry-run").assert();
 
-        // Should succeed (dry run) and mention the process
+        // dry-run 成功として表示される
         result.success().stdout(predicate::str::contains("dry run"));
 
-        // Verify the process is still running
+        // プロセスが生き続けていることを確認する
         let check = std::process::Command::new("kill")
             .arg("-0")
             .arg(child_pid.to_string())
@@ -298,7 +298,7 @@ fn test_kill_child_process_dry_run() {
             "Child process should still be running after dry-run"
         );
 
-        // Clean up: actually kill the child process
+        // 後始末として実際に終了する
         let _ = std::process::Command::new("kill")
             .arg(child_pid.to_string())
             .status();
@@ -307,7 +307,7 @@ fn test_kill_child_process_dry_run() {
 
 #[test]
 fn test_kill_child_process_actually() {
-    // Spawn a child process that sleeps
+    // 待機する子プロセスを起動する
     let child = std::process::Command::new("sleep")
         .arg("60")
         .stdout(Stdio::null())
@@ -317,26 +317,26 @@ fn test_kill_child_process_actually() {
     if let Ok(mut child) = child {
         let child_pid = child.id();
 
-        // Actually kill the child process
+        // 実際に子プロセスを終了する
         let mut cmd = Command::cargo_bin("safe-kill").unwrap();
         let result = cmd.arg(child_pid.to_string()).assert();
 
-        // Should succeed
+        // 成功表示になる
         result.success().stdout(predicate::str::contains("✓"));
 
-        // Wait for the child process to be reaped
+        // ゾンビ化を避けるため回収する
         let _ = child.wait();
 
-        // Give the OS a moment to clean up
+        // OS 側の後始末待ち
         std::thread::sleep(std::time::Duration::from_millis(200));
 
-        // Verify the process is no longer running
+        // すでに終了済みであることを確認する
         let check = std::process::Command::new("kill")
             .arg("-0")
             .arg(child_pid.to_string())
             .status();
 
-        // Either the command fails or returns non-zero (process doesn't exist)
+        // `kill -0` が失敗するか非 0 を返せば終了済み
         let is_terminated = check.is_err() || !check.unwrap().success();
         assert!(is_terminated, "Child process should be terminated");
     }
@@ -344,7 +344,7 @@ fn test_kill_child_process_actually() {
 
 #[test]
 fn test_kill_child_by_name_dry_run() {
-    // Spawn a uniquely named process (using a script)
+    // 一意な名前の子プロセスを起動する
     let mut script = NamedTempFile::new().unwrap();
     writeln!(script, "#!/bin/bash\nsleep 60").unwrap();
 
@@ -362,10 +362,10 @@ fn test_kill_child_by_name_dry_run() {
         .spawn();
 
     if let Ok(_child) = child {
-        // Small delay to let the process start
+        // 起動完了を少し待つ
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        // Try to kill by name with dry-run
+        // 名前指定の dry-run を試す
         let mut cmd = Command::cargo_bin("safe-kill").unwrap();
         let result = cmd
             .arg("--name")
@@ -373,16 +373,38 @@ fn test_kill_child_by_name_dry_run() {
             .arg("--dry-run")
             .assert();
 
-        // May find the process or not depending on OS behavior
-        // Just verify it doesn't panic and returns some result
+        // OS 実装差で見つからない場合があるため、少なくとも異常終了しないことだけ見る
         result.try_success().ok();
 
-        // Clean up
+        // 後始末
         let _ = std::process::Command::new("pkill")
             .arg("-f")
             .arg("safe_kill_test_target")
             .status();
     }
+}
+
+#[test]
+fn test_name_dry_run_summary_uses_would_kill() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--name")
+        .arg("sleep")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would kill"));
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // =============================================================================
@@ -391,7 +413,7 @@ fn test_kill_child_by_name_dry_run() {
 
 #[test]
 fn test_denylist_prevents_kill() {
-    // Try to kill launchd (macOS) or systemd (Linux) - should be denied
+    // launchd (macOS) または systemd (Linux) の kill を試みる - 拒否されるべき
     #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::cargo_bin("safe-kill").unwrap();
@@ -421,7 +443,7 @@ fn test_denylist_prevents_kill() {
 
 #[test]
 fn test_custom_config_file_path() {
-    // Create a temporary config file
+    // 一時的な設定ファイルを作成
     let mut config_file = NamedTempFile::new().unwrap();
     writeln!(
         config_file,
@@ -432,8 +454,8 @@ processes = ["test_denied_process"]
     )
     .unwrap();
 
-    // The config loading is done at startup, so we can't easily test custom paths
-    // via CLI. This test verifies that the binary still works with config present.
+    // 設定の読み込みは起動時に行われるため、CLI 経由でカスタムパスを簡単にテストできない。
+    // このテストは設定ファイルが存在してもバイナリが正常に動作することを確認する。
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("--list").assert().success();
 }
@@ -506,7 +528,7 @@ fn test_help_shows_port_option() {
 
 #[test]
 fn test_port_no_process_on_port() {
-    // Use an unlikely port number that should have no process
+    // プロセスが使用していないであろうポート番号を使用
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("--port")
         .arg("59997")
@@ -528,7 +550,7 @@ fn test_port_with_dry_run_no_process() {
 
 #[test]
 fn test_port_short_option() {
-    // Test -p short form
+    // -p 短縮形のテスト
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("-p")
         .arg("59996")
@@ -599,8 +621,8 @@ fn test_init_help() {
 
 #[test]
 fn test_init_force_creates_config() {
-    // Test that init --force runs successfully
-    // Use temporary HOME to avoid writing to real user config
+    // init --force が正常に実行されることをテスト
+    // 実際のユーザー設定に書き込まないよう一時的な HOME を使用
     let temp = tempfile::tempdir().unwrap();
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.env("HOME", temp.path())
@@ -629,7 +651,7 @@ fn test_init_creates_valid_toml() {
 
     let temp = tempfile::tempdir().unwrap();
 
-    // Run init --force
+    // init --force を実行
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.env("HOME", temp.path())
         .arg("init")
@@ -637,7 +659,7 @@ fn test_init_creates_valid_toml() {
         .assert()
         .success();
 
-    // Get the path from the output and verify the content
+    // 出力からパスを取得し、内容を検証
     let config_path = temp
         .path()
         .join(".config")

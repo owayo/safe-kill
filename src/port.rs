@@ -1,25 +1,25 @@
-//! Port detection module for safe-kill
+//! safe-kill のポート検出モジュール
 //!
-//! Detects processes using specific ports via netstat2.
+//! netstat2 を使用して特定ポートを使用するプロセスを検出する。
 
 use crate::error::SafeKillError;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
 
-/// Information about a process using a specific port
+/// 特定ポートを使用するプロセスの情報
 #[derive(Debug, Clone)]
 pub struct PortProcess {
-    /// Process ID
+    /// プロセス ID
     pub pid: u32,
-    /// Process name
+    /// プロセス名
     pub name: String,
-    /// Port number
+    /// ポート番号
     pub port: u16,
-    /// Protocol (TCP or UDP)
+    /// プロトコル（TCP または UDP）
     pub protocol: PortProtocol,
 }
 
-/// Protocol type for port binding
+/// ポートバインディングのプロトコル種別
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortProtocol {
     Tcp,
@@ -35,23 +35,23 @@ impl std::fmt::Display for PortProtocol {
     }
 }
 
-/// Port detector that finds processes using specific ports
+/// 特定ポートを使用するプロセスを検出するポート検出器
 pub struct PortDetector {
     provider: ProcessInfoProvider,
 }
 
 impl PortDetector {
-    /// Create a new PortDetector
+    /// 新しい PortDetector を作成
     pub fn new() -> Self {
         Self {
             provider: ProcessInfoProvider::new(),
         }
     }
 
-    /// Find all processes using the specified port
+    /// 指定ポートを使用するすべてのプロセスを検索
     ///
-    /// Returns processes listening on the port (both TCP and UDP).
-    /// Multiple processes may be returned if they share the port.
+    /// ポートでリッスンしているプロセスを返す（TCP と UDP の両方）。
+    /// ポートを共有している場合、複数のプロセスが返される可能性がある。
     pub fn find_by_port(&self, port: u16) -> Result<Vec<PortProcess>, SafeKillError> {
         let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
         let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
@@ -90,14 +90,14 @@ impl PortDetector {
             }
         }
 
-        // Remove duplicates (same PID may appear multiple times for different sockets)
+        // 重複を除去（同一 PID が異なるソケットで複数回出現する場合がある）
         results.sort_by_key(|p| p.pid);
         results.dedup_by_key(|p| p.pid);
 
         Ok(results)
     }
 
-    /// Get process info for all processes using the specified port
+    /// 指定ポートを使用するすべてのプロセスのプロセス情報を取得
     pub fn get_process_info(&self, port: u16) -> Result<Vec<ProcessInfo>, SafeKillError> {
         let port_processes = self.find_by_port(port)?;
 
@@ -111,7 +111,7 @@ impl PortDetector {
         Ok(process_infos)
     }
 
-    /// Refresh the underlying process information
+    /// 内部のプロセス情報を更新
     pub fn refresh(&mut self) {
         self.provider.refresh();
     }
@@ -130,14 +130,14 @@ mod tests {
     #[test]
     fn test_port_detector_new() {
         let detector = PortDetector::new();
-        // Should not panic
+        // パニックしないことを確認
         let _ = detector;
     }
 
     #[test]
     fn test_port_detector_default() {
         let detector = PortDetector::default();
-        // Should not panic
+        // パニックしないことを確認
         let _ = detector;
     }
 
@@ -200,10 +200,10 @@ mod tests {
     #[test]
     fn test_find_by_port_unused_port() {
         let detector = PortDetector::new();
-        // Use a high port that's unlikely to be in use
+        // 使用されていない可能性の高い高ポートを使用
         let result = detector.find_by_port(59999);
         assert!(result.is_ok());
-        // Port might or might not have processes, but should not error
+        // プロセスがあるかは不定だが、エラーにはならないはず
     }
 
     #[test]
@@ -211,7 +211,7 @@ mod tests {
         let detector = PortDetector::new();
         let result = detector.find_by_port(80);
         assert!(result.is_ok());
-        // Result is a Vec, may be empty
+        // 結果は Vec で、空の場合もある
         let _processes: Vec<PortProcess> = result.unwrap();
     }
 
@@ -226,7 +226,7 @@ mod tests {
     fn test_port_detector_refresh() {
         let mut detector = PortDetector::new();
         detector.refresh();
-        // Should not panic
+        // パニックしないことを確認
     }
 
     // =============================================================================

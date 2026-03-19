@@ -1,36 +1,36 @@
-//! Process information provider using sysinfo crate
+//! sysinfo クレートを使用したプロセス情報プロバイダー
 //!
-//! Provides cross-platform process information retrieval.
+//! クロスプラットフォームなプロセス情報取得を提供する。
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-/// Information about a single process
+/// 単一プロセスの情報
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessInfo {
-    /// Process ID
+    /// プロセス ID
     pub pid: u32,
-    /// Parent process ID (None if no parent or unknown)
+    /// 親プロセス ID（親がない場合や不明な場合は None）
     pub parent_pid: Option<u32>,
-    /// Process name
+    /// プロセス名
     pub name: String,
-    /// Command line arguments
+    /// コマンドライン引数
     pub cmd: Vec<String>,
 }
 
-/// Provider for process information using sysinfo
+/// sysinfo を使用したプロセス情報プロバイダー
 pub struct ProcessInfoProvider {
     system: System,
 }
 
 impl ProcessInfoProvider {
-    /// Create a new ProcessInfoProvider with refreshed process list
+    /// プロセスリストを更新済みの新しい ProcessInfoProvider を作成
     pub fn new() -> Self {
         let mut system = System::new_all();
         system.refresh_processes(ProcessesToUpdate::All, true);
         Self { system }
     }
 
-    /// Refresh the process list
+    /// プロセスリストを更新
     pub fn refresh(&mut self) {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
     }

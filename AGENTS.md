@@ -54,7 +54,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 |--------|------|
 | `policy.rs` | Kill 許可判定のオーケストレーション。`KillPermission` enum を返す |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
-| `killer.rs` | シグナル送信と結果追跡。dry-run 対応 |
+| `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux の番号差異吸収、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決 |

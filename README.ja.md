@@ -36,6 +36,7 @@
 - **複数シグナル対応**: SIGTERM、SIGKILL、SIGHUPなど
 - **ドライランモード**: 実際に終了せずにプレビュー
 - **プロセス検出**: セッション内の終了可能なプロセス一覧表示
+- **正確な失敗報告**: ポリシーチェック通過後の `ProcessNotFound` / `PermissionDenied` をそのまま返す
 
 ## 動作環境
 
@@ -123,6 +124,12 @@ safe-kill --port 3000
 # 終了対象をプレビュー
 safe-kill --name python --dry-run
 ```
+
+`--name` / `--port` の dry-run では、実際に kill したと誤解しないように集計行を `would kill` 表示にしています。
+
+### エラーハンドリング
+
+ポリシーチェックは通過したがシグナル送信前に対象プロセスが終了していた場合や、OS により送信が拒否された場合は、`NoKillableTarget` に丸めず `ProcessNotFound` や `PermissionDenied` として元の実行時エラーを返します。
 
 ## 設定
 

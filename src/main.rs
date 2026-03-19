@@ -1,14 +1,14 @@
-//! safe-kill: Safe process termination tool for AI agents
+//! safe-kill: AI エージェント向け安全プロセス終了ツール
 //!
-//! This tool provides ancestry-based access control for process termination,
-//! allowing AI agents to safely kill only their descendant processes.
+//! ancestry ベースのアクセス制御で、現在セッションの子孫プロセスのみを
+//! 安全に終了できるようにする。
 
 use std::process::ExitCode;
 
 use safe_kill::cli::{CliArgs, ExecutionMode};
 use safe_kill::error::SafeKillError;
 use safe_kill::init::InitCommand;
-use safe_kill::killer::BatchKillResult;
+use safe_kill::killer::{BatchKillResult, KillResult};
 use safe_kill::policy::PolicyEngine;
 use safe_kill::process_info;
 
@@ -22,21 +22,21 @@ fn main() -> ExitCode {
     }
 }
 
-/// Main execution logic
+/// メインの実行ロジック
 fn run() -> Result<(), SafeKillError> {
-    // Parse CLI arguments
+    // CLI 引数を解析する
     let args = CliArgs::parse_args();
 
-    // Validate and determine execution mode
+    // 実行モードを検証して確定する
     let mode = args.validate()?;
 
-    // Parse signal
+    // シグナル指定を解釈する
     let signal = args.parse_signal()?;
 
-    // Create policy engine
+    // ポリシーエンジンを生成する
     let engine = PolicyEngine::with_defaults();
 
-    // Execute based on mode
+    // 実行モードごとに処理する
     match mode {
         ExecutionMode::KillByPid(pid) => {
             let result = engine.kill_by_pid(pid, signal, args.dry_run)?;
@@ -44,16 +44,19 @@ fn run() -> Result<(), SafeKillError> {
             if result.success {
                 Ok(())
             } else {
-                Err(SafeKillError::SystemError(result.message))
+                Err(single_result_error(&result))
             }
         }
         ExecutionMode::KillByName(name) => {
             let batch_result = engine.kill_by_name(&name, signal, args.dry_run)?;
-            print_batch_result(&batch_result);
+            print_batch_result(&batch_result, args.dry_run);
             if batch_result.any_success() {
                 Ok(())
             } else {
-                Err(SafeKillError::NoKillableTarget(format!("name '{}'", name)))
+                Err(batch_result_error(
+                    format!("name '{}'", name),
+                    &batch_result,
+                ))
             }
         }
         ExecutionMode::ListKillable => {
@@ -63,13 +66,13 @@ fn run() -> Result<(), SafeKillError> {
         }
         ExecutionMode::KillByPort(port) => {
             let batch_result = engine.kill_by_port(port, signal, args.dry_run)?;
-            print_port_kill_result(port, &batch_result);
+            print_port_kill_result(port, &batch_result, args.dry_run);
             if batch_result.any_success() {
                 Ok(())
             } else if batch_result.results.is_empty() {
                 Err(SafeKillError::NoProcessOnPort(port))
             } else {
-                Err(SafeKillError::NoKillableTarget(format!("port {}", port)))
+                Err(batch_result_error(format!("port {}", port), &batch_result))
             }
         }
         ExecutionMode::InitConfig { force } => {
@@ -83,35 +86,75 @@ fn run() -> Result<(), SafeKillError> {
     }
 }
 
-/// Print a single kill result
+/// 1 件分の実行結果から返却用エラーを復元する
+fn single_result_error(result: &KillResult) -> SafeKillError {
+    result
+        .error
+        .clone()
+        .unwrap_or_else(|| SafeKillError::SystemError(result.message.clone()))
+}
+
+/// 複数件の実行結果から返却用エラーを選ぶ
+fn batch_result_error(target: String, result: &BatchKillResult) -> SafeKillError {
+    result
+        .first_operational_error()
+        .cloned()
+        .unwrap_or(SafeKillError::NoKillableTarget(target))
+}
+
+/// 1 件の結果を表示する
 fn print_kill_result(name: &str, pid: u32, success: bool, message: &str) {
     let status = if success { "✓" } else { "✗" };
     println!("{} {} (PID {}): {}", status, name, pid, message);
 }
 
-/// Print batch kill results
-fn print_batch_result(result: &BatchKillResult) {
-    println!(
-        "Matched {} process(es), killed {}:",
-        result.total_matched, result.total_killed
-    );
+/// 複数件実行時の要約行を組み立てる
+fn batch_result_summary(result: &BatchKillResult, dry_run: bool) -> String {
+    if dry_run {
+        format!(
+            "Matched {} process(es), would kill {}:",
+            result.total_matched, result.total_killed
+        )
+    } else {
+        format!(
+            "Matched {} process(es), killed {}:",
+            result.total_matched, result.total_killed
+        )
+    }
+}
+
+/// 複数件の結果を表示する
+fn print_batch_result(result: &BatchKillResult, dry_run: bool) {
+    println!("{}", batch_result_summary(result, dry_run));
     for r in &result.results {
         print_kill_result(&r.name, r.pid, r.success, &r.message);
     }
 }
 
-/// Print port kill results
-fn print_port_kill_result(port: u16, result: &BatchKillResult) {
-    println!(
-        "Port {}: Found {} process(es), killed {}:",
-        port, result.total_matched, result.total_killed
-    );
+/// ポート指定実行時の要約行を組み立てる
+fn port_result_summary(port: u16, result: &BatchKillResult, dry_run: bool) -> String {
+    if dry_run {
+        format!(
+            "Port {}: Found {} process(es), would kill {}:",
+            port, result.total_matched, result.total_killed
+        )
+    } else {
+        format!(
+            "Port {}: Found {} process(es), killed {}:",
+            port, result.total_matched, result.total_killed
+        )
+    }
+}
+
+/// ポート指定の結果を表示する
+fn print_port_kill_result(port: u16, result: &BatchKillResult, dry_run: bool) {
+    println!("{}", port_result_summary(port, result, dry_run));
     for r in &result.results {
         print_kill_result(&r.name, r.pid, r.success, &r.message);
     }
 }
 
-/// Print list of killable processes
+/// 終了可能なプロセス一覧を表示する
 fn print_killable_list(processes: &[process_info::ProcessInfo]) {
     if processes.is_empty() {
         println!("No killable processes found.");
@@ -128,7 +171,7 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
         } else {
             p.cmd.join(" ")
         };
-        // Truncate command safely for Unicode
+        // Unicode を壊さないように切り詰める
         let cmd_display = truncate(&cmd, 30);
         println!(
             "{:>8}  {:<20}  {}",
@@ -139,7 +182,7 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
     }
 }
 
-/// Truncate a string to max length
+/// 文字数上限で文字列を切り詰める
 fn truncate(s: &str, max_len: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_len {
@@ -160,16 +203,15 @@ mod tests {
 
     #[test]
     fn test_project_compiles() {
-        // Basic smoke test to verify the project compiles correctly
-        // The fact that this test runs means the project compiles
+        // このテストが動く時点でコンパイルは通っている
     }
 
     #[test]
     fn test_version_available() {
-        // Verify that cargo version is accessible
+        // Cargo からバージョンを取得できることを確認する
         let version = env!("CARGO_PKG_VERSION");
         assert!(!version.is_empty());
-        // Version format: YY.M.COUNTER (e.g., 26.1.100)
+        // バージョン形式は YY.M.COUNTER
         assert!(version.contains('.'), "Version should contain dots");
     }
 
@@ -199,14 +241,12 @@ mod tests {
 
     #[test]
     fn test_truncate_boundary_just_over() {
-        // len 5 > max_len 4, so truncated: s[..1] + "..." = "a..."
         let result = truncate("abcde", 4);
         assert_eq!(result, "a...");
     }
 
     #[test]
     fn test_truncate_boundary_exact_no_truncation() {
-        // len 4 == max_len 4, no truncation
         let result = truncate("abcd", 4);
         assert_eq!(result, "abcd");
     }
@@ -252,5 +292,134 @@ mod tests {
                 "Each version part should be numeric"
             );
         }
+    }
+
+    #[test]
+    fn test_single_result_error_preserves_original_error() {
+        let result = KillResult::failure(42, "worker", &SafeKillError::PermissionDenied(42));
+        assert_eq!(
+            single_result_error(&result),
+            SafeKillError::PermissionDenied(42)
+        );
+    }
+
+    #[test]
+    fn test_batch_result_error_prefers_operational_error() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            10,
+            "parent",
+            &SafeKillError::SuicidePrevention(10),
+        ));
+        batch.add(KillResult::failure(
+            20,
+            "worker",
+            &SafeKillError::ProcessNotFound(20),
+        ));
+
+        assert_eq!(
+            batch_result_error("name 'worker'".to_string(), &batch),
+            SafeKillError::ProcessNotFound(20)
+        );
+    }
+
+    #[test]
+    fn test_batch_result_error_falls_back_to_no_killable_target() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            10,
+            "parent",
+            &SafeKillError::SuicidePrevention(10),
+        ));
+
+        assert_eq!(
+            batch_result_error("port 8080".to_string(), &batch),
+            SafeKillError::NoKillableTarget("port 8080".to_string())
+        );
+    }
+
+    #[test]
+    fn test_batch_result_summary_uses_killed_for_normal_run() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::success(
+            10,
+            "worker",
+            safe_kill::signal::Signal::SIGTERM,
+        ));
+
+        assert_eq!(
+            batch_result_summary(&batch, false),
+            "Matched 1 process(es), killed 1:"
+        );
+    }
+
+    #[test]
+    fn test_batch_result_summary_uses_would_kill_for_dry_run() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::dry_run(
+            10,
+            "worker",
+            safe_kill::signal::Signal::SIGTERM,
+        ));
+
+        assert_eq!(
+            batch_result_summary(&batch, true),
+            "Matched 1 process(es), would kill 1:"
+        );
+    }
+
+    #[test]
+    fn test_port_result_summary_uses_would_kill_for_dry_run() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::dry_run(
+            20,
+            "server",
+            safe_kill::signal::Signal::SIGTERM,
+        ));
+
+        assert_eq!(
+            port_result_summary(3000, &batch, true),
+            "Port 3000: Found 1 process(es), would kill 1:"
+        );
+    }
+
+    #[test]
+    fn test_single_result_error_fallback_when_no_error_field() {
+        // error フィールドが None の場合、message から SystemError にフォールバックする
+        let result = KillResult {
+            pid: 42,
+            name: "test".to_string(),
+            success: false,
+            message: "unexpected failure".to_string(),
+            error: None,
+        };
+        assert_eq!(
+            single_result_error(&result),
+            SafeKillError::SystemError("unexpected failure".to_string())
+        );
+    }
+
+    #[test]
+    fn test_batch_result_error_empty_batch() {
+        let batch = BatchKillResult::new();
+        assert_eq!(
+            batch_result_error("name 'test'".to_string(), &batch),
+            SafeKillError::NoKillableTarget("name 'test'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_port_result_summary_uses_killed_for_normal_run() {
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::success(
+            20,
+            "server",
+            safe_kill::signal::Signal::SIGTERM,
+        ));
+
+        assert_eq!(
+            port_result_summary(3000, &batch, false),
+            "Port 3000: Found 1 process(es), killed 1:"
+        );
     }
 }

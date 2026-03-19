@@ -1,6 +1,6 @@
-//! Policy engine for safe-kill
+//! safe-kill の Policy engine
 //!
-//! Coordinates kill permission checks using ancestry, config, and suicide prevention.
+//! ancestry、config、自殺防止を組み合わせた kill 許可判定を統括する。
 
 use crate::ancestry::AncestryChecker;
 use crate::config::Config;
@@ -10,23 +10,23 @@ use crate::port::PortDetector;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use crate::signal::Signal;
 
-/// Result of a kill permission check
+/// kill 許可判定の結果
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillPermission {
-    /// Kill is allowed (by ancestry check)
+    /// kill 許可（ancestry チェックによる）
     Allowed,
-    /// Kill is allowed (process is in allowlist)
+    /// kill 許可（allowlist に含まれるプロセス）
     AllowedByAllowlist,
-    /// Kill is denied (process is in denylist)
+    /// kill 拒否（denylist に含まれるプロセス）
     DeniedByDenylist(String),
-    /// Kill is denied (not a descendant of root)
+    /// kill 拒否（root の子孫ではない）
     DeniedNotDescendant,
-    /// Kill is denied (would kill self or parent)
+    /// kill 拒否（自プロセスまたは親プロセスの kill）
     DeniedSuicidePrevention,
 }
 
 impl KillPermission {
-    /// Check if the permission allows killing
+    /// kill が許可されているかを確認する
     pub fn is_allowed(&self) -> bool {
         matches!(
             self,
@@ -34,13 +34,13 @@ impl KillPermission {
         )
     }
 
-    /// Check if the permission denies killing
+    /// kill が拒否されているかを確認する
     pub fn is_denied(&self) -> bool {
         !self.is_allowed()
     }
 }
 
-/// Policy engine that orchestrates kill permission checks
+/// kill 許可判定を統括する Policy engine
 pub struct PolicyEngine {
     config: Config,
     ancestry: AncestryChecker,
@@ -50,7 +50,7 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
-    /// Create a new PolicyEngine with the given configuration
+    /// 指定された設定で PolicyEngine を生成する
     pub fn new(config: Config) -> Self {
         let provider = ProcessInfoProvider::new();
         let ancestry = AncestryChecker::new(ProcessInfoProvider::new());
@@ -66,36 +66,36 @@ impl PolicyEngine {
         }
     }
 
-    /// Create a new PolicyEngine with default configuration
+    /// デフォルト設定で PolicyEngine を生成する
     pub fn with_defaults() -> Self {
         Self::new(Config::load())
     }
 
-    /// Refresh process information
+    /// プロセス情報を更新する
     pub fn refresh(&mut self) {
         self.provider.refresh();
         self.ancestry.refresh();
         self.port_detector.refresh();
     }
 
-    /// Check if a process can be killed
+    /// プロセスを kill 可能か判定する
     pub fn can_kill(&self, process: &ProcessInfo) -> KillPermission {
-        // 1. Check suicide prevention first (highest priority)
+        // 1. 自殺防止チェック（最優先）
         if self.ancestry.is_suicide(process.pid) {
             return KillPermission::DeniedSuicidePrevention;
         }
 
-        // 2. Check denylist (second highest priority)
+        // 2. denylist チェック（2番目の優先度）
         if self.config.is_denied(&process.name) {
             return KillPermission::DeniedByDenylist(process.name.clone());
         }
 
-        // 3. Check allowlist (bypasses ancestry check)
+        // 3. allowlist チェック（ancestry チェックをバイパス）
         if self.config.is_allowed(&process.name) {
             return KillPermission::AllowedByAllowlist;
         }
 
-        // 4. Check ancestry (default check)
+        // 4. ancestry チェック（デフォルトのチェック）
         if self.ancestry.is_descendant(process.pid) {
             return KillPermission::Allowed;
         }
@@ -103,20 +103,20 @@ impl PolicyEngine {
         KillPermission::DeniedNotDescendant
     }
 
-    /// Kill a process by PID
+    /// PID を指定してプロセスを kill する
     pub fn kill_by_pid(
         &self,
         pid: u32,
         signal: Signal,
         dry_run: bool,
     ) -> Result<KillResult, SafeKillError> {
-        // Get process info
+        // プロセス情報を取得
         let process = self
             .provider
             .get(pid)
             .ok_or(SafeKillError::ProcessNotFound(pid))?;
 
-        // Check permission
+        // 許可判定
         match self.can_kill(&process) {
             KillPermission::Allowed | KillPermission::AllowedByAllowlist => Ok(self
                 .killer
@@ -129,7 +129,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Kill processes by name
+    /// プロセス名を指定して kill する
     pub fn kill_by_name(
         &self,
         name: &str,
@@ -151,7 +151,7 @@ impl PolicyEngine {
                 self.killer
                     .kill_with_result(process.pid, &process.name, signal, dry_run)
             } else {
-                // Create a failure result for denied processes
+                // 拒否されたプロセスの失敗結果を生成
                 let error = match permission {
                     KillPermission::DeniedByDenylist(ref name) => {
                         SafeKillError::Denylisted(name.clone())
@@ -173,21 +173,21 @@ impl PolicyEngine {
         Ok(batch_result)
     }
 
-    /// Kill processes by port
+    /// ポートを指定してプロセスを kill する
     ///
-    /// Note: This does NOT apply ancestor check - only denylist is applied.
-    /// The rationale is that port-based killing targets specific services
-    /// regardless of process ancestry.
+    /// 注意: ancestry チェックは適用しない。denylist のみ適用される。
+    /// ポート指定の kill はプロセスの ancestry に関係なく
+    /// 特定のサービスを対象とするため。
     pub fn kill_by_port(
         &self,
         port: u16,
         signal: Signal,
         dry_run: bool,
     ) -> Result<BatchKillResult, SafeKillError> {
-        // 1. Check if port is allowed by config
+        // 1. config でポートが許可されているか確認
         self.config.check_port_allowed(port)?;
 
-        // 2. Find processes on the port
+        // 2. ポート上のプロセスを検索
         let port_processes = self.port_detector.find_by_port(port)?;
 
         if port_processes.is_empty() {
@@ -196,16 +196,16 @@ impl PolicyEngine {
 
         let mut batch_result = BatchKillResult::new();
 
-        // 3. For each process, apply only suicide prevention and denylist checks
+        // 3. 各プロセスに対して自殺防止と denylist チェックのみ適用
         for pp in port_processes {
-            // Get full process info if available
+            // 利用可能な場合、完全なプロセス情報を取得
             let process_name = self
                 .provider
                 .get(pp.pid)
                 .map(|p| p.name.clone())
                 .unwrap_or_else(|| pp.name.clone());
 
-            // Check permission (only suicide prevention and denylist)
+            // 許可判定（自殺防止と denylist のみ）
             let permission = self.can_kill_for_port(pp.pid, &process_name);
 
             let result = if permission.is_allowed() {
@@ -230,29 +230,29 @@ impl PolicyEngine {
         Ok(batch_result)
     }
 
-    /// Check if a process can be killed for port-based killing
+    /// ポート指定 kill 用のプロセス kill 可否判定
     ///
-    /// This is a simplified check that only applies:
-    /// 1. Suicide prevention (cannot kill self or parent)
-    /// 2. Denylist check
+    /// 以下の簡略化されたチェックのみ適用:
+    /// 1. 自殺防止（自プロセス・親プロセスの kill 不可）
+    /// 2. denylist チェック
     ///
-    /// It does NOT apply ancestor check or allowlist (those are for PID-based killing).
+    /// ancestry チェックや allowlist は適用しない（PID 指定 kill 用）。
     fn can_kill_for_port(&self, pid: u32, name: &str) -> KillPermission {
-        // 1. Check suicide prevention first (highest priority)
+        // 1. 自殺防止チェック（最優先）
         if self.ancestry.is_suicide(pid) {
             return KillPermission::DeniedSuicidePrevention;
         }
 
-        // 2. Check denylist
+        // 2. denylist チェック
         if self.config.is_denied(name) {
             return KillPermission::DeniedByDenylist(name.to_string());
         }
 
-        // Port-based killing is allowed if not denied
+        // 拒否されなければポート指定 kill は許可
         KillPermission::Allowed
     }
 
-    /// List all processes that can be killed
+    /// kill 可能な全プロセスを一覧する
     pub fn list_killable(&self) -> Vec<ProcessInfo> {
         self.provider
             .all()
@@ -261,12 +261,12 @@ impl PolicyEngine {
             .collect()
     }
 
-    /// Get the current root PID
+    /// 現在の root PID を取得する
     pub fn root_pid(&self) -> u32 {
         self.ancestry.root_pid()
     }
 
-    /// Get a reference to the configuration
+    /// 設定への参照を取得する
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -277,7 +277,7 @@ mod tests {
     use super::*;
     use crate::config::ProcessList;
 
-    // KillPermission tests
+    // KillPermission のテスト
     #[test]
     fn test_kill_permission_allowed() {
         assert!(KillPermission::Allowed.is_allowed());
@@ -323,7 +323,7 @@ mod tests {
         assert!(debug_str.contains("Allowed"));
     }
 
-    // PolicyEngine construction tests
+    // PolicyEngine 構築テスト
     #[test]
     fn test_policy_engine_new() {
         let config = Config::default();
@@ -342,7 +342,7 @@ mod tests {
         let config = Config::default();
         let mut engine = PolicyEngine::new(config);
         engine.refresh();
-        // Should not panic
+        // パニックしないことを確認
     }
 
     #[test]
@@ -358,7 +358,7 @@ mod tests {
         assert!(engine.config().is_allowed("node"));
     }
 
-    // can_kill tests
+    // can_kill のテスト
     #[test]
     fn test_can_kill_self_denied() {
         let engine = PolicyEngine::with_defaults();
@@ -429,8 +429,8 @@ mod tests {
             cmd: vec![],
         };
 
-        // Note: This will fail suicide check if it happens to be our PID
-        // So we use a fake PID that's definitely not ours
+        // 自プロセスの PID だと自殺防止チェックに引っかかるため
+        // 確実に自プロセスではない偽の PID を使用
         let permission = engine.can_kill(&process);
         assert_eq!(permission, KillPermission::AllowedByAllowlist);
     }
@@ -461,7 +461,7 @@ mod tests {
         }
     }
 
-    // kill_by_pid tests
+    // kill_by_pid のテスト
     #[test]
     fn test_kill_by_pid_not_found() {
         let engine = PolicyEngine::with_defaults();
@@ -480,12 +480,12 @@ mod tests {
     #[test]
     fn test_kill_by_pid_dry_run() {
         let engine = PolicyEngine::with_defaults();
-        // Use dry_run on a non-existent process - should still fail because process not found
+        // 存在しないプロセスに dry_run を使用 - プロセス未検出で失敗するはず
         let result = engine.kill_by_pid(999999999, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::ProcessNotFound(_))));
     }
 
-    // kill_by_name tests
+    // kill_by_name のテスト
     #[test]
     fn test_kill_by_name_not_found() {
         let engine = PolicyEngine::with_defaults();
@@ -493,17 +493,17 @@ mod tests {
         assert!(matches!(result, Err(SafeKillError::ProcessNameNotFound(_))));
     }
 
-    // list_killable tests
+    // list_killable のテスト
     #[test]
     fn test_list_killable() {
         let engine = PolicyEngine::with_defaults();
         let killable = engine.list_killable();
 
-        // Should not contain current process
+        // 自プロセスを含まないこと
         let current_pid = ProcessInfoProvider::current_pid();
         assert!(!killable.iter().any(|p| p.pid == current_pid));
 
-        // Should not contain parent process
+        // 親プロセスを含まないこと
         if let Some(current) = engine.provider.get(current_pid) {
             if let Some(parent_pid) = current.parent_pid {
                 assert!(!killable.iter().any(|p| p.pid == parent_pid));
@@ -518,7 +518,7 @@ mod tests {
             let engine = PolicyEngine::with_defaults();
             let killable = engine.list_killable();
 
-            // Should not contain launchd (in default denylist on macOS)
+            // launchd を含まないこと（macOS のデフォルト denylist に含まれる）
             assert!(!killable.iter().any(|p| p.name == "launchd"));
         }
 
@@ -527,12 +527,12 @@ mod tests {
             let engine = PolicyEngine::with_defaults();
             let killable = engine.list_killable();
 
-            // Should not contain systemd (in default denylist on Linux)
+            // systemd を含まないこと（Linux のデフォルト denylist に含まれる）
             assert!(!killable.iter().any(|p| p.name == "systemd"));
         }
     }
 
-    // Root PID tests
+    // root PID のテスト
     #[test]
     fn test_root_pid() {
         let engine = PolicyEngine::with_defaults();
@@ -540,13 +540,13 @@ mod tests {
         assert!(root_pid > 0);
     }
 
-    // Permission priority tests
+    // 許可優先順位のテスト
     #[test]
     fn test_permission_priority_suicide_over_denylist() {
         let config = Config {
             allowlist: None,
             denylist: Some(ProcessList {
-                processes: vec!["safe-kill".to_string()], // Add self to denylist
+                processes: vec!["safe-kill".to_string()], // 自プロセスを denylist に追加
             }),
             allowed_ports: None,
         };

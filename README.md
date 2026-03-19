@@ -36,6 +36,7 @@
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
 - **Process Discovery**: List all killable processes in your session
+- **Accurate Failure Reporting**: Preserve `ProcessNotFound` / `PermissionDenied` when signal dispatch fails after policy checks
 
 ## Requirements
 
@@ -123,6 +124,12 @@ safe-kill --port 3000
 # List what would be killed
 safe-kill --name python --dry-run
 ```
+
+For `--name` and `--port` dry runs, batch summaries use `would kill` so preview output is not mistaken for an actual termination.
+
+### Error Handling
+
+If a process matched policy checks but disappeared before signal delivery, or the OS rejected the signal, `safe-kill` returns the original runtime error such as `ProcessNotFound` or `PermissionDenied` instead of collapsing it into `NoKillableTarget`.
 
 ## Configuration
 

@@ -406,4 +406,28 @@ mod tests {
         let debug_str = format!("{:?}", sig);
         assert_eq!(debug_str, "SIGTERM");
     }
+
+    #[test]
+    fn test_send_pid_i32_max_boundary() {
+        // i32::MAX はギリギリ有効な PID 値（プロセスは存在しないが InvalidPid にはならない）
+        let result = SignalSender::send(i32::MAX as u32, Signal::SIGTERM);
+        assert!(
+            matches!(
+                result,
+                Err(SafeKillError::ProcessNotFound(_)) | Err(SafeKillError::PermissionDenied(_))
+            ),
+            "i32::MAX は有効な PID 範囲だが、プロセスが存在しないためエラーになる"
+        );
+    }
+
+    #[test]
+    fn test_send_pid_1_permission_denied_or_ok() {
+        // PID 1 (init/launchd) への送信は PermissionDenied になることが多い
+        let result = SignalSender::send(1, Signal::SIGTERM);
+        // 環境依存のためエラー型は限定しないが、InvalidPid にはならないことを確認
+        assert!(
+            !matches!(result, Err(SafeKillError::InvalidPid(_))),
+            "PID 1 は有効な PID なので InvalidPid にはならない"
+        );
+    }
 }
