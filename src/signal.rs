@@ -1,33 +1,33 @@
-//! Signal handling for safe-kill
+//! safe-kill のシグナル処理
 //!
-//! Provides Unix signal parsing and sending functionality using nix crate.
+//! nix クレートを使用した Unix シグナルの解析と送信機能を提供する。
 
 use crate::error::SafeKillError;
 use nix::sys::signal::{self, Signal as NixSignal};
 use nix::unistd::Pid;
 
-/// Supported signals for process termination
+/// プロセス終了に使用するサポート対象シグナル
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Signal {
-    /// SIGHUP (1) - Hangup
+    /// SIGHUP (1) - ハングアップ
     SIGHUP,
-    /// SIGINT (2) - Interrupt
+    /// SIGINT (2) - 割り込み
     SIGINT,
-    /// SIGQUIT (3) - Quit
+    /// SIGQUIT (3) - 終了
     SIGQUIT,
-    /// SIGKILL (9) - Kill (cannot be caught)
+    /// SIGKILL (9) - 強制終了（捕捉不可）
     SIGKILL,
-    /// SIGTERM (15) - Terminate
+    /// SIGTERM (15) - 終了要求
     #[default]
     SIGTERM,
-    /// SIGUSR1 (10/30) - User defined signal 1
+    /// SIGUSR1 (10/30) - ユーザー定義シグナル 1
     SIGUSR1,
-    /// SIGUSR2 (12/31) - User defined signal 2
+    /// SIGUSR2 (12/31) - ユーザー定義シグナル 2
     SIGUSR2,
 }
 
 impl Signal {
-    /// Convert to nix Signal type
+    /// nix の Signal 型に変換する
     fn to_nix(self) -> NixSignal {
         match self {
             Signal::SIGHUP => NixSignal::SIGHUP,
@@ -40,12 +40,12 @@ impl Signal {
         }
     }
 
-    /// Get signal number
+    /// シグナル番号を取得する
     pub fn number(&self) -> i32 {
         self.to_nix() as i32
     }
 
-    /// Get signal name
+    /// シグナル名を取得する
     pub fn name(&self) -> &'static str {
         match self {
             Signal::SIGHUP => "SIGHUP",
@@ -59,24 +59,24 @@ impl Signal {
     }
 }
 
-/// Signal sender for Unix processes
+/// Unix プロセス向けシグナル送信器
 pub struct SignalSender;
 
 impl SignalSender {
-    /// Parse signal from string (name or number)
+    /// 文字列からシグナルを解析する（名前または番号）
     ///
-    /// Accepts:
-    /// - Signal names: "SIGTERM", "SIGKILL", "TERM", "KILL", etc.
-    /// - Signal numbers: "15", "9", etc.
+    /// 受け付ける形式:
+    /// - シグナル名: "SIGTERM", "SIGKILL", "TERM", "KILL" など
+    /// - シグナル番号: "15", "9" など
     pub fn parse_signal(s: &str) -> Result<Signal, SafeKillError> {
         let s = s.trim().to_uppercase();
 
-        // Try parsing as number first
+        // まず番号として解析を試みる
         if let Ok(num) = s.parse::<i32>() {
             return Self::from_number(num);
         }
 
-        // Try parsing as name
+        // 名前として解析を試みる
         Self::from_name(&s)
     }
 

@@ -1,7 +1,7 @@
-//! safe-kill: Safe process termination tool for AI agents
+//! safe-kill: AI エージェント向けの安全なプロセス終了ツール
 //!
-//! This library provides ancestry-based access control for process termination,
-//! allowing AI agents to safely kill only their descendant processes.
+//! ancestry ベースのアクセス制御によるプロセス終了機能を提供し、
+//! AI エージェントが自身の子孫プロセスのみを安全に kill できるようにする。
 
 pub mod ancestry;
 pub mod cli;

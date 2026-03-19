@@ -1,6 +1,6 @@
-//! Init command module for safe-kill
+//! safe-kill の init コマンドモジュール
 //!
-//! Generates configuration file with sample settings.
+//! サンプル設定を含む設定ファイルを生成する。
 
 use std::fs;
 use std::io::{self, Write};
@@ -9,18 +9,18 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::error::SafeKillError;
 
-/// Init command for generating configuration file
+/// 設定ファイル生成のための init コマンド
 pub struct InitCommand;
 
 impl InitCommand {
-    /// Execute the init command to generate configuration file
+    /// init コマンドを実行して設定ファイルを生成する
     ///
-    /// # Arguments
-    /// * `force` - If true, overwrite existing file without confirmation
+    /// # 引数
+    /// * `force` - true の場合、確認なしで既存ファイルを上書き
     ///
-    /// # Returns
-    /// * `Ok(PathBuf)` - Path to the generated file
-    /// * `Err(SafeKillError)` - If generation fails
+    /// # 戻り値
+    /// * `Ok(PathBuf)` - 生成されたファイルのパス
+    /// * `Err(SafeKillError)` - 生成に失敗した場合
     pub fn execute(force: bool) -> Result<PathBuf, SafeKillError> {
         let config_dir = Config::config_dir().ok_or_else(|| {
             SafeKillError::ConfigCreationError("Unable to determine config directory".to_string())
@@ -30,9 +30,9 @@ impl InitCommand {
             SafeKillError::ConfigCreationError("Unable to determine config path".to_string())
         })?;
 
-        // Check if file exists
+        // ファイルの存在チェック
         if config_path.exists() && !force {
-            // Ask for confirmation
+            // 上書き確認
             if !Self::confirm_overwrite(&config_path)? {
                 return Err(SafeKillError::ConfigCreationError(
                     "Operation cancelled".to_string(),
@@ -40,7 +40,7 @@ impl InitCommand {
             }
         }
 
-        // Create directory if it doesn't exist
+        // ディレクトリが存在しない場合は作成
         fs::create_dir_all(&config_dir).map_err(|e| {
             SafeKillError::ConfigCreationError(format!(
                 "Failed to create directory {}: {}",
@@ -49,7 +49,7 @@ impl InitCommand {
             ))
         })?;
 
-        // Write config file
+        // 設定ファイルを書き込み
         let content = Self::default_config_content();
         fs::write(&config_path, content).map_err(|e| {
             SafeKillError::ConfigCreationError(format!(
@@ -62,7 +62,7 @@ impl InitCommand {
         Ok(config_path)
     }
 
-    /// Generate default configuration content with comments
+    /// コメント付きのデフォルト設定内容を生成
     pub fn default_config_content() -> String {
         r#"# safe-kill configuration file
 # This file controls which processes can be killed by safe-kill.
@@ -90,7 +90,7 @@ ports = ["1420", "3000-3010", "5173", "8080"]
         .to_string()
     }
 
-    /// Ask user for confirmation to overwrite existing file
+    /// 既存ファイルの上書き確認をユーザーに求める
     fn confirm_overwrite(path: &Path) -> Result<bool, SafeKillError> {
         eprint!(
             "Config file already exists at {}. Overwrite? [y/N]: ",
@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn test_default_config_is_valid_toml() {
         let content = InitCommand::default_config_content();
-        // Should parse as valid TOML
+        // 有効な TOML としてパースできること
         let result: Result<toml::Value, _> = toml::from_str(&content);
         assert!(result.is_ok(), "Config content should be valid TOML");
     }
@@ -212,11 +212,11 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
 
-        // Write directly using the same logic as execute
+        // execute と同じロジックで直接書き込み
         let content = InitCommand::default_config_content();
         std::fs::write(&config_path, &content).unwrap();
 
-        // Verify file exists and is valid TOML
+        // ファイルが存在し、有効な TOML であることを確認
         assert!(config_path.exists());
         let read_content = std::fs::read_to_string(&config_path).unwrap();
         assert_eq!(read_content, content);

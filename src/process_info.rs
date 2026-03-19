@@ -175,7 +175,7 @@ mod tests {
     fn test_current_parent_pid() {
         let provider = ProcessInfoProvider::new();
         let parent = provider.current_parent_pid();
-        // Current process should have a parent
+        // 現在のプロセスには親が存在するはず
         assert!(parent.is_some());
     }
 
@@ -183,7 +183,7 @@ mod tests {
     fn test_all_processes_not_empty() {
         let provider = ProcessInfoProvider::new();
         let all = provider.all();
-        // There should be at least the current process
+        // 少なくとも現在のプロセスが含まれるはず
         assert!(!all.is_empty());
     }
 
@@ -201,7 +201,7 @@ mod tests {
         let before = provider.all().len();
         provider.refresh();
         let after = provider.all().len();
-        // Process count should be reasonable (not zero)
+        // プロセス数が妥当であること（ゼロでない）
         assert!(before > 0);
         assert!(after > 0);
     }
@@ -218,17 +218,17 @@ mod tests {
         let provider = ProcessInfoProvider::new();
         let current_pid = ProcessInfoProvider::current_pid();
         let info = provider.get(current_pid).unwrap();
-        // Process name should not be empty
+        // プロセス名が空でないこと
         assert!(!info.name.is_empty());
     }
 
     #[test]
     fn test_pid_1_exists_or_system_process() {
         let provider = ProcessInfoProvider::new();
-        // On most systems, PID 1 exists (init/launchd/systemd)
-        // But we don't strictly require it - just test that get works
+        // ほとんどのシステムで PID 1 は存在する（init/launchd/systemd）
+        // ただし厳密には要求せず、get が動作することをテスト
         let _result = provider.get(1);
-        // This test passes regardless - we're just testing the API works
+        // 結果に関わらずテストは通過する - API の動作確認が目的
     }
 
     #[test]

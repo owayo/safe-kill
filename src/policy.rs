@@ -651,7 +651,7 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // Port 59995 is allowed but no process on it
+        // ポート 59995 は許可されているがプロセスが存在しない
         let result = engine.kill_by_port(59995, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59995))));
     }
@@ -660,7 +660,7 @@ mod tests {
     fn test_kill_by_port_dry_run_no_process() {
         use crate::config::AllowedPorts;
 
-        // Explicit allowed_ports configuration (None means port killing is disabled)
+        // 明示的な allowed_ports 設定（None はポート kill 無効を意味する）
         let config = Config {
             allowlist: None,
             denylist: None,
@@ -669,16 +669,16 @@ mod tests {
             }),
         };
         let engine = PolicyEngine::new(config);
-        // dry_run should still check if process exists
+        // dry_run でもプロセスの存在チェックは行われる
         let result = engine.kill_by_port(3008, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(3008))));
     }
 
-    // can_kill_for_port tests
+    // can_kill_for_port のテスト
     #[test]
     fn test_can_kill_for_port_allowed() {
         let engine = PolicyEngine::with_defaults();
-        // Random PID that's not self and not in denylist
+        // 自プロセスでも denylist にも含まれないランダムな PID
         let permission = engine.can_kill_for_port(99999, "random_process");
         assert_eq!(permission, KillPermission::Allowed);
     }
@@ -713,14 +713,14 @@ mod tests {
 
     #[test]
     fn test_can_kill_for_port_no_ancestor_check() {
-        // Verify that can_kill_for_port does NOT check ancestry
-        // This is by design: port-based killing only applies denylist
+        // can_kill_for_port が ancestry チェックを行わないことを検証
+        // 設計上の意図: ポート指定 kill は denylist のみ適用
         let engine = PolicyEngine::with_defaults();
 
-        // A random process that is definitely NOT a descendant
-        // but should still be allowed if not in denylist
-        // Note: On macOS, "launchd" might be in default denylist
-        // So we use a generic name for this test
+        // 確実に子孫ではないランダムなプロセス
+        // denylist に含まれていなければ許可されるべき
+        // 注意: macOS では "launchd" がデフォルト denylist に含まれる可能性がある
+        // そのためこのテストでは汎用的な名前を使用
         let permission = engine.can_kill_for_port(99999, "some_random_server");
         assert_eq!(permission, KillPermission::Allowed);
     }
@@ -735,17 +735,17 @@ mod tests {
             cmd: vec![],
         };
         let permission = engine.can_kill(&process);
-        // Not in allowlist, not a descendant -> DeniedNotDescendant
+        // allowlist に含まれず、子孫でもない -> DeniedNotDescendant
         assert_eq!(permission, KillPermission::DeniedNotDescendant);
     }
 
     #[test]
     fn test_kill_by_pid_not_descendant() {
-        // PID 1 is never a descendant of a normal session
+        // PID 1 は通常のセッションの子孫にはなり得ない
         let engine = PolicyEngine::with_defaults();
         let result = engine.kill_by_pid(1, Signal::SIGTERM, false);
         assert!(result.is_err());
-        // Could be DeniedByDenylist (launchd/systemd in denylist) or SuicidePrevention
+        // DeniedByDenylist（launchd/systemd が denylist に含まれる）または SuicidePrevention の可能性
         match result {
             Err(SafeKillError::Denylisted(_))
             | Err(SafeKillError::SuicidePrevention(_))
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_kill_permission_eq_variants() {
-        // Verify equality between different DeniedByDenylist instances
+        // 異なる DeniedByDenylist インスタンス間の等値性を検証
         let a = KillPermission::DeniedByDenylist("proc_a".to_string());
         let b = KillPermission::DeniedByDenylist("proc_a".to_string());
         let c = KillPermission::DeniedByDenylist("proc_b".to_string());
