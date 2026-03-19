@@ -80,7 +80,7 @@ impl SignalSender {
         Self::from_name(&s)
     }
 
-    /// Parse signal from number
+    /// 番号からシグナルを解析する
     fn from_number(num: i32) -> Result<Signal, SafeKillError> {
         match num {
             1 => Ok(Signal::SIGHUP),
@@ -94,9 +94,9 @@ impl SignalSender {
         }
     }
 
-    /// Parse signal from name
+    /// 名前からシグナルを解析する
     fn from_name(s: &str) -> Result<Signal, SafeKillError> {
-        // Remove SIG prefix if present
+        // SIG プレフィックスがあれば除去
         let name = s.strip_prefix("SIG").unwrap_or(s);
 
         match name {
@@ -111,10 +111,10 @@ impl SignalSender {
         }
     }
 
-    /// Send signal to process
+    /// プロセスにシグナルを送信する
     pub fn send(pid: u32, signal: Signal) -> Result<(), SafeKillError> {
-        // PID 0 and values beyond i32 are unsafe for nix::Pid::from_raw usage.
-        // PID 0 has special semantics (process group), so reject explicitly.
+        // PID 0 および i32 を超える値は nix::Pid::from_raw で安全に扱えない。
+        // PID 0 は特殊な意味（プロセスグループ）を持つため明示的に拒否する。
         if pid == 0 || pid > i32::MAX as u32 {
             return Err(SafeKillError::InvalidPid(pid.to_string()));
         }
@@ -134,7 +134,7 @@ impl SignalSender {
 mod tests {
     use super::*;
 
-    // Signal enum tests
+    // Signal enum のテスト
     #[test]
     fn test_signal_default() {
         assert_eq!(Signal::default(), Signal::SIGTERM);
@@ -160,7 +160,7 @@ mod tests {
         assert_eq!(Signal::SIGTERM.number(), 15);
     }
 
-    // Parse from number tests
+    // 番号からの解析テスト
     #[test]
     fn test_parse_signal_from_number() {
         assert_eq!(SignalSender::parse_signal("1").unwrap(), Signal::SIGHUP);
@@ -190,7 +190,7 @@ mod tests {
         assert_eq!(SignalSender::parse_signal("31").unwrap(), Signal::SIGUSR2);
     }
 
-    // Parse from name tests
+    // 名前からの解析テスト
     #[test]
     fn test_parse_signal_from_name_with_prefix() {
         assert_eq!(
@@ -257,7 +257,7 @@ mod tests {
         assert_eq!(SignalSender::parse_signal(" 15 ").unwrap(), Signal::SIGTERM);
     }
 
-    // Invalid signal tests
+    // 無効なシグナルのテスト
     #[test]
     fn test_parse_invalid_signal_number() {
         let result = SignalSender::parse_signal("99");
@@ -345,16 +345,16 @@ mod tests {
         assert!(SignalSender::parse_signal("15TERM").is_err());
     }
 
-    // Send signal tests
+    // シグナル送信テスト
     #[test]
     fn test_send_to_nonexistent_process() {
-        // Use a very high PID that's unlikely to exist
+        // 存在する可能性が極めて低い大きな PID を使用
         let result = SignalSender::send(999999999, Signal::SIGTERM);
         assert!(result.is_err());
         match result {
             Err(SafeKillError::ProcessNotFound(pid)) => assert_eq!(pid, 999999999),
             Err(SafeKillError::PermissionDenied(_)) => {
-                // Some systems may return permission denied instead
+                // 一部のシステムでは代わりに permission denied を返す場合がある
             }
             Err(e) => panic!("Unexpected error: {:?}", e),
             Ok(_) => panic!("Expected error for nonexistent process"),
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn test_signal_number_all_variants() {
-        // Verify that all signals have valid numbers
+        // すべてのシグナルが有効な番号を持つことを検証
         let signals = [
             (Signal::SIGHUP, 1),
             (Signal::SIGINT, 2),
@@ -387,12 +387,12 @@ mod tests {
         for (sig, expected_num) in &signals {
             assert_eq!(sig.number(), *expected_num);
         }
-        // SIGUSR1 and SIGUSR2 have platform-specific numbers
+        // SIGUSR1 と SIGUSR2 はプラットフォーム固有の番号を持つ
         assert!(Signal::SIGUSR1.number() > 0);
         assert!(Signal::SIGUSR2.number() > 0);
     }
 
-    // Clone and Copy tests
+    // Clone と Copy のテスト
     #[test]
     fn test_signal_clone() {
         let sig = Signal::SIGTERM;
