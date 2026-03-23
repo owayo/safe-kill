@@ -83,7 +83,7 @@ safe-kill [OPTIONS] [PID]
 
 | オプション | 短縮形 | 説明 |
 |-----------|-------|------|
-| `--name <NAME>` | `-N` | プロセス名で終了（pkill形式） |
+| `--name <NAME>` | `-N` | プロセス名の完全一致で終了 |
 | `--port <PORT>` | `-p` | 指定したポートを使用するプロセスを終了 |
 | `--signal <SIGNAL>` | `-s` | 送信するシグナル（デフォルト: SIGTERM） |
 | `--list` | `-l` | 終了可能なプロセス一覧 |
@@ -126,6 +126,8 @@ safe-kill --name python --dry-run
 ```
 
 `--name` / `--port` の dry-run では、実際に kill したと誤解しないように集計行を `would kill` 表示にしています。
+
+`--name` は実行ファイル名の完全一致で判定します。部分一致やパターン一致は行いません。
 
 ### エラーハンドリング
 
@@ -267,7 +269,7 @@ Claude Code で `kill`/`pkill` コマンドの代わりに `safe-kill` を使用
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 safe-kill を使用: safe-kill <PID> または safe-kill --name <名前> (pkill相当)。シグナル指定は -s <signal>' >&2; exit 2; fi"
+            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 safe-kill を使用: safe-kill <PID> または safe-kill --name <完全一致名>。シグナル指定は -s <signal>' >&2; exit 2; fi"
           }
         ]
       }

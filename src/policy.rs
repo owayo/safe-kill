@@ -1,4 +1,4 @@
-//! safe-kill の Policy engine
+//! safe-kill のポリシーエンジン
 //!
 //! ancestry、config、自殺防止を組み合わせた kill 許可判定を統括する。
 
@@ -40,7 +40,7 @@ impl KillPermission {
     }
 }
 
-/// kill 許可判定を統括する Policy engine
+/// kill 許可判定を統括するポリシーエンジン
 pub struct PolicyEngine {
     config: Config,
     ancestry: AncestryChecker,

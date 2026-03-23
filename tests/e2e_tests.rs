@@ -42,6 +42,17 @@ fn test_list_with_dry_run_is_invalid() {
     cmd.arg("--list").arg("--dry-run").assert().success();
 }
 
+#[test]
+fn test_list_ignores_invalid_signal() {
+    // 一覧表示ではシグナルを使わないため、無効な値でも失敗しない
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--signal")
+        .arg("INVALID")
+        .arg("--list")
+        .assert()
+        .success();
+}
+
 // =============================================================================
 // --dry-run モードの動作確認テスト
 // =============================================================================
@@ -643,6 +654,29 @@ fn test_init_output_shows_hint() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Hint").and(predicate::str::contains("--port")));
+}
+
+#[test]
+fn test_init_ignores_invalid_signal() {
+    // init ではシグナルを使わないため、無効な値でも設定生成を継続する
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp
+        .path()
+        .join(".config")
+        .join("safe-kill")
+        .join("config.toml");
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--signal")
+        .arg("INVALID")
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created"));
+
+    assert!(config_path.exists());
 }
 
 #[test]

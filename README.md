@@ -83,7 +83,7 @@ safe-kill [OPTIONS] [PID]
 
 | Option | Short | Description |
 |--------|-------|-------------|
-| `--name <NAME>` | `-N` | Kill processes by name (pkill-style) |
+| `--name <NAME>` | `-N` | Kill processes by exact process name |
 | `--port <PORT>` | `-p` | Kill process using the specified port |
 | `--signal <SIGNAL>` | `-s` | Signal to send (default: SIGTERM) |
 | `--list` | `-l` | List killable processes |
@@ -126,6 +126,8 @@ safe-kill --name python --dry-run
 ```
 
 For `--name` and `--port` dry runs, batch summaries use `would kill` so preview output is not mistaken for an actual termination.
+
+`--name` matches the executable name exactly. It does not perform substring or pattern matching.
 
 ### Error Handling
 
@@ -267,7 +269,7 @@ Add to `.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <name> (like pkill). Use -s <signal> for signal.' >&2; exit 2; fi"
+            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <exact-name>. Use -s <signal> for signal.' >&2; exit 2; fi"
           }
         ]
       }

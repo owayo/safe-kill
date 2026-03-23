@@ -12,7 +12,7 @@ use crate::signal::{Signal, SignalSender};
 pub enum ExecutionMode {
     /// PID 指定でプロセスを kill
     KillByPid(u32),
-    /// 名前指定でプロセスを kill（pkill 風）
+    /// プロセス名の完全一致で終了
     KillByName(String),
     /// ポート指定でプロセスを kill
     KillByPort(u16),
@@ -52,7 +52,7 @@ pub struct CliArgs {
     #[arg(value_name = "PID")]
     pub pid: Option<u32>,
 
-    /// 名前指定でプロセスを kill（pkill 風）
+    /// プロセス名の完全一致で終了
     #[arg(short = 'N', long, value_name = "NAME")]
     pub name: Option<String>,
 

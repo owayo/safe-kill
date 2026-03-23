@@ -203,9 +203,9 @@ impl Config {
     ///
     /// 開発でよく使われるポートで、`safe-kill init` で生成される
     /// サンプル設定に含まれる:
-    /// - 1420: Tauri dev server
-    /// - 3000-3010: Node.js dev server
-    /// - 5173: Vite dev server
+    /// - 1420: Tauri 開発サーバー
+    /// - 3000-3010: Node.js 開発サーバー
+    /// - 5173: Vite 開発サーバー
     /// - 8080: HTTP 代替ポート
     ///
     /// 注意: ランタイムのデフォルトとしては適用されない。
@@ -572,7 +572,7 @@ processes = ["node"]
         .unwrap();
 
         let config = Config::load_from_path(Some(file.path().to_path_buf()));
-        // デフォルト denylist が追加されるべき since it was missing
+        // denylist が未指定だったため、デフォルト denylist が追加されるべき
         assert!(config.denylist.is_some());
         let denylist = config.denylist.as_ref().unwrap();
         assert!(!denylist.processes.is_empty());

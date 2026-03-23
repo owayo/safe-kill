@@ -64,26 +64,26 @@ impl InitCommand {
 
     /// コメント付きのデフォルト設定内容を生成
     pub fn default_config_content() -> String {
-        r#"# safe-kill configuration file
-# This file controls which processes can be killed by safe-kill.
+        r#"# safe-kill 設定ファイル
+# safe-kill で終了を許可するプロセスやポートをこのファイルで制御します。
 
-# Allowlist: Only processes matching these names can be killed.
-# If not specified, all processes (except denylisted) are allowed.
+# 許可リスト: ここに書いたプロセス名は親子関係チェックをバイパスできます。
+# 指定しない場合は、拒否リスト以外のプロセスが通常の安全チェック対象になります。
 # [allowlist]
 # processes = ["next-server"]
 
-# Denylist: Processes matching these names can never be killed.
-# System processes are always protected by default.
+# 拒否リスト: ここに書いたプロセス名は常に終了できません。
+# システムプロセスはデフォルトでも保護されます。
 # [denylist]
 # processes = ["systemd", "launchd", "init"]
 
-# Allowed ports: Ports that can be targeted with --port option.
-# If not specified, --port option is disabled (no ports can be killed).
-# Supports individual ports and ranges (e.g., "3000", "8080-8090").
-#   - 1420: Tauri dev server
-#   - 3000-3010: Node.js dev servers
-#   - 5173: Vite dev server
-#   - 8080: HTTP alternative port
+# 許可ポート: --port オプションで対象にできるポートです。
+# 指定しない場合、--port オプションは無効です。
+# 単一ポート ("3000") と範囲 ("8080-8090") の両方を指定できます。
+#   - 1420: Tauri 開発サーバー
+#   - 3000-3010: Node.js 開発サーバー
+#   - 5173: Vite 開発サーバー
+#   - 8080: HTTP 代替ポート
 [allowed_ports]
 ports = ["1420", "3000-3010", "5173", "8080"]
 "#
@@ -140,10 +140,10 @@ mod tests {
     #[test]
     fn test_default_config_content_has_comments() {
         let content = InitCommand::default_config_content();
-        assert!(content.contains("# safe-kill configuration file"));
-        assert!(content.contains("# Allowlist"));
-        assert!(content.contains("# Denylist"));
-        assert!(content.contains("# Allowed ports"));
+        assert!(content.contains("# safe-kill 設定ファイル"));
+        assert!(content.contains("# 許可リスト"));
+        assert!(content.contains("# 拒否リスト"));
+        assert!(content.contains("# 許可ポート"));
     }
 
     #[test]
@@ -199,10 +199,10 @@ mod tests {
     fn test_default_config_content_has_port_descriptions() {
         let content = InitCommand::default_config_content();
         // ポートの説明コメントが含まれていること
-        assert!(content.contains("Tauri dev server"));
-        assert!(content.contains("Node.js dev servers"));
-        assert!(content.contains("Vite dev server"));
-        assert!(content.contains("HTTP alternative port"));
+        assert!(content.contains("Tauri 開発サーバー"));
+        assert!(content.contains("Node.js 開発サーバー"));
+        assert!(content.contains("Vite 開発サーバー"));
+        assert!(content.contains("HTTP 代替ポート"));
     }
 
     #[test]

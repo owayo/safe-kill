@@ -58,6 +58,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux の番号差異吸収、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決 |
+| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索 |
 | `init.rs` | `safe-kill init` で config.toml を生成 |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 
