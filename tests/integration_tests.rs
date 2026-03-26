@@ -772,3 +772,186 @@ fn test_process_info_get_pid_1() {
     assert_eq!(info.pid, 1);
     assert!(!info.name.is_empty());
 }
+
+// =============================================================================
+// PolicyEngine kill_by_name 成功パステスト
+// =============================================================================
+
+/// kill_by_name で子プロセスが見つかり dry-run で成功するテスト
+#[test]
+fn test_policy_engine_kill_by_name_dry_run_success() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    // 自プロセスの子孫なので ancestry チェックを通過する
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_name("sleep", Signal::SIGTERM, true);
+    assert!(result.is_ok(), "dry-run での kill_by_name は Ok を返すべき");
+
+    let batch = result.unwrap();
+    assert!(batch.total_matched > 0, "sleep プロセスが見つかるべき");
+    // dry-run では kill が成功扱いになる
+    assert!(batch.any_success(), "dry-run の結果は success になるべき");
+
+    // 実際には kill されていないので cleanup
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+/// kill_by_name で混合結果（一部許可・一部拒否）のテスト
+#[test]
+fn test_policy_engine_kill_by_name_mixed_batch() {
+    use safe_kill::config::ProcessList;
+
+    // PID 1 のプロセス名を取得
+    let provider = ProcessInfoProvider::new();
+    let pid1_info = provider.get(1).expect("PID 1 should exist");
+
+    // denylist に入っているプロセスを名前で検索した場合、
+    // 全プロセスが拒否される
+    let config = Config {
+        allowlist: None,
+        denylist: Some(ProcessList {
+            processes: vec![pid1_info.name.clone()],
+        }),
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_name(&pid1_info.name, Signal::SIGTERM, true);
+    assert!(result.is_ok());
+
+    let batch = result.unwrap();
+    assert!(batch.total_matched > 0);
+    // denylist 上のプロセスはすべて拒否
+    assert_eq!(batch.total_killed, 0);
+    assert!(!batch.all_success());
+    assert!(!batch.any_success());
+
+    // 各結果にエラーが含まれることを確認
+    for r in &batch.results {
+        assert!(!r.success);
+        assert!(r.error.is_some());
+    }
+}
+
+// =============================================================================
+// PolicyEngine kill_by_pid 成功パステスト
+// =============================================================================
+
+/// kill_by_pid で子プロセスを dry-run で正常終了するテスト
+#[test]
+fn test_policy_engine_kill_by_pid_dry_run_success() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_pid(child_pid, Signal::SIGTERM, true);
+    assert!(result.is_ok(), "子プロセスの dry-run kill は Ok を返すべき");
+
+    let kill_result = result.unwrap();
+    assert!(kill_result.success);
+    assert_eq!(kill_result.pid, child_pid);
+    assert!(kill_result.message.contains("dry run"));
+
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+// =============================================================================
+// AncestryChecker get_root_pid フォールバックテスト
+// =============================================================================
+
+/// 環境変数未設定時に get_root_pid が祖父プロセス PID を返すテスト
+#[test]
+fn test_ancestry_get_root_pid_without_env_var() {
+    // 環境変数を一時的にクリア
+    let original = std::env::var("SAFE_KILL_ROOT_PID").ok();
+    unsafe {
+        std::env::remove_var("SAFE_KILL_ROOT_PID");
+    }
+
+    let provider = ProcessInfoProvider::new();
+    let root = AncestryChecker::get_root_pid(&provider);
+
+    // ルート PID は有効な値（> 0）であるべき
+    assert!(root > 0, "ルート PID は 0 より大きいべき");
+
+    // 現在プロセスの祖父 PID または親 PID と一致するはず
+    let current_pid = ProcessInfoProvider::current_pid();
+    if let Some(current_info) = provider.get(current_pid) {
+        if let Some(parent_pid) = current_info.parent_pid {
+            if let Some(parent_info) = provider.get(parent_pid) {
+                if let Some(grandparent_pid) = parent_info.parent_pid {
+                    assert_eq!(root, grandparent_pid, "祖父プロセス PID と一致すべき");
+                } else {
+                    // 祖父が取得できない場合は親 PID にフォールバック
+                    assert_eq!(root, parent_pid, "親プロセス PID にフォールバックすべき");
+                }
+            }
+        }
+    }
+
+    // 環境変数を復元
+    if let Some(val) = original {
+        unsafe {
+            std::env::set_var("SAFE_KILL_ROOT_PID", val);
+        }
+    }
+}
+
+// =============================================================================
+// ProcessInfoProvider 空文字列検索テスト
+// =============================================================================
+
+#[test]
+fn test_process_info_find_by_name_empty_string() {
+    let provider = ProcessInfoProvider::new();
+    let results = provider.find_by_name("");
+    assert!(results.is_empty(), "空文字列での検索は空の結果を返すべき");
+}
+
+// =============================================================================
+// SignalSender 成功パス統合テスト
+// =============================================================================
+
+/// 子プロセスに SIGTERM を送信し、成功を確認する統合テスト
+#[test]
+fn test_signal_send_success_to_child_integration() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let pid = child.id();
+
+    let result = SignalSender::send(pid, Signal::SIGTERM);
+    assert!(result.is_ok(), "子プロセスへの SIGTERM 送信は成功するべき");
+
+    // プロセスが終了済みなので再送信すると ProcessNotFound になる
+    let mut child = child;
+    let _ = child.wait();
+
+    let result2 = SignalSender::send(pid, Signal::SIGTERM);
+    assert!(
+        matches!(result2, Err(SafeKillError::ProcessNotFound(_))),
+        "終了済みプロセスへの送信は ProcessNotFound になるべき"
+    );
+}

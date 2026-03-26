@@ -332,4 +332,22 @@ mod tests {
             assert!(!p.name.is_empty(), "All processes should have a name");
         }
     }
+
+    // 空文字列での find_by_name テスト
+    #[test]
+    fn test_find_by_name_empty_string() {
+        let provider = ProcessInfoProvider::new();
+        let results = provider.find_by_name("");
+        // 空文字列で一致するプロセスは通常存在しない
+        assert!(results.is_empty(), "空文字列での検索は空の結果を返すべき");
+    }
+
+    // 存在しない PID への get テスト（u32::MAX 付近）
+    #[test]
+    fn test_get_nonexistent_large_pid() {
+        let provider = ProcessInfoProvider::new();
+        // u32::MAX に近い PID は通常存在しない
+        let result = provider.get(u32::MAX - 1);
+        assert!(result.is_none(), "非常に大きい PID は存在しないはず");
+    }
 }

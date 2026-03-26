@@ -430,4 +430,50 @@ mod tests {
             "PID 1 は有効な PID なので InvalidPid にはならない"
         );
     }
+
+    // 実プロセスへのシグナル送信成功テスト
+    #[test]
+    fn test_send_success_to_child_process() {
+        use std::process::Command;
+
+        // 子プロセスを生成
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動に失敗");
+        let pid = child.id();
+
+        // SIGTERM を送信し、成功を確認
+        let result = SignalSender::send(pid, Signal::SIGTERM);
+        assert!(result.is_ok(), "子プロセスへの SIGTERM 送信は成功するべき");
+
+        // 終了を待つ
+        let mut child = child;
+        let _ = child.wait();
+    }
+
+    // 子プロセスに各種シグナルを送信できることを確認
+    #[test]
+    fn test_send_various_signals_to_child() {
+        use std::process::Command;
+
+        for signal in [
+            Signal::SIGHUP,
+            Signal::SIGINT,
+            Signal::SIGQUIT,
+            Signal::SIGKILL,
+        ] {
+            let child = Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("sleep プロセスの起動に失敗");
+            let pid = child.id();
+
+            let result = SignalSender::send(pid, signal);
+            assert!(result.is_ok(), "{} の送信が失敗した", signal.name());
+
+            let mut child = child;
+            let _ = child.wait();
+        }
+    }
 }

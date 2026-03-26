@@ -29,7 +29,7 @@ sysinfo = "0.38.4"
 nix = { version = "0.31.2", features = ["signal", "process"] }
 
 # 設定ファイル解析
-toml = "1.0.7"
+toml = "1.1.0"
 serde = { version = "1.0.228", features = ["derive"] }
 
 # ホームディレクトリ検出

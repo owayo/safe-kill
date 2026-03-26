@@ -510,4 +510,68 @@ mod tests {
         // 成功結果には error がなく、Denylisted はポリシーエラー → None
         assert_eq!(batch.first_operational_error(), None);
     }
+
+    // 実プロセスに対する kill_with_result の成功パステスト
+    #[test]
+    fn test_kill_with_result_success_real_process() {
+        use std::process::Command;
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動に失敗");
+        let pid = child.id();
+
+        let killer = ProcessKiller::new();
+        let result = killer.kill_with_result(pid, "sleep", Signal::SIGTERM, false);
+
+        assert!(result.success, "実プロセスへの kill は成功するべき");
+        assert_eq!(result.pid, pid);
+        assert_eq!(result.name, "sleep");
+        assert!(result.error.is_none());
+        assert!(result.message.contains("Sent SIGTERM"));
+
+        let mut child = child;
+        let _ = child.wait();
+    }
+
+    // kill() メソッドの成功パステスト
+    #[test]
+    fn test_kill_success_real_process() {
+        use std::process::Command;
+
+        let child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動に失敗");
+        let pid = child.id();
+
+        let killer = ProcessKiller::new();
+        let result = killer.kill(pid, Signal::SIGTERM);
+
+        assert!(result.is_ok(), "実プロセスへの kill() は Ok を返すべき");
+
+        let mut child = child;
+        let _ = child.wait();
+    }
+
+    // BatchKillResult の any_success テスト
+    #[test]
+    fn test_batch_kill_result_any_success() {
+        let mut batch = BatchKillResult::new();
+        assert!(!batch.any_success(), "空のバッチは any_success = false");
+
+        batch.add(KillResult::failure(
+            1,
+            "a",
+            &SafeKillError::ProcessNotFound(1),
+        ));
+        assert!(!batch.any_success(), "全失敗のバッチは any_success = false");
+
+        batch.add(KillResult::success(2, "b", Signal::SIGTERM));
+        assert!(
+            batch.any_success(),
+            "1件でも成功があれば any_success = true"
+        );
+    }
 }
