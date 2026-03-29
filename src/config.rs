@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub struct Config {
     /// ancestry チェックをバイパスするプロセス（子孫検証なしで kill 可能）
     pub allowlist: Option<ProcessList>,
-    /// kill 不可能なプロセス（allowlist より優先される）
+    /// kill 不可能なプロセス（allowlist より優先され、既定の保護対象にも合流される）
     pub denylist: Option<ProcessList>,
     /// --port kill 操作で許可されるポート
     pub allowed_ports: Option<AllowedPorts>,
@@ -155,12 +155,21 @@ impl Config {
 
     /// 既存の設定にデフォルト値をマージする
     fn merge_defaults(&mut self) {
-        // denylist が未指定の場合、デフォルトの denylist を追加
-        if self.denylist.is_none() {
-            self.denylist = Some(ProcessList {
-                processes: Self::default_denylist(),
-            });
+        let mut processes = self
+            .denylist
+            .take()
+            .map(|list| list.processes)
+            .unwrap_or_default();
+
+        // システム保護対象は常に denylist に含める。
+        for default_process in Self::default_denylist() {
+            if !processes.iter().any(|process| process == &default_process) {
+                processes.push(default_process);
+            }
         }
+
+        self.denylist = Some(ProcessList { processes });
+
         // 注意: allowed_ports はデフォルトでは設定されない。
         // ポート指定 kill は明示的に設定しない限り無効。
     }
@@ -539,7 +548,7 @@ processes = ["node"]
     }
 
     #[test]
-    fn test_merge_defaults_preserves_custom_denylist() {
+    fn test_merge_defaults_merges_custom_denylist_with_defaults() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
@@ -551,12 +560,41 @@ processes = ["custom_process"]
         .unwrap();
 
         let config = Config::load_from_path(Some(file.path().to_path_buf()));
-        // カスタム denylist はデフォルトで上書きされないこと
+        // カスタム denylist を保持しつつ、既定の保護対象も必ず残す。
         let denylist = config.denylist.as_ref().unwrap();
-        assert_eq!(denylist.processes, vec!["custom_process".to_string()]);
-        // デフォルトのプロセス（例: launchd, systemd）はリストに含まれないこと
-        assert!(!denylist.processes.contains(&"launchd".to_string()));
-        assert!(!denylist.processes.contains(&"systemd".to_string()));
+        assert!(denylist.processes.contains(&"custom_process".to_string()));
+        for default_process in Config::default_denylist() {
+            assert!(denylist.processes.contains(&default_process));
+        }
+    }
+
+    #[test]
+    fn test_merge_defaults_deduplicates_existing_default_denylist_entries() {
+        let mut file = NamedTempFile::new().unwrap();
+        let default_process = Config::default_denylist()
+            .into_iter()
+            .next()
+            .expect("default denylist should not be empty");
+        writeln!(
+            file,
+            r#"
+[denylist]
+processes = ["{}", "custom_process"]
+"#,
+            default_process
+        )
+        .unwrap();
+
+        let config = Config::load_from_path(Some(file.path().to_path_buf()));
+        let denylist = config.denylist.as_ref().unwrap();
+        let count = denylist
+            .processes
+            .iter()
+            .filter(|process| *process == &default_process)
+            .count();
+
+        assert_eq!(count, 1);
+        assert!(denylist.processes.contains(&"custom_process".to_string()));
     }
 
     #[test]

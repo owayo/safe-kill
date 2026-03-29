@@ -73,7 +73,7 @@ impl InitCommand {
 # processes = ["next-server"]
 
 # 拒否リスト: ここに書いたプロセス名は常に終了できません。
-# システムプロセスはデフォルトでも保護されます。
+# システムプロセスはデフォルトでも保護され、ここに書いた内容はその保護対象に追加されます。
 # [denylist]
 # processes = ["systemd", "launchd", "init"]
 

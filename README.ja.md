@@ -142,9 +142,10 @@ safe-kill --name python --dry-run
 [allowlist]
 processes = ["my-trusted-app", "next-server"]
 
-# 絶対に終了できないプロセス（許可リストより優先）
+# 追加で絶対に終了できないプロセス（許可リストより優先）
+# システム保護の既定 denylist は維持され、この設定はそこへ追加されます
 [denylist]
-processes = ["launchd", "systemd", "init", "kernel_task"]
+processes = ["postgres"]
 
 # --port オプションで許可するポート
 # 指定しない場合、--port オプションは無効（ポート指定でのkillは不可）
@@ -163,6 +164,8 @@ ports = ["1420", "3000-3010", "5173", "8080"]
 **macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
 
 **Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
+
+ユーザー定義の `[denylist]` はこの既定保護に追加されます。カスタマイズしてもシステムプロセスの保護は解除されません。
 
 ## アーキテクチャ
 

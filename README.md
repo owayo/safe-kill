@@ -142,9 +142,10 @@ Initialize configuration with `safe-kill init`, or create `~/.config/safe-kill/c
 [allowlist]
 processes = ["my-trusted-app", "next-server"]
 
-# Processes that can never be killed (takes precedence over allowlist)
+# Additional processes that can never be killed (takes precedence over allowlist)
+# Built-in system protections stay enabled even when you customize this list.
 [denylist]
-processes = ["launchd", "systemd", "init", "kernel_task"]
+processes = ["postgres"]
 
 # Allowed ports for --port option
 # If not specified, --port option is disabled (no ports can be killed)
@@ -163,6 +164,8 @@ The following system processes are protected by default:
 **macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
 
 **Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
+
+User-defined `[denylist]` entries are appended to this built-in protection set. Customizing the list does not remove system safeguards.
 
 ## Architecture
 

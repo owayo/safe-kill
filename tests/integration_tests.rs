@@ -6,7 +6,7 @@ use safe_kill::ancestry::AncestryChecker;
 use safe_kill::config::Config;
 use safe_kill::error::SafeKillError;
 use safe_kill::killer::ProcessKiller;
-use safe_kill::policy::PolicyEngine;
+use safe_kill::policy::{KillPermission, PolicyEngine};
 use safe_kill::process_info::ProcessInfoProvider;
 use safe_kill::signal::{Signal, SignalSender};
 
@@ -113,6 +113,31 @@ processes = ["blocked_process"]
 }
 
 #[test]
+fn test_config_load_keeps_default_system_denylist_when_customized() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+[denylist]
+processes = ["custom_process"]
+"#
+    )
+    .unwrap();
+
+    let provider = ProcessInfoProvider::new();
+    let pid1_info = provider.get(1).expect("PID 1 should exist");
+
+    let config = Config::load_from_path(Some(file.path().to_path_buf()));
+
+    assert!(config.is_denied("custom_process"));
+    assert!(
+        config.is_denied(&pid1_info.name),
+        "custom denylist should not remove system protection for PID 1 ({})",
+        pid1_info.name
+    );
+}
+
+#[test]
 fn test_config_apply_in_policy_engine() {
     use safe_kill::config::ProcessList;
 
@@ -131,6 +156,29 @@ fn test_config_apply_in_policy_engine() {
     // 設定が適用されていることを確認
     assert!(engine.config().is_allowed("allowed_test"));
     assert!(engine.config().is_denied("denied_test"));
+}
+
+#[test]
+fn test_policy_engine_keeps_system_processes_denied_with_custom_denylist() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+[denylist]
+processes = ["custom_process"]
+"#
+    )
+    .unwrap();
+
+    let provider = ProcessInfoProvider::new();
+    let pid1_info = provider.get(1).expect("PID 1 should exist");
+    let config = Config::load_from_path(Some(file.path().to_path_buf()));
+    let engine = PolicyEngine::new(config);
+
+    assert!(matches!(
+        engine.can_kill(&pid1_info),
+        KillPermission::DeniedByDenylist(ref name) if name == &pid1_info.name
+    ));
 }
 
 #[test]
