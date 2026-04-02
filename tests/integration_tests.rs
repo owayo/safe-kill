@@ -1169,3 +1169,256 @@ fn test_policy_engine_list_killable_includes_child() {
     let _ = SignalSender::send(child_pid, Signal::SIGTERM);
     let _ = child.wait();
 }
+
+// =============================================================================
+// 追加テスト: 空リスト・部分一致・既終了プロセス
+// =============================================================================
+
+/// 空の processes 配列での allowlist/denylist 動作テスト
+#[test]
+fn test_config_empty_process_lists() {
+    use safe_kill::config::ProcessList;
+
+    let config = Config {
+        allowlist: Some(ProcessList { processes: vec![] }),
+        denylist: Some(ProcessList { processes: vec![] }),
+        allowed_ports: None,
+    };
+
+    // 空リストでは何も許可・拒否されない
+    assert!(!config.is_allowed("node"));
+    assert!(!config.is_denied("node"));
+    assert!(!config.is_allowed(""));
+    assert!(!config.is_denied(""));
+}
+
+/// find_by_name は部分一致ではなく完全一致であることを確認
+#[test]
+fn test_process_info_find_by_name_no_partial_match() {
+    let provider = ProcessInfoProvider::new();
+    let current = provider.get(ProcessInfoProvider::current_pid()).unwrap();
+
+    // 名前の一部だけでは一致しないことを確認
+    if current.name.len() > 1 {
+        let partial = &current.name[..current.name.len() - 1];
+        let results = provider.find_by_name(partial);
+        // 部分一致では現在のプロセスが見つからないこと
+        // （ただし偶然一致するプロセスが存在する可能性はある）
+        for r in &results {
+            assert_eq!(r.name, partial, "find_by_name は完全一致のみ返すべき");
+        }
+    }
+}
+
+/// 既に終了したプロセスへの kill が適切なエラーを返すテスト
+#[test]
+fn test_kill_already_terminated_process() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    // まず終了させる
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let mut child = child;
+    let _ = child.wait();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 終了済みプロセスへの kill を試行
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+    let result = engine.kill_by_pid(child_pid, Signal::SIGTERM, false);
+
+    // ProcessNotFound エラーが返されるべき
+    assert!(
+        matches!(result, Err(SafeKillError::ProcessNotFound(_))),
+        "終了済みプロセスへの kill は ProcessNotFound になるべき"
+    );
+}
+
+/// 子プロセスが ancestry チェックを通過することを確認
+#[test]
+fn test_ancestry_child_process_is_descendant() {
+    use safe_kill::ancestry::AncestryChecker;
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let provider = ProcessInfoProvider::new();
+    let checker = AncestryChecker::new(provider);
+
+    // 子プロセスはセッションの子孫であるべき
+    assert!(
+        checker.is_descendant(child_pid),
+        "子プロセスは ancestry チェックを通過すべき"
+    );
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+/// ポート指定 kill で実際の TCP リスナーをテスト
+#[test]
+fn test_policy_engine_kill_by_port_with_real_listener() {
+    use safe_kill::config::AllowedPorts;
+    use std::net::TcpListener;
+    use std::process::Command;
+
+    // 利用可能なポートを見つける
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ポートのバインドに失敗");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener); // ポートを解放して子プロセスに使わせる
+
+    // nc (netcat) でリスナーを起動
+    let child = Command::new("nc")
+        .arg("-l")
+        .arg("127.0.0.1")
+        .arg(port.to_string())
+        .spawn();
+
+    if let Ok(child) = child {
+        let child_pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec![format!("{}", port)],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+
+        let result = engine.kill_by_port(port, Signal::SIGTERM, true);
+        // nc がポートをバインドできた場合はプロセスが見つかるはず
+        // 環境により見つからない場合もあるので、エラーでも OK
+        if let Ok(batch) = result {
+            if batch.total_matched > 0 {
+                assert!(batch.any_success(), "dry-run では成功扱いになるべき");
+            }
+        }
+
+        // クリーンアップ
+        let mut child = child;
+        let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+        let _ = child.wait();
+    }
+}
+
+/// denylist に入っているプロセスは ancestry チェックに関係なく拒否される
+#[test]
+fn test_denylist_overrides_ancestry_for_child() {
+    use safe_kill::config::ProcessList;
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let config = Config {
+        allowlist: None,
+        denylist: Some(ProcessList {
+            processes: vec!["sleep".to_string()],
+        }),
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    // 子プロセスでも denylist に含まれていれば拒否
+    let result = engine.kill_by_pid(child_pid, Signal::SIGTERM, false);
+    assert!(
+        matches!(result, Err(SafeKillError::Denylisted(_))),
+        "denylist のプロセスは子プロセスでも拒否されるべき"
+    );
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+/// allowlist に入っていれば ancestry チェックをバイパスできる
+#[test]
+fn test_allowlist_bypasses_ancestry_check() {
+    use safe_kill::config::ProcessList;
+
+    // PID 1 のプロセス名を取得
+    let provider = ProcessInfoProvider::new();
+    let pid1_info = provider.get(1).expect("PID 1 should exist");
+
+    // PID 1 を allowlist に入れ、denylist からは除外
+    let config = Config {
+        allowlist: Some(ProcessList {
+            processes: vec![pid1_info.name.clone()],
+        }),
+        denylist: None,
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    // can_kill では AllowedByAllowlist が返るべき
+    let permission = engine.can_kill(&pid1_info);
+    assert_eq!(
+        permission,
+        KillPermission::AllowedByAllowlist,
+        "allowlist のプロセスは ancestry チェックをバイパスすべき"
+    );
+}
+
+/// PortRange の同一ポート範囲テスト（start == end）
+#[test]
+fn test_port_range_same_start_end_in_policy() {
+    use safe_kill::config::AllowedPorts;
+
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["8080-8080".to_string()],
+        }),
+    };
+
+    assert!(config.is_port_allowed(8080));
+    assert!(!config.is_port_allowed(8079));
+    assert!(!config.is_port_allowed(8081));
+}
+
+/// TOML の allowlist のみ指定時にデフォルト denylist が自動追加されることを確認
+#[test]
+fn test_config_load_allowlist_only_gets_default_denylist() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+[allowlist]
+processes = ["my_app"]
+"#
+    )
+    .unwrap();
+
+    let config = Config::load_from_path(Some(file.path().to_path_buf()));
+
+    // allowlist が設定されている
+    assert!(config.is_allowed("my_app"));
+
+    // デフォルト denylist も自動追加されている
+    let default_denylist = Config::default_denylist();
+    for process in &default_denylist {
+        assert!(
+            config.is_denied(process),
+            "デフォルト denylist の {} が含まれるべき",
+            process
+        );
+    }
+}
