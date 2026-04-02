@@ -1003,3 +1003,169 @@ fn test_signal_send_success_to_child_integration() {
         "終了済みプロセスへの送信は ProcessNotFound になるべき"
     );
 }
+
+// =============================================================================
+// kill_by_name 実 kill テスト
+// =============================================================================
+
+/// kill_by_name で子プロセスを実際に kill するテスト
+#[test]
+fn test_policy_engine_kill_by_name_actual_kill() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_name("sleep", Signal::SIGTERM, false);
+    assert!(result.is_ok(), "子プロセスの kill_by_name は Ok を返すべき");
+
+    let batch = result.unwrap();
+    assert!(batch.total_matched > 0, "sleep プロセスが見つかるべき");
+    assert!(batch.any_success(), "少なくとも1件は成功するべき");
+
+    // 終了済みプロセスの回収
+    let mut child = child;
+    let _ = child.wait();
+
+    // プロセスが終了したことを確認
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let check = SignalSender::send(child_pid, Signal::SIGTERM);
+    assert!(
+        matches!(check, Err(SafeKillError::ProcessNotFound(_))),
+        "kill 後のプロセスは ProcessNotFound になるべき"
+    );
+}
+
+// =============================================================================
+// config port_not_allowed_hint テスト
+// =============================================================================
+
+/// config なしの場合の port_not_allowed_hint テスト
+#[test]
+fn test_port_not_allowed_hint_without_config() {
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: None,
+    };
+    let hint = config.port_not_allowed_hint(3000);
+    assert!(hint.contains("3000"), "ヒントにポート番号が含まれるべき");
+    assert!(
+        hint.contains("config.toml"),
+        "ヒントに設定ファイル名が含まれるべき"
+    );
+    assert!(
+        hint.contains("safe-kill init"),
+        "ヒントに init コマンドが含まれるべき"
+    );
+}
+
+// =============================================================================
+// PolicyEngine kill_by_pid 実 kill テスト
+// =============================================================================
+
+/// kill_by_pid で子プロセスを実際に kill するテスト
+#[test]
+fn test_policy_engine_kill_by_pid_actual_kill() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+
+    let result = engine.kill_by_pid(child_pid, Signal::SIGTERM, false);
+    assert!(result.is_ok(), "子プロセスの kill_by_pid は Ok を返すべき");
+
+    let kill_result = result.unwrap();
+    assert!(kill_result.success, "kill は成功するべき");
+    assert_eq!(kill_result.pid, child_pid);
+    assert!(
+        kill_result.message.contains("SIGTERM"),
+        "メッセージにシグナル名が含まれるべき"
+    );
+
+    // 終了済みプロセスの回収
+    let mut child = child;
+    let _ = child.wait();
+}
+
+// =============================================================================
+// AncestryChecker is_descendant_of で異なる祖先テスト
+// =============================================================================
+
+/// 無関係なプロセスの子孫判定テスト
+#[test]
+fn test_ancestry_is_descendant_of_unrelated() {
+    let provider = ProcessInfoProvider::new();
+    let current_pid = ProcessInfoProvider::current_pid();
+    let checker = AncestryChecker::new(provider);
+
+    // 現在プロセスが PID 1 の子孫であることは確認（通常は true）
+    // ただし PID 1 は現在プロセスの子孫ではない
+    assert!(!checker.is_descendant_of(1, current_pid));
+}
+
+// =============================================================================
+// Config check_port_allowed のエラー内容テスト
+// =============================================================================
+
+/// check_port_allowed のエラーにポート番号とヒントが含まれることを確認
+#[test]
+fn test_check_port_allowed_error_content() {
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: None,
+    };
+    let result = config.check_port_allowed(8080);
+    assert!(result.is_err());
+    match result {
+        Err(SafeKillError::PortNotAllowed { port, hint }) => {
+            assert_eq!(port, 8080);
+            assert!(hint.contains("8080"));
+            assert!(hint.contains("config.toml"));
+        }
+        _ => panic!("PortNotAllowed エラーが返されるべき"),
+    }
+}
+
+// =============================================================================
+// PolicyEngine list_killable で子プロセスが含まれるテスト
+// =============================================================================
+
+/// 子プロセスが list_killable の結果に含まれることを確認
+#[test]
+fn test_policy_engine_list_killable_includes_child() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let config = Config::load();
+    let engine = PolicyEngine::new(config);
+
+    let killable = engine.list_killable();
+    assert!(
+        killable.iter().any(|p| p.pid == child_pid),
+        "子プロセスが killable リストに含まれるべき"
+    );
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}

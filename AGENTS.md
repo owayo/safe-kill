@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 286 + bin 23 + E2E 65 + integration 48)
+make test               # 全テスト実行 (lib 287 + bin 26 + E2E 65 + integration 56)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト

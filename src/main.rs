@@ -282,6 +282,27 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_multibyte_boundary() {
+        // マルチバイト文字のみで構成された文字列の切り詰め
+        let result = truncate("日本語テスト", 5);
+        assert_eq!(result, "日本...");
+    }
+
+    #[test]
+    fn test_truncate_mixed_ascii_unicode() {
+        // ASCII とマルチバイト文字の混在
+        let result = truncate("abc日本語", 5);
+        assert_eq!(result, "ab...");
+    }
+
+    #[test]
+    fn test_truncate_emoji() {
+        // 絵文字を含む文字列
+        let result = truncate("🎉🎊🎋🎌🎍", 4);
+        assert_eq!(result, "🎉...");
+    }
+
+    #[test]
     fn test_version_format_parts() {
         let version = env!("CARGO_PKG_VERSION");
         let parts: Vec<&str> = version.split('.').collect();
