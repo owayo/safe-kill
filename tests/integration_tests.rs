@@ -1394,6 +1394,180 @@ fn test_port_range_same_start_end_in_policy() {
     assert!(!config.is_port_allowed(8081));
 }
 
+// =============================================================================
+// PortDetector 実リスナーテスト
+// =============================================================================
+
+/// 実際の TCP リスナーを起動し、PortDetector がプロセスを検出できることを確認
+#[test]
+fn test_port_detector_find_by_port_with_real_listener() {
+    use safe_kill::port::PortDetector;
+    use std::net::TcpListener;
+
+    // OS が自動割り当てしたポートを使用
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ポートのバインドに失敗");
+    let port = listener.local_addr().unwrap().port();
+
+    // リスナーが生きている状態で検出を試みる
+    let detector = PortDetector::new();
+    let result = detector.find_by_port(port);
+    assert!(result.is_ok(), "find_by_port はエラーなく完了すべき");
+
+    let processes = result.unwrap();
+    // 自プロセスがリッスンしているので検出されるべき
+    let current_pid = ProcessInfoProvider::current_pid();
+    assert!(
+        processes.iter().any(|p| p.pid == current_pid),
+        "自プロセスがポート {} のリスナーとして検出されるべき (検出: {:?})",
+        port,
+        processes.iter().map(|p| p.pid).collect::<Vec<_>>()
+    );
+
+    // PortProcess のフィールドを確認
+    if let Some(pp) = processes.iter().find(|p| p.pid == current_pid) {
+        assert_eq!(pp.port, port);
+        assert!(!pp.name.is_empty());
+    }
+
+    drop(listener);
+}
+
+/// 実際の TCP リスナーで get_process_info が ProcessInfo を返すことを確認
+#[test]
+fn test_port_detector_get_process_info_with_real_listener() {
+    use safe_kill::port::PortDetector;
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ポートのバインドに失敗");
+    let port = listener.local_addr().unwrap().port();
+
+    let detector = PortDetector::new();
+    let result = detector.get_process_info(port);
+    assert!(result.is_ok(), "get_process_info はエラーなく完了すべき");
+
+    let infos = result.unwrap();
+    let current_pid = ProcessInfoProvider::current_pid();
+    assert!(
+        infos.iter().any(|p| p.pid == current_pid),
+        "get_process_info で自プロセスが返されるべき"
+    );
+
+    drop(listener);
+}
+
+// =============================================================================
+// Config 全セクション同時指定テスト
+// =============================================================================
+
+/// allowlist + denylist + allowed_ports を全て指定した設定ファイルのロードテスト
+#[test]
+fn test_config_load_all_sections() {
+    let mut file = NamedTempFile::new().unwrap();
+    writeln!(
+        file,
+        r#"
+[allowlist]
+processes = ["node", "npm"]
+
+[denylist]
+processes = ["postgres"]
+
+[allowed_ports]
+ports = ["3000-3010", "8080"]
+"#
+    )
+    .unwrap();
+
+    let config = Config::load_from_path(Some(file.path().to_path_buf()));
+
+    // allowlist が正しく読み込まれている
+    assert!(config.is_allowed("node"));
+    assert!(config.is_allowed("npm"));
+    assert!(!config.is_allowed("python"));
+
+    // カスタム denylist + デフォルト denylist が合流されている
+    assert!(config.is_denied("postgres"));
+    for default in Config::default_denylist() {
+        assert!(
+            config.is_denied(&default),
+            "デフォルト denylist の {} が含まれるべき",
+            default
+        );
+    }
+
+    // allowed_ports が正しく読み込まれている
+    assert!(config.is_port_allowed(3000));
+    assert!(config.is_port_allowed(3005));
+    assert!(config.is_port_allowed(3010));
+    assert!(config.is_port_allowed(8080));
+    assert!(!config.is_port_allowed(8081));
+    assert!(!config.is_port_allowed(22));
+}
+
+// =============================================================================
+// PolicyEngine kill_by_port 実 kill テスト
+// =============================================================================
+
+/// --port で実際に子プロセスの TCP リスナーを kill するテスト
+#[test]
+fn test_policy_engine_kill_by_port_actual_kill() {
+    use safe_kill::config::AllowedPorts;
+    use std::net::TcpListener;
+    use std::process::Command;
+
+    // 利用可能なポートを見つける
+    let listener = TcpListener::bind("127.0.0.1:0").expect("ポートのバインドに失敗");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    // nc (netcat) でリスナーを起動
+    let child = Command::new("nc")
+        .arg("-l")
+        .arg("127.0.0.1")
+        .arg(port.to_string())
+        .spawn();
+
+    if let Ok(child) = child {
+        let child_pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec![format!("{}", port)],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+
+        let result = engine.kill_by_port(port, Signal::SIGTERM, false);
+
+        // nc がポートをバインドできた場合
+        if let Ok(batch) = result {
+            if batch.total_matched > 0 {
+                assert!(batch.any_success(), "実際の kill は成功すべき");
+
+                // プロセスが終了したことを確認
+                let mut child = child;
+                let _ = child.wait();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+
+                let check = SignalSender::send(child_pid, Signal::SIGTERM);
+                assert!(
+                    matches!(check, Err(SafeKillError::ProcessNotFound(_))),
+                    "kill 後のプロセスは ProcessNotFound になるべき"
+                );
+                return;
+            }
+        }
+
+        // nc が使えなかった場合のクリーンアップ
+        let mut child = child;
+        let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+        let _ = child.wait();
+    }
+}
+
 /// TOML の allowlist のみ指定時にデフォルト denylist が自動追加されることを確認
 #[test]
 fn test_config_load_allowlist_only_gets_default_denylist() {
