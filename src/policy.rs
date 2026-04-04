@@ -767,6 +767,47 @@ mod tests {
     }
 
     #[test]
+    fn test_can_kill_for_port_ignores_allowlist() {
+        // allowlist に含まれていても、can_kill_for_port は AllowedByAllowlist を返さない
+        // （ポート kill では allowlist バイパスは適用しない設計）
+        let config = Config {
+            allowlist: Some(ProcessList {
+                processes: vec!["allowlisted_server".to_string()],
+            }),
+            denylist: None,
+            allowed_ports: None,
+        };
+        let engine = PolicyEngine::new(config);
+
+        // allowlist に含まれるプロセスでも、Allowed（AllowedByAllowlist ではない）が返る
+        let permission = engine.can_kill_for_port(99999, "allowlisted_server");
+        assert_eq!(
+            permission,
+            KillPermission::Allowed,
+            "can_kill_for_port は AllowedByAllowlist ではなく Allowed を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_batch_result_error_multiple_policy_errors_only() {
+        // 全てポリシーエラー（NotDescendant）のみの場合、NoKillableTarget にフォールバック
+        let mut batch = BatchKillResult::new();
+        batch.add(KillResult::failure(
+            100,
+            "proc_a",
+            &SafeKillError::NotDescendant(100, "proc_a".to_string()),
+        ));
+        batch.add(KillResult::failure(
+            200,
+            "proc_b",
+            &SafeKillError::NotDescendant(200, "proc_b".to_string()),
+        ));
+
+        // first_operational_error は NotDescendant をスキップするため None
+        assert!(batch.first_operational_error().is_none());
+    }
+
+    #[test]
     fn test_kill_permission_eq_variants() {
         // 異なる DeniedByDenylist インスタンス間の等値性を検証
         let a = KillPermission::DeniedByDenylist("proc_a".to_string());

@@ -982,6 +982,39 @@ ports = ["3000-3100", "3306", "5432"]
     }
 
     #[test]
+    fn test_port_range_reversed_start_end() {
+        // start > end は無効
+        assert!(PortRange::parse("100-50").is_err());
+        assert!(PortRange::parse("8080-3000").is_err());
+        assert!(PortRange::parse("65535-1").is_err());
+    }
+
+    #[test]
+    fn test_port_range_parse_with_spaces_around_dash() {
+        // ダッシュ前後のスペースは許容される
+        let range = PortRange::parse("3000 - 3100").unwrap();
+        assert!(range.contains(3000));
+        assert!(range.contains(3100));
+        assert!(!range.contains(2999));
+    }
+
+    #[test]
+    fn test_port_range_single_port_zero() {
+        // ポート 0 は u16 として有効だが境界値
+        let range = PortRange::parse("0").unwrap();
+        assert!(range.contains(0));
+        assert!(!range.contains(1));
+    }
+
+    #[test]
+    fn test_port_range_max_single_port() {
+        // u16::MAX (65535) は有効
+        let range = PortRange::parse("65535").unwrap();
+        assert!(range.contains(65535));
+        assert!(!range.contains(65534));
+    }
+
+    #[test]
     fn test_get_port_ranges_skips_invalid() {
         let config = Config {
             allowlist: None,

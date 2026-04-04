@@ -333,6 +333,46 @@ mod tests {
         }
     }
 
+    // find_by_name の大文字小文字区別テスト
+    #[test]
+    fn test_find_by_name_case_sensitive() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let current_info = provider
+            .get(current_pid)
+            .expect("現在のプロセスが存在するべき");
+
+        // 大文字に変換して検索（元の名前と異なる場合のみテスト有効）
+        let upper_name = current_info.name.to_uppercase();
+        if upper_name != current_info.name {
+            let results = provider.find_by_name(&upper_name);
+            assert!(
+                !results.iter().any(|p| p.pid == current_pid),
+                "find_by_name は大文字小文字を区別するため、大文字変換名では一致しないべき"
+            );
+        }
+    }
+
+    // find_by_name の部分一致を拒否するテスト
+    #[test]
+    fn test_find_by_name_no_partial_match() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let current_info = provider
+            .get(current_pid)
+            .expect("現在のプロセスが存在するべき");
+
+        // プロセス名が2文字以上の場合、先頭1文字で検索しても部分一致しない
+        if current_info.name.len() > 1 {
+            let partial = &current_info.name[..1];
+            let results = provider.find_by_name(partial);
+            // 部分一致で見つかるプロセスがあっても、完全一致でないものは含まない
+            for r in &results {
+                assert_eq!(r.name, partial, "find_by_name は完全一致のみ返すべき");
+            }
+        }
+    }
+
     // 空文字列での find_by_name テスト
     #[test]
     fn test_find_by_name_empty_string() {

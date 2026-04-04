@@ -392,6 +392,47 @@ mod tests {
         assert!(Signal::SIGUSR2.number() > 0);
     }
 
+    // サポート外のシグナル番号テスト
+    #[test]
+    fn test_parse_signal_unsupported_numbers_in_range() {
+        // 1-31 の範囲内だがサポート対象外のシグナル番号
+        for num in [4, 5, 6, 7, 8, 11, 13, 14, 16, 17, 18, 19, 20, 21] {
+            let result = SignalSender::parse_signal(&num.to_string());
+            assert!(
+                result.is_err(),
+                "シグナル番号 {} はサポート外のためエラーになるべき",
+                num
+            );
+        }
+    }
+
+    #[test]
+    fn test_signal_usr1_usr2_platform_number() {
+        // プラットフォーム固有の番号が正しいことを検証
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(Signal::SIGUSR1.number(), 30);
+            assert_eq!(Signal::SIGUSR2.number(), 31);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(Signal::SIGUSR1.number(), 10);
+            assert_eq!(Signal::SIGUSR2.number(), 12);
+        }
+    }
+
+    #[test]
+    fn test_signal_name_number_roundtrip() {
+        // 名前 → シグナル → 番号 → シグナル のラウンドトリップ
+        let signals = ["HUP", "INT", "QUIT", "KILL", "TERM", "USR1", "USR2"];
+        for name in signals {
+            let sig = SignalSender::parse_signal(name).unwrap();
+            let num = sig.number();
+            let sig2 = SignalSender::parse_signal(&num.to_string()).unwrap();
+            assert_eq!(sig, sig2, "{} のラウンドトリップが一致するべき", name);
+        }
+    }
+
     // Clone と Copy のテスト
     #[test]
     fn test_signal_clone() {
