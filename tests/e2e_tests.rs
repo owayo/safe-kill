@@ -1084,3 +1084,192 @@ fn test_port_kill_outside_allowed_range() {
         .code(4) // PortNotAllowed exit code
         .stderr(predicate::str::contains("not allowed"));
 }
+
+// =============================================================================
+// init サブコマンドの E2E テスト
+// =============================================================================
+
+#[test]
+fn test_init_creates_config_file() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created:"));
+
+    // 設定ファイルが作成されたことを確認
+    let config_path = temp
+        .path()
+        .join(".config")
+        .join("safe-kill")
+        .join("config.toml");
+    assert!(config_path.exists(), "設定ファイルが作成されるべき");
+
+    // 有効な TOML であることを確認
+    let content = fs::read_to_string(&config_path).unwrap();
+    let parsed: Result<toml::Value, _> = toml::from_str(&content);
+    assert!(
+        parsed.is_ok(),
+        "生成された設定ファイルは有効な TOML であるべき"
+    );
+}
+
+#[test]
+fn test_init_twice_with_force() {
+    let temp = tempfile::tempdir().unwrap();
+
+    // 1回目の init
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success();
+
+    // 2回目の init（--force で上書き）
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created:"));
+}
+
+// =============================================================================
+// 複数ターゲットの排他チェック E2E テスト
+// =============================================================================
+
+#[test]
+fn test_pid_and_port_conflict() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("12345")
+        .arg("--port")
+        .arg("3000")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--port cannot be combined"));
+}
+
+#[test]
+fn test_pid_and_name_conflict() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("12345")
+        .arg("--name")
+        .arg("node")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Cannot specify both"));
+}
+
+#[test]
+fn test_list_and_pid_conflict() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("12345")
+        .arg("--list")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--list cannot be combined"));
+}
+
+// =============================================================================
+// dry-run の E2E テスト
+// =============================================================================
+
+#[test]
+fn test_dry_run_does_not_kill_child_process() {
+    use std::process::Stdio;
+
+    // 子プロセスを生成
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let pid = child.id();
+
+    // dry-run で kill を試みる
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg(pid.to_string())
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry run"));
+
+    // プロセスがまだ生きていることを確認（safe-kill の API を使用）
+    use safe_kill::signal::{Signal, SignalSender};
+    // SIGTERM を dry-run ではなく実際に送信して成功すれば生存している
+    // ここでは単にプロセスが存在することを ProcessInfoProvider で確認
+    use safe_kill::process_info::ProcessInfoProvider;
+    let provider = ProcessInfoProvider::new();
+    assert!(
+        provider.get(pid).is_some(),
+        "dry-run 後もプロセスは生存しているべき"
+    );
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+// =============================================================================
+// シグナル指定の E2E テスト
+// =============================================================================
+
+#[test]
+fn test_kill_with_signal_number() {
+    use std::process::Stdio;
+
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let pid = child.id();
+
+    // シグナル番号 15 (SIGTERM) で kill
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg(pid.to_string())
+        .arg("--signal")
+        .arg("15")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SIGTERM"));
+
+    let mut child = child;
+    let _ = child.wait();
+}
+
+#[test]
+fn test_kill_with_signal_name_without_prefix() {
+    use std::process::Stdio;
+
+    let child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let pid = child.id();
+
+    // "KILL" (SIGプレフィックスなし) で kill
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg(pid.to_string())
+        .arg("--signal")
+        .arg("KILL")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SIGKILL"));
+
+    let mut child = child;
+    let _ = child.wait();
+}

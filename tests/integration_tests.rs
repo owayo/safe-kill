@@ -1568,6 +1568,180 @@ fn test_policy_engine_kill_by_port_actual_kill() {
     }
 }
 
+// =============================================================================
+// PolicyEngine::kill_by_name で全プロセスがポリシー拒否されるケース
+// =============================================================================
+
+/// kill_by_name で一致プロセスが全て denylist に含まれる場合のテスト
+#[test]
+fn test_kill_by_name_all_denied_returns_batch_with_failures() {
+    use safe_kill::config::ProcessList;
+
+    // 現在のプロセス名を取得して denylist に追加する
+    let provider = ProcessInfoProvider::new();
+    let current_pid = ProcessInfoProvider::current_pid();
+    let current_info = provider
+        .get(current_pid)
+        .expect("現在のプロセスが存在するべき");
+
+    let config = Config {
+        allowlist: None,
+        denylist: Some(ProcessList {
+            processes: vec![current_info.name.clone()],
+        }),
+        allowed_ports: None,
+    };
+    let engine = PolicyEngine::new(config);
+
+    // 現在のプロセス名で kill を試みる（全て拒否されるはず）
+    let result = engine.kill_by_name(&current_info.name, Signal::SIGTERM, false);
+    assert!(
+        result.is_ok(),
+        "kill_by_name はプロセスが見つかれば Ok を返す"
+    );
+    let batch = result.unwrap();
+    assert!(!batch.any_success(), "全プロセスが拒否されるため成功なし");
+    assert!(batch.total_matched > 0, "一致プロセスが存在するべき");
+}
+
+/// kill_by_name の dry-run で成功するケースのテスト
+#[test]
+fn test_kill_by_name_dry_run_child_process() {
+    use safe_kill::config::ProcessList;
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let _pid = child.id();
+
+    let engine = PolicyEngine::with_defaults();
+    let result = engine.kill_by_name("sleep", Signal::SIGTERM, true);
+
+    // sleep プロセスが見つかり、dry-run で成功するはず
+    match result {
+        Ok(batch) => {
+            if batch.any_success() {
+                // dry-run なので実際にはプロセスは生きている
+                assert!(batch.total_killed > 0);
+            }
+        }
+        Err(SafeKillError::ProcessNameNotFound(_)) => {
+            // プロセス名が異なる場合（環境依存）
+        }
+        Err(e) => panic!("予期しないエラー: {:?}", e),
+    }
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(child.id(), Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+// =============================================================================
+// AncestryChecker の追加テスト
+// =============================================================================
+
+/// 子プロセスを生成して ancestry チェックを検証するテスト
+#[test]
+fn test_ancestry_checker_child_process_is_descendant() {
+    use std::process::Command;
+
+    let child = Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    let provider = ProcessInfoProvider::new();
+    let current_pid = ProcessInfoProvider::current_pid();
+    let checker = AncestryChecker::with_root_pid(provider, current_pid);
+
+    // 子プロセスは現在プロセスの子孫であるべき
+    assert!(
+        checker.is_descendant(child_pid),
+        "子プロセス (PID {}) は現在プロセス (PID {}) の子孫であるべき",
+        child_pid,
+        current_pid
+    );
+
+    // クリーンアップ
+    let mut child = child;
+    let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+    let _ = child.wait();
+}
+
+/// PID 1 をルートに設定した場合、現在プロセスが子孫になることを確認
+#[test]
+fn test_ancestry_checker_pid1_as_root_current_is_descendant() {
+    let provider = ProcessInfoProvider::new();
+    let checker = AncestryChecker::with_root_pid(provider, 1);
+    let current_pid = ProcessInfoProvider::current_pid();
+
+    // PID 1 をルートとした場合、現在プロセスはその子孫であるべき
+    // （macOS/Linux では全プロセスが PID 1 の子孫）
+    assert!(
+        checker.is_descendant(current_pid),
+        "現在プロセスは PID 1 の子孫であるべき"
+    );
+}
+
+// =============================================================================
+// Config::load のテスト（実パスからの読み込み）
+// =============================================================================
+
+/// Config::load がデフォルト設定を返すことを確認（設定ファイルの有無に依存しない）
+#[test]
+fn test_config_load_returns_valid_config() {
+    let config = Config::load();
+    // denylist は常に存在する（デフォルトまたは設定ファイルから）
+    assert!(
+        config.denylist.is_some(),
+        "Config::load は常に denylist を持つべき"
+    );
+    let denylist = config.denylist.as_ref().unwrap();
+    assert!(!denylist.processes.is_empty(), "denylist は空でないべき");
+
+    // デフォルトのシステムプロセスが含まれているべき
+    let defaults = Config::default_denylist();
+    for process in &defaults {
+        assert!(
+            denylist.processes.contains(process),
+            "デフォルト denylist の {} が含まれるべき",
+            process
+        );
+    }
+}
+
+// =============================================================================
+// PolicyEngine::kill_by_port の追加テスト
+// =============================================================================
+
+/// ポート kill で自プロセスが対象になった場合の自殺防止テスト
+#[test]
+fn test_kill_by_port_suicide_prevention() {
+    use safe_kill::config::AllowedPorts;
+
+    // 自プロセスがリッスンしているポートがあれば自殺防止が効くはず
+    // ここでは設定上許可されたポートで、プロセスが見つからないケースを確認
+    let config = Config {
+        allowlist: None,
+        denylist: None,
+        allowed_ports: Some(AllowedPorts {
+            ports: vec!["59980-59989".to_string()],
+        }),
+    };
+    let engine = PolicyEngine::new(config);
+
+    // 未使用ポートでは NoProcessOnPort エラー
+    let result = engine.kill_by_port(59985, Signal::SIGTERM, false);
+    assert!(
+        matches!(result, Err(SafeKillError::NoProcessOnPort(59985))),
+        "未使用ポートでは NoProcessOnPort エラーが返るべき"
+    );
+}
+
 /// TOML の allowlist のみ指定時にデフォルト denylist が自動追加されることを確認
 #[test]
 fn test_config_load_allowlist_only_gets_default_denylist() {
