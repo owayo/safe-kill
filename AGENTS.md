@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 298 + bin 26 + E2E 68 + integration 69)
+make test               # 全テスト実行 (lib 299 + bin 26 + E2E 76 + integration 77)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -56,7 +56,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist とユーザー denylist を合流 |
-| `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux の番号差異吸収、危険 PID 値の拒否 |
+| `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索 |
 | `init.rs` | `safe-kill init` で config.toml を生成 |

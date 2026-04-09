@@ -102,8 +102,8 @@ Supported signals can be specified by name or number:
 | SIGHUP | 1 | Hangup |
 | SIGINT | 2 | Interrupt |
 | SIGQUIT | 3 | Quit |
-| SIGUSR1 | 10/30 | User-defined signal 1 (Linux: 10, macOS: 30) |
-| SIGUSR2 | 12/31 | User-defined signal 2 (Linux: 12, macOS: 31) |
+| SIGUSR1 | 10 (Linux) / 30 (macOS) | User-defined signal 1 (platform-native number only) |
+| SIGUSR2 | 12 (Linux) / 31 (macOS) | User-defined signal 2 (platform-native number only) |
 
 ### Examples
 
@@ -317,10 +317,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 298 tests covering all modules
+- **Library Unit Tests**: 299 tests covering all modules
 - **Binary Unit Tests**: 26 tests for CLI output utilities and version checks
-- **Integration Tests**: 69 tests with real process trees
-- **E2E Tests**: 68 tests for CLI behavior
+- **Integration Tests**: 77 tests with real process trees
+- **E2E Tests**: 76 tests for CLI behavior
 
 ## Contributing
 
