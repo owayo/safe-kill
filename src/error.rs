@@ -36,6 +36,10 @@ pub enum SafeKillError {
     #[error("Invalid PID: {0}")]
     InvalidPid(String),
 
+    /// CLI オプションの組み合わせが不正
+    #[error("{0}")]
+    InvalidUsage(String),
+
     /// シグナル指定が不正
     #[error("Invalid signal: {0}")]
     InvalidSignal(String),

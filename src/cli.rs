@@ -125,15 +125,15 @@ impl CliArgs {
             _ => {
                 // 複数ターゲット指定はエラー
                 if has_list {
-                    Err(SafeKillError::InvalidPid(
+                    Err(SafeKillError::InvalidUsage(
                         "--list cannot be combined with PID, --name, or --port".to_string(),
                     ))
                 } else if has_port {
-                    Err(SafeKillError::InvalidPid(
+                    Err(SafeKillError::InvalidUsage(
                         "--port cannot be combined with PID or --name".to_string(),
                     ))
                 } else {
-                    Err(SafeKillError::InvalidPid(
+                    Err(SafeKillError::InvalidUsage(
                         "Cannot specify both PID and --name".to_string(),
                     ))
                 }
