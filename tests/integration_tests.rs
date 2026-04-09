@@ -1607,7 +1607,6 @@ fn test_kill_by_name_all_denied_returns_batch_with_failures() {
 /// kill_by_name の dry-run で成功するケースのテスト
 #[test]
 fn test_kill_by_name_dry_run_child_process() {
-    use safe_kill::config::ProcessList;
     use std::process::Command;
 
     let child = Command::new("sleep")

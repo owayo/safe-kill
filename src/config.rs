@@ -1015,6 +1015,35 @@ ports = ["3000-3100", "3306", "5432"]
     }
 
     #[test]
+    fn test_check_port_allowed_all_specs_malformed() {
+        // すべてのポート指定が無効な場合、どのポートも許可されない
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec![
+                    "not-a-port".to_string(),
+                    "abc".to_string(),
+                    "xxx-yyy".to_string(),
+                ],
+            }),
+        };
+        // allowed_ports は存在するがすべて無効 → PortNotAllowed エラー
+        let result = config.check_port_allowed(8080);
+        assert!(
+            matches!(
+                result,
+                Err(SafeKillError::PortNotAllowed { port: 8080, .. })
+            ),
+            "すべてのポート指定が無効な場合、PortNotAllowed エラーを返すべき"
+        );
+        // is_port_allowed も false
+        assert!(!config.is_port_allowed(3000));
+        assert!(!config.is_port_allowed(0));
+        assert!(!config.is_port_allowed(65535));
+    }
+
+    #[test]
     fn test_get_port_ranges_skips_invalid() {
         let config = Config {
             allowlist: None,

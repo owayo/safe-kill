@@ -449,6 +449,16 @@ mod tests {
     }
 
     #[test]
+    fn test_send_rejects_u32_max() {
+        // u32::MAX は i32::MAX を超えるため拒否される
+        let result = SignalSender::send(u32::MAX, Signal::SIGTERM);
+        assert!(
+            matches!(result, Err(SafeKillError::InvalidPid(_))),
+            "u32::MAX は InvalidPid エラーになるべき"
+        );
+    }
+
+    #[test]
     fn test_send_pid_i32_max_boundary() {
         // i32::MAX はギリギリ有効な PID 値（プロセスは存在しないが InvalidPid にはならない）
         let result = SignalSender::send(i32::MAX as u32, Signal::SIGTERM);
