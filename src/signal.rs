@@ -81,6 +81,11 @@ impl SignalSender {
     }
 
     /// 番号からシグナルを解析する
+    ///
+    /// USR1/USR2 のシグナル番号はプラットフォームごとに異なるため、
+    /// 各 OS のネイティブな番号のみ受け付ける:
+    /// - Linux: USR1=10, USR2=12
+    /// - macOS: USR1=30, USR2=31
     fn from_number(num: i32) -> Result<Signal, SafeKillError> {
         match num {
             1 => Ok(Signal::SIGHUP),
@@ -88,8 +93,14 @@ impl SignalSender {
             3 => Ok(Signal::SIGQUIT),
             9 => Ok(Signal::SIGKILL),
             15 => Ok(Signal::SIGTERM),
-            10 | 30 => Ok(Signal::SIGUSR1), // Linux: 10, macOS: 30
-            12 | 31 => Ok(Signal::SIGUSR2), // Linux: 12, macOS: 31
+            #[cfg(target_os = "linux")]
+            10 => Ok(Signal::SIGUSR1),
+            #[cfg(target_os = "linux")]
+            12 => Ok(Signal::SIGUSR2),
+            #[cfg(target_os = "macos")]
+            30 => Ok(Signal::SIGUSR1),
+            #[cfg(target_os = "macos")]
+            31 => Ok(Signal::SIGUSR2),
             _ => Err(SafeKillError::InvalidSignal(num.to_string())),
         }
     }
@@ -170,24 +181,58 @@ mod tests {
         assert_eq!(SignalSender::parse_signal("15").unwrap(), Signal::SIGTERM);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_parse_signal_usr1_linux() {
         assert_eq!(SignalSender::parse_signal("10").unwrap(), Signal::SIGUSR1);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_parse_signal_usr1_macos() {
         assert_eq!(SignalSender::parse_signal("30").unwrap(), Signal::SIGUSR1);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_parse_signal_usr2_linux() {
         assert_eq!(SignalSender::parse_signal("12").unwrap(), Signal::SIGUSR2);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_parse_signal_usr2_macos() {
         assert_eq!(SignalSender::parse_signal("31").unwrap(), Signal::SIGUSR2);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_parse_signal_linux_number_rejected_on_macos() {
+        // macOS ではシグナル番号 10 は SIGBUS であり SIGUSR1 ではない
+        assert!(
+            SignalSender::parse_signal("10").is_err(),
+            "macOS ではシグナル番号 10 は拒否されるべき"
+        );
+        // macOS ではシグナル番号 12 は SIGPIPE であり SIGUSR2 ではない
+        assert!(
+            SignalSender::parse_signal("12").is_err(),
+            "macOS ではシグナル番号 12 は拒否されるべき"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_parse_signal_macos_number_rejected_on_linux() {
+        // Linux ではシグナル番号 30 は SIGPWR であり SIGUSR1 ではない
+        assert!(
+            SignalSender::parse_signal("30").is_err(),
+            "Linux ではシグナル番号 30 は拒否されるべき"
+        );
+        // Linux ではシグナル番号 31 は SIGSYS であり SIGUSR2 ではない
+        assert!(
+            SignalSender::parse_signal("31").is_err(),
+            "Linux ではシグナル番号 31 は拒否されるべき"
+        );
     }
 
     // 名前からの解析テスト

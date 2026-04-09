@@ -1741,6 +1741,51 @@ fn test_kill_by_port_suicide_prevention() {
     );
 }
 
+/// u32::MAX の PID に対するシグナル送信は拒否されることを確認
+#[test]
+fn test_signal_send_rejects_u32_max_integration() {
+    let result = SignalSender::send(u32::MAX, Signal::SIGTERM);
+    assert!(
+        matches!(result, Err(SafeKillError::InvalidPid(_))),
+        "u32::MAX は InvalidPid エラーになるべき"
+    );
+}
+
+/// exit_code が各エラー種別に対して意図通りのマッピングであることを確認
+#[test]
+fn test_exit_code_mapping_for_policy_errors() {
+    use safe_kill::error::SafeKillExitCode;
+
+    // ポリシー関連のエラーは GeneralError (255) にマッピングされる
+    assert_eq!(
+        SafeKillError::Denylisted("test".to_string()).exit_code(),
+        SafeKillExitCode::GeneralError,
+        "Denylisted は GeneralError であるべき"
+    );
+    assert_eq!(
+        SafeKillError::SuicidePrevention(1).exit_code(),
+        SafeKillExitCode::GeneralError,
+        "SuicidePrevention は GeneralError であるべき"
+    );
+    assert_eq!(
+        SafeKillError::NotDescendant(1, "test".to_string()).exit_code(),
+        SafeKillExitCode::GeneralError,
+        "NotDescendant は GeneralError であるべき"
+    );
+
+    // 対象未検出のエラーは NoTarget (1) にマッピングされる
+    assert_eq!(
+        SafeKillError::ProcessNotFound(1).exit_code(),
+        SafeKillExitCode::NoTarget,
+        "ProcessNotFound は NoTarget であるべき"
+    );
+    assert_eq!(
+        SafeKillError::NoProcessOnPort(8080).exit_code(),
+        SafeKillExitCode::NoTarget,
+        "NoProcessOnPort は NoTarget であるべき"
+    );
+}
+
 /// TOML の allowlist のみ指定時にデフォルト denylist が自動追加されることを確認
 #[test]
 fn test_config_load_allowlist_only_gets_default_denylist() {
