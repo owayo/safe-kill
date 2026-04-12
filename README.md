@@ -36,6 +36,7 @@
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
 - **Process Discovery**: List all killable processes in your session
+- **Deterministic Ordering**: Sort batch matches and killable process lists by PID for reproducible output
 - **Accurate Failure Reporting**: Preserve `ProcessNotFound` / `PermissionDenied` when signal dispatch fails after policy checks
 
 ## Requirements
@@ -128,6 +129,8 @@ safe-kill --name python --dry-run
 For `--name` and `--port` dry runs, batch summaries use `would kill` so preview output is not mistaken for an actual termination.
 
 `--name` matches the executable name exactly. It does not perform substring or pattern matching.
+
+When multiple processes match `--name`, results are processed and displayed in ascending PID order so repeated runs stay stable.
 
 ### Error Handling
 

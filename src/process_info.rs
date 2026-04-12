@@ -52,7 +52,8 @@ impl ProcessInfoProvider {
 
     /// 指定名に一致するすべてのプロセスを検索（完全一致）
     pub fn find_by_name(&self, name: &str) -> Vec<ProcessInfo> {
-        self.system
+        let mut processes: Vec<_> = self
+            .system
             .processes()
             .iter()
             .filter(|(_, proc)| proc.name().to_string_lossy() == name)
@@ -66,12 +67,17 @@ impl ProcessInfoProvider {
                     .map(|s| s.to_string_lossy().to_string())
                     .collect(),
             })
-            .collect()
+            .collect();
+
+        // `sysinfo` の内部マップ順に依存させず、複数一致時の処理順を安定させる。
+        processes.sort_by_key(|process| process.pid);
+        processes
     }
 
     /// すべてのプロセスを取得
     pub fn all(&self) -> Vec<ProcessInfo> {
-        self.system
+        let mut processes: Vec<_> = self
+            .system
             .processes()
             .iter()
             .map(|(pid, proc)| ProcessInfo {
@@ -84,7 +90,11 @@ impl ProcessInfoProvider {
                     .map(|s| s.to_string_lossy().to_string())
                     .collect(),
             })
-            .collect()
+            .collect();
+
+        // 一覧表示の出力順が毎回ぶれないよう PID 昇順にそろえる。
+        processes.sort_by_key(|process| process.pid);
+        processes
     }
 
     /// 現在のプロセスの PID を取得
@@ -238,12 +248,12 @@ mod tests {
         // 現在のプロセス名を取得
         let current_info = provider
             .get(current_pid)
-            .expect("Current process should exist");
+            .expect("現在のプロセスが存在するべき");
         // 名前で検索して現在のプロセスが含まれることを確認
         let results = provider.find_by_name(&current_info.name);
         assert!(
             results.iter().any(|p| p.pid == current_pid),
-            "find_by_name should find the current process by its name"
+            "find_by_name は現在のプロセス名で検索した結果に現在の PID を含むべき"
         );
     }
 
@@ -253,15 +263,30 @@ mod tests {
         let current_pid = ProcessInfoProvider::current_pid();
         let current_info = provider
             .get(current_pid)
-            .expect("Current process should exist");
+            .expect("現在のプロセスが存在するべき");
         let results = provider.find_by_name(&current_info.name);
         // 結果の全プロセスが検索名と一致すること
         for result in &results {
             assert_eq!(
                 result.name, current_info.name,
-                "All find_by_name results should have the searched name"
+                "find_by_name の結果はすべて検索した名前と一致するべき"
             );
         }
+    }
+
+    #[test]
+    fn test_find_by_name_results_are_sorted_by_pid() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let current_info = provider
+            .get(current_pid)
+            .expect("現在のプロセスが存在するべき");
+        let results = provider.find_by_name(&current_info.name);
+
+        assert!(
+            results.windows(2).all(|pair| pair[0].pid <= pair[1].pid),
+            "find_by_name の結果は PID 昇順であるべき"
+        );
     }
 
     #[test]
@@ -328,9 +353,20 @@ mod tests {
         let provider = ProcessInfoProvider::new();
         let all = provider.all();
         for p in &all {
-            assert!(p.pid > 0, "All processes should have PID > 0");
-            assert!(!p.name.is_empty(), "All processes should have a name");
+            assert!(p.pid > 0, "すべてのプロセスは PID > 0 であるべき");
+            assert!(!p.name.is_empty(), "すべてのプロセスは名前を持つべき");
         }
+    }
+
+    #[test]
+    fn test_all_processes_are_sorted_by_pid() {
+        let provider = ProcessInfoProvider::new();
+        let all = provider.all();
+
+        assert!(
+            all.windows(2).all(|pair| pair[0].pid <= pair[1].pid),
+            "all の結果は PID 昇順であるべき"
+        );
     }
 
     // find_by_name の大文字小文字区別テスト
