@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI 引数解析
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 # プロセス情報取得（クロスプラットフォーム）
 sysinfo = "0.38.4"
@@ -42,7 +42,7 @@ netstat2 = "0.11.2"
 thiserror = "2.0.18"
 
 [dev-dependencies]
-assert_cmd = "2.2.0"
+assert_cmd = "2.2.1"
 predicates = "3.1.4"
 tempfile = "3.27.0"
 

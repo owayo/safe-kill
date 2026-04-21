@@ -78,7 +78,10 @@ safe-kill --name python --dry-run
 
 ```bash
 safe-kill [OPTIONS] [PID]
+safe-kill init [--force]
 ```
+
+`init` は単独で使うサブコマンドです。`PID`、`--name`、`--port`、`--list`、`--signal`、`--dry-run` とは組み合わせできません。
 
 ### オプション
 

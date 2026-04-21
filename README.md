@@ -78,7 +78,10 @@ safe-kill --name python --dry-run
 
 ```bash
 safe-kill [OPTIONS] [PID]
+safe-kill init [--force]
 ```
+
+`init` is a standalone subcommand. It cannot be combined with `PID`, `--name`, `--port`, `--list`, `--signal`, or `--dry-run`.
 
 ### Options
 

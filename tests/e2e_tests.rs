@@ -53,6 +53,22 @@ fn test_list_ignores_invalid_signal() {
         .success();
 }
 
+#[test]
+fn test_init_cannot_be_combined_with_list() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("--list").arg("init").assert().failure();
+}
+
+#[test]
+fn test_init_cannot_be_combined_with_pid() {
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("1234")
+        .arg("init")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
 // =============================================================================
 // --dry-run モードの動作確認テスト
 // =============================================================================
@@ -657,8 +673,8 @@ fn test_init_output_shows_hint() {
 }
 
 #[test]
-fn test_init_ignores_invalid_signal() {
-    // init ではシグナルを使わないため、無効な値でも設定生成を継続する
+fn test_init_rejects_signal_option() {
+    // init は単独サブコマンドとして扱い、通常オプションとの併用は拒否する
     let temp = tempfile::tempdir().unwrap();
     let config_path = temp
         .path()
@@ -673,10 +689,9 @@ fn test_init_ignores_invalid_signal() {
         .arg("init")
         .arg("--force")
         .assert()
-        .success()
-        .stdout(predicate::str::contains("Created"));
+        .failure();
 
-    assert!(config_path.exists());
+    assert!(!config_path.exists());
 }
 
 #[test]

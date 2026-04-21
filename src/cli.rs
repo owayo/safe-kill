@@ -38,6 +38,7 @@ pub enum Command {
 #[command(
     name = "safe-kill",
     version,
+    args_conflicts_with_subcommands = true,
     about = "Safe process termination tool for AI agents",
     long_about = "A CLI tool that provides ancestry-based access control for process termination.\n\
                   It allows killing only descendant processes of the current session,\n\
@@ -87,6 +88,20 @@ impl CliArgs {
     pub fn validate(&self) -> Result<ExecutionMode, SafeKillError> {
         // サブコマンドを先に処理
         if let Some(ref cmd) = self.command {
+            let has_runtime_options = self.pid.is_some()
+                || self.name.is_some()
+                || self.port.is_some()
+                || self.list
+                || self.dry_run
+                || !self.signal.eq_ignore_ascii_case("SIGTERM");
+
+            if has_runtime_options {
+                return Err(SafeKillError::InvalidUsage(
+                    "init cannot be combined with PID, --name, --port, --list, --signal, or --dry-run"
+                        .to_string(),
+                ));
+            }
+
             match cmd {
                 Command::Init { force } => {
                     return Ok(ExecutionMode::InitConfig { force: *force });
@@ -504,5 +519,32 @@ mod tests {
             result,
             Ok(ExecutionMode::InitConfig { force: true })
         ));
+    }
+
+    #[test]
+    fn test_init_command_rejects_runtime_options() {
+        let args = CliArgs {
+            command: Some(Command::Init { force: false }),
+            pid: Some(1234),
+            name: None,
+            port: None,
+            signal: "SIGTERM".to_string(),
+            list: false,
+            dry_run: true,
+        };
+        let result = args.validate();
+        assert!(matches!(result, Err(SafeKillError::InvalidUsage(_))));
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_list_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "--list", "init"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_pid_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "1234", "init"]);
+        assert!(result.is_err());
     }
 }
