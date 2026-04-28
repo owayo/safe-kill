@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 304 + bin 26 + E2E 78 + integration 77)
+make test               # 全テスト実行 (lib 308 + bin 26 + E2E 80 + integration 77)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -41,19 +41,20 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 1. **自殺防止**: 自プロセス・親プロセスの kill 禁止
 2. **PID検証**: `0` や `i32::MAX` を超える PID は拒否
 3. **Denylist**: システムプロセスは常に保護
-4. **Ancestry検証**: セッションの子孫のみ kill 可能
+4. **Root PID保護**: `SAFE_KILL_ROOT_PID` または自動検出された信頼ルート自体は kill 禁止
 5. **Allowlist**: 信頼プロセスは ancestry チェックをバイパス
+6. **Ancestry検証**: セッションの子孫のみ kill 可能
 
 ### Port-based killing の特殊性
 
-`--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。
+`--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。信頼ルート PID 自体はポート指定でも保護する。
 
 ## Key Modules
 
 | Module | Role |
 |--------|------|
 | `cli.rs` | clap ベースの CLI 定義と実行モード判定。`init` サブコマンドと通常 kill オプションの排他も担う |
-| `policy.rs` | Kill 許可判定のオーケストレーション。`KillPermission` enum を返す |
+| `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護と `KillPermission` enum の返却も担う |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist とユーザー denylist を合流 |
@@ -71,4 +72,4 @@ YY.M.COUNTER 形式（例: 26.1.105）。リリースは GitHub Actions の work
 
 - E2E テストは `assert_cmd` を使用し、実際のバイナリを実行する
 - 統合テストは実プロセスツリーを使ったテスト
-- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0` や無効値は無視）
+- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0` や無効値は無視、root PID 自体は kill 不可）

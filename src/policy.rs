@@ -90,12 +90,17 @@ impl PolicyEngine {
             return KillPermission::DeniedByDenylist(process.name.clone());
         }
 
-        // 3. allowlist チェック（ancestry チェックをバイパス）
+        // 3. 信頼ルート自体は子孫プロセスではないため保護する
+        if process.pid == self.ancestry.root_pid() {
+            return KillPermission::DeniedNotDescendant;
+        }
+
+        // 4. allowlist チェック（ancestry チェックをバイパス）
         if self.config.is_allowed(&process.name) {
             return KillPermission::AllowedByAllowlist;
         }
 
-        // 4. ancestry チェック（デフォルトのチェック）
+        // 5. ancestry チェック（デフォルトのチェック）
         if self.ancestry.is_descendant(process.pid) {
             return KillPermission::Allowed;
         }
@@ -110,6 +115,11 @@ impl PolicyEngine {
         signal: Signal,
         dry_run: bool,
     ) -> Result<KillResult, SafeKillError> {
+        // PID 0 はプロセスグループを表し、i32 超過値は nix::Pid に安全に渡せない。
+        if pid == 0 || pid > i32::MAX as u32 {
+            return Err(SafeKillError::InvalidPid(pid.to_string()));
+        }
+
         // プロセス情報を取得
         let process = self
             .provider
@@ -219,6 +229,9 @@ impl PolicyEngine {
                     KillPermission::DeniedSuicidePrevention => {
                         SafeKillError::SuicidePrevention(pp.pid)
                     }
+                    KillPermission::DeniedNotDescendant => {
+                        SafeKillError::NotDescendant(pp.pid, process_name.clone())
+                    }
                     _ => SafeKillError::SystemError("Unexpected permission".to_string()),
                 };
                 KillResult::failure(pp.pid, &process_name, &error)
@@ -235,8 +248,9 @@ impl PolicyEngine {
     /// 以下の簡略化されたチェックのみ適用:
     /// 1. 自殺防止（自プロセス・親プロセスの kill 不可）
     /// 2. denylist チェック
+    /// 3. root PID 保護（信頼ルート自体の kill 不可）
     ///
-    /// ancestry チェックや allowlist は適用しない（PID 指定 kill 用）。
+    /// ancestry 走査や allowlist は適用しない（ポート指定 kill 用）。
     fn can_kill_for_port(&self, pid: u32, name: &str) -> KillPermission {
         // 1. 自殺防止チェック（最優先）
         if self.ancestry.is_suicide(pid) {
@@ -246,6 +260,11 @@ impl PolicyEngine {
         // 2. denylist チェック
         if self.config.is_denied(name) {
             return KillPermission::DeniedByDenylist(name.to_string());
+        }
+
+        // 3. 信頼ルート自体はポート指定でも終了対象にしない
+        if pid == self.ancestry.root_pid() {
+            return KillPermission::DeniedNotDescendant;
         }
 
         // 拒否されなければポート指定 kill は許可
@@ -358,6 +377,16 @@ mod tests {
         assert!(engine.config().is_allowed("node"));
     }
 
+    fn engine_with_root_pid(config: Config, root_pid: u32) -> PolicyEngine {
+        PolicyEngine {
+            config,
+            ancestry: AncestryChecker::with_root_pid(ProcessInfoProvider::new(), root_pid),
+            killer: ProcessKiller::new(),
+            provider: ProcessInfoProvider::new(),
+            port_detector: PortDetector::new(),
+        }
+    }
+
     // can_kill のテスト
     #[test]
     fn test_can_kill_self_denied() {
@@ -436,6 +465,30 @@ mod tests {
     }
 
     #[test]
+    fn test_can_kill_root_pid_denied_before_allowlist() {
+        let root_pid = ProcessInfoProvider::current_pid().saturating_add(100_000);
+        let config = Config {
+            allowlist: Some(ProcessList {
+                processes: vec!["trusted_root".to_string()],
+            }),
+            denylist: None,
+            allowed_ports: None,
+        };
+        let engine = engine_with_root_pid(config, root_pid);
+
+        let process = ProcessInfo {
+            pid: root_pid,
+            parent_pid: None,
+            name: "trusted_root".to_string(),
+            cmd: vec![],
+        };
+
+        // root PID は信頼境界であり、allowlist でも終了対象にしない。
+        let permission = engine.can_kill(&process);
+        assert_eq!(permission, KillPermission::DeniedNotDescendant);
+    }
+
+    #[test]
     fn test_denylist_takes_precedence_over_allowlist() {
         let config = Config {
             allowlist: Some(ProcessList {
@@ -467,6 +520,20 @@ mod tests {
         let engine = PolicyEngine::with_defaults();
         let result = engine.kill_by_pid(999999999, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::ProcessNotFound(_))));
+    }
+
+    #[test]
+    fn test_kill_by_pid_zero_rejected_as_invalid() {
+        let engine = PolicyEngine::with_defaults();
+        let result = engine.kill_by_pid(0, Signal::SIGTERM, true);
+        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
+    }
+
+    #[test]
+    fn test_kill_by_pid_over_i32_max_rejected_as_invalid() {
+        let engine = PolicyEngine::with_defaults();
+        let result = engine.kill_by_pid(i32::MAX as u32 + 1, Signal::SIGTERM, true);
+        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
     }
 
     #[test]
@@ -712,9 +779,18 @@ mod tests {
     }
 
     #[test]
+    fn test_can_kill_for_port_root_pid_denied() {
+        let root_pid = ProcessInfoProvider::current_pid().saturating_add(100_000);
+        let engine = engine_with_root_pid(Config::default(), root_pid);
+
+        let permission = engine.can_kill_for_port(root_pid, "trusted_root");
+        assert_eq!(permission, KillPermission::DeniedNotDescendant);
+    }
+
+    #[test]
     fn test_can_kill_for_port_no_ancestor_check() {
         // can_kill_for_port が ancestry チェックを行わないことを検証
-        // 設計上の意図: ポート指定 kill は denylist のみ適用
+        // 設計上の意図: ポート指定 kill は ancestry 走査を適用しない
         let engine = PolicyEngine::with_defaults();
 
         // 確実に子孫ではないランダムなプロセス

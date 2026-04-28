@@ -190,8 +190,9 @@ flowchart TB
 1. **Suicide Prevention**: Cannot kill own process or parent
 2. **PID Validation**: Reject unsafe PID values (`0`, out-of-range) before signal dispatch
 3. **Denylist Check**: System processes are always protected
-4. **Ancestry Verification**: Only descendants of root session are killable
-5. **Allowlist Bypass**: Trusted processes can skip ancestry check
+4. **Root PID Protection**: The trust root itself is not killable, even if allowlisted
+5. **Allowlist Bypass**: Trusted processes can skip ancestry checks
+6. **Ancestry Verification**: Only descendants of root session are killable
 
 ### Process Tree and Killable Scope
 
@@ -237,12 +238,14 @@ flowchart TB
 | Other terminal (:3000) | ❌ No | ✅ Yes | Port in allowed_ports (bypasses ancestry) |
 | VS Code (`node`) | ❌ No | ❌ No | Not a descendant, no allowed port |
 | Browser | ❌ No | ❌ No | Not a descendant |
+| Root session process | ❌ No | ❌ No | Trust root is not a descendant target |
 | `launchd`/`systemd` | ❌ No | ❌ No | System process (denylist) |
 
 **Key Points**:
 - `safe-kill --name node`: Only `node` processes within your session (green area) are terminated. Requires ancestry check.
-- `safe-kill --port 3000`: Kills process using port 3000 **regardless of ancestry** if port is in `allowed_ports`. Useful for killing orphaned dev servers started in other terminals.
+- `safe-kill --port 3000`: Kills process using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, and root PID protections. Useful for killing orphaned dev servers started in other terminals.
 - `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled.
+- `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
 
 ## Exit Codes
 
@@ -259,7 +262,7 @@ flowchart TB
 
 | Variable | Description |
 |----------|-------------|
-| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0` or invalid values are ignored) |
+| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0` or invalid values are ignored; the root PID itself is not killable) |
 
 ## Claude Code Integration
 
@@ -323,10 +326,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 299 tests covering all modules
+- **Library Unit Tests**: 308 tests covering all modules
 - **Binary Unit Tests**: 26 tests for CLI output utilities and version checks
 - **Integration Tests**: 77 tests with real process trees
-- **E2E Tests**: 76 tests for CLI behavior
+- **E2E Tests**: 80 tests for CLI behavior
 
 ## Contributing
 

@@ -517,7 +517,17 @@ fn test_pid_zero() {
     cmd.arg("0")
         .assert()
         .failure()
-        .stderr(predicate::str::contains("not found").or(predicate::str::contains("No such")));
+        .stderr(predicate::str::contains("Invalid PID: 0"));
+}
+
+#[test]
+fn test_pid_over_i32_max() {
+    // nix::Pid が扱う i32 の範囲を超える PID は拒否すべき
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.arg("2147483648")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid PID: 2147483648"));
 }
 
 #[test]
@@ -894,6 +904,31 @@ fn test_env_var_root_pid_override() {
         .arg("--list")
         .assert()
         .success();
+}
+
+#[test]
+fn test_env_var_root_pid_itself_is_not_killable() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("5")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let root_pid = child.id();
+
+    // 信頼ルート自体は子孫ではないため、dry-run でも終了対象にしない。
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("SAFE_KILL_ROOT_PID", root_pid.to_string())
+        .arg(root_pid.to_string())
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a descendant"));
+
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]
