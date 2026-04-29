@@ -892,4 +892,46 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
     }
+
+    #[test]
+    fn test_list_killable_excludes_root_pid() {
+        // 信頼ルート PID 自体は子孫扱いされず、kill 可能リストに含まれてはならない。
+        let engine = PolicyEngine::with_defaults();
+        let root_pid = engine.root_pid();
+        let killable = engine.list_killable();
+        assert!(
+            !killable.iter().any(|p| p.pid == root_pid),
+            "root PID ({}) は kill 可能リストから除外されるべき",
+            root_pid
+        );
+    }
+
+    #[test]
+    fn test_can_kill_root_pid_with_default_engine() {
+        // デフォルト設定のエンジンでも、root PID 自体への kill は拒否される。
+        let engine = PolicyEngine::with_defaults();
+        let root_pid = engine.root_pid();
+
+        // root PID のプロセス情報が取得できる場合のみ検証（環境依存）
+        if let Some(process) = engine.provider.get(root_pid) {
+            let permission = engine.can_kill(&process);
+            assert!(
+                permission.is_denied(),
+                "root PID ({}) は kill 拒否されるべき",
+                root_pid
+            );
+        }
+    }
+
+    #[test]
+    fn test_kill_by_pid_i32_max_boundary() {
+        // i32::MAX は有効な PID 範囲だが、対応するプロセスが存在しないため
+        // InvalidPid ではなく ProcessNotFound が返るべき。
+        let engine = PolicyEngine::with_defaults();
+        let result = engine.kill_by_pid(i32::MAX as u32, Signal::SIGTERM, true);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(_))),
+            "i32::MAX は有効な PID 値だが対応プロセスが存在しないため ProcessNotFound になるべき"
+        );
+    }
 }

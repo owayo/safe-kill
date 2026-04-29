@@ -205,6 +205,26 @@ mod tests {
         assert_eq!(AncestryChecker::parse_root_pid("  42  "), Some(42));
     }
 
+    #[test]
+    fn test_parse_root_pid_negative_rejected() {
+        // 負数は u32 として解析できないため None になる。
+        assert_eq!(AncestryChecker::parse_root_pid("-1"), None);
+        assert_eq!(AncestryChecker::parse_root_pid("-12345"), None);
+    }
+
+    #[test]
+    fn test_parse_root_pid_overflow_rejected() {
+        // u32::MAX を超える値は解析できないため None になる。
+        let overflow = format!("{}", u64::from(u32::MAX) + 1);
+        assert_eq!(AncestryChecker::parse_root_pid(&overflow), None);
+    }
+
+    #[test]
+    fn test_parse_root_pid_empty_rejected() {
+        assert_eq!(AncestryChecker::parse_root_pid(""), None);
+        assert_eq!(AncestryChecker::parse_root_pid("   "), None);
+    }
+
     // is_descendant テスト
     #[test]
     fn test_current_process_is_descendant_of_root() {
