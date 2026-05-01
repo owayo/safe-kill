@@ -4,7 +4,7 @@
 
 use crate::error::SafeKillError;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
-use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, get_sockets_info};
+use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState, get_sockets_info};
 
 /// 特定ポートを使用するプロセスの情報
 #[derive(Debug, Clone)]
@@ -66,27 +66,24 @@ impl PortDetector {
         let mut results = Vec::new();
 
         for si in sockets_info {
-            let (local_port, protocol) = match &si.protocol_socket_info {
-                ProtocolSocketInfo::Tcp(tcp_si) => (tcp_si.local_port, PortProtocol::Tcp),
-                ProtocolSocketInfo::Udp(udp_si) => (udp_si.local_port, PortProtocol::Udp),
+            let Some(protocol) = socket_matches_port(&si.protocol_socket_info, port) else {
+                continue;
             };
 
-            if local_port == port {
-                for pid in &si.associated_pids {
-                    let pid = *pid;
-                    let name = self
-                        .provider
-                        .get(pid)
-                        .map(|p| p.name)
-                        .unwrap_or_else(|| format!("pid:{}", pid));
+            for pid in &si.associated_pids {
+                let pid = *pid;
+                let name = self
+                    .provider
+                    .get(pid)
+                    .map(|p| p.name)
+                    .unwrap_or_else(|| format!("pid:{}", pid));
 
-                    results.push(PortProcess {
-                        pid,
-                        name,
-                        port,
-                        protocol,
-                    });
-                }
+                results.push(PortProcess {
+                    pid,
+                    name,
+                    port,
+                    protocol,
+                });
             }
         }
 
@@ -114,6 +111,23 @@ impl PortDetector {
     /// 内部のプロセス情報を更新
     pub fn refresh(&mut self) {
         self.provider.refresh();
+    }
+}
+
+/// 指定ポートの待ち受けソケットか判定する
+///
+/// TCP は LISTEN 状態のみを対象にする。ESTABLISHED などの接続済みソケットまで
+/// kill 対象に含めると、同じローカルポートを持つクライアントプロセスを誤って
+/// 終了する可能性がある。UDP は状態を持たないため、ローカルポート一致で対象にする。
+fn socket_matches_port(socket: &ProtocolSocketInfo, port: u16) -> Option<PortProtocol> {
+    match socket {
+        ProtocolSocketInfo::Tcp(tcp_si)
+            if tcp_si.local_port == port && tcp_si.state == TcpState::Listen =>
+        {
+            Some(PortProtocol::Tcp)
+        }
+        ProtocolSocketInfo::Udp(udp_si) if udp_si.local_port == port => Some(PortProtocol::Udp),
+        _ => None,
     }
 }
 
@@ -321,5 +335,40 @@ mod tests {
         // PIDの重複がないこと
         sorted_pids.dedup();
         assert_eq!(pids.len(), sorted_pids.len());
+    }
+
+    #[test]
+    fn test_socket_matches_port_accepts_tcp_listen_only() {
+        let tcp_listen = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
+            local_addr: "127.0.0.1".parse().unwrap(),
+            local_port: 3000,
+            remote_addr: "0.0.0.0".parse().unwrap(),
+            remote_port: 0,
+            state: TcpState::Listen,
+        });
+        let tcp_established = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
+            local_addr: "127.0.0.1".parse().unwrap(),
+            local_port: 3000,
+            remote_addr: "127.0.0.1".parse().unwrap(),
+            remote_port: 4000,
+            state: TcpState::Established,
+        });
+
+        assert_eq!(
+            socket_matches_port(&tcp_listen, 3000),
+            Some(PortProtocol::Tcp)
+        );
+        assert_eq!(socket_matches_port(&tcp_established, 3000), None);
+    }
+
+    #[test]
+    fn test_socket_matches_port_accepts_udp_by_local_port() {
+        let udp = ProtocolSocketInfo::Udp(netstat2::UdpSocketInfo {
+            local_addr: "127.0.0.1".parse().unwrap(),
+            local_port: 5353,
+        });
+
+        assert_eq!(socket_matches_port(&udp, 5353), Some(PortProtocol::Udp));
+        assert_eq!(socket_matches_port(&udp, 5354), None);
     }
 }

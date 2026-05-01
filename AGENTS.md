@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 314 + bin 26 + E2E 80 + integration 77)
+make test               # 全テスト実行 (lib 316 + bin 26 + E2E 80 + integration 77)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -47,7 +47,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 
 ### Port-based killing の特殊性
 
-`--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。信頼ルート PID 自体はポート指定でも保護する。
+`--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。信頼ルート PID 自体はポート指定でも保護する。TCP は LISTEN 状態のソケットのみ対象にし、ESTABLISHED などの接続済みクライアントソケットは対象外。UDP は状態を持たないためローカルポート一致で対象にする。
 
 ## Key Modules
 
@@ -59,7 +59,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。OS別デフォルト denylist とユーザー denylist を合流 |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
-| `port.rs` | netstat2 による port→PID 解決 |
+| `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。結果は PID 昇順で安定化 |
 | `init.rs` | `safe-kill init` で config.toml を生成 |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |

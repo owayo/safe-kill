@@ -36,6 +36,7 @@
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
 - **Process Discovery**: List all killable processes in your session
+- **Port-based Cleanup**: Kill configured TCP listeners or UDP sockets by local port
 - **Deterministic Ordering**: Sort batch matches and killable process lists by PID for reproducible output
 - **Accurate Failure Reporting**: Preserve `ProcessNotFound` / `PermissionDenied` when signal dispatch fails after policy checks
 
@@ -88,7 +89,7 @@ safe-kill init [--force]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--name <NAME>` | `-N` | Kill processes by exact process name |
-| `--port <PORT>` | `-p` | Kill process using the specified port |
+| `--port <PORT>` | `-p` | Kill configured TCP listener or UDP socket using the specified port |
 | `--signal <SIGNAL>` | `-s` | Signal to send (default: SIGTERM) |
 | `--list` | `-l` | List killable processes |
 | `--dry-run` | `-n` | Preview without sending signals |
@@ -122,7 +123,7 @@ safe-kill -s 9 12345
 # Kill all node processes in session
 safe-kill --name node
 
-# Kill process using port 3000
+# Kill the configured TCP listener or UDP socket using port 3000
 safe-kill --port 3000
 
 # List what would be killed
@@ -134,6 +135,8 @@ For `--name` and `--port` dry runs, batch summaries use `would kill` so preview 
 `--name` matches the executable name exactly. It does not perform substring or pattern matching.
 
 When multiple processes match `--name`, results are processed and displayed in ascending PID order so repeated runs stay stable.
+
+`--port` targets TCP sockets only when they are in `LISTEN` state. Established TCP client sockets with the same local port are ignored. UDP has no connection state, so UDP matches use the local port.
 
 ### Error Handling
 
@@ -243,7 +246,8 @@ flowchart TB
 
 **Key Points**:
 - `safe-kill --name node`: Only `node` processes within your session (green area) are terminated. Requires ancestry check.
-- `safe-kill --port 3000`: Kills process using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, and root PID protections. Useful for killing orphaned dev servers started in other terminals.
+- `safe-kill --port 3000`: Kills a TCP listener or UDP socket using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, and root PID protections. Useful for killing orphaned dev servers started in other terminals.
+- TCP port matching ignores `ESTABLISHED` and other non-listening sockets so client connections are not selected just because their local port matches.
 - `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled.
 - `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
 
