@@ -30,12 +30,10 @@ fn run() -> Result<(), SafeKillError> {
     // 実行モードを検証して確定する
     let mode = args.validate()?;
 
-    // ポリシーエンジンを生成する
-    let engine = PolicyEngine::with_defaults();
-
     // 実行モードごとに処理する
     match mode {
         ExecutionMode::KillByPid(pid) => {
+            let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let result = engine.kill_by_pid(pid, signal, args.dry_run)?;
             print_kill_result(&result.name, result.pid, result.success, &result.message);
@@ -46,6 +44,7 @@ fn run() -> Result<(), SafeKillError> {
             }
         }
         ExecutionMode::KillByName(name) => {
+            let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let batch_result = engine.kill_by_name(&name, signal, args.dry_run)?;
             print_batch_result(&batch_result, args.dry_run);
@@ -59,11 +58,13 @@ fn run() -> Result<(), SafeKillError> {
             }
         }
         ExecutionMode::ListKillable => {
+            let engine = PolicyEngine::try_with_defaults()?;
             let processes = engine.list_killable();
             print_killable_list(&processes);
             Ok(())
         }
         ExecutionMode::KillByPort(port) => {
+            let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let batch_result = engine.kill_by_port(port, signal, args.dry_run)?;
             print_port_kill_result(port, &batch_result, args.dry_run);

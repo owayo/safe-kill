@@ -89,7 +89,7 @@ safe-kill init [--force]
 | Option | Short | Description |
 |--------|-------|-------------|
 | `--name <NAME>` | `-N` | Kill processes by exact process name |
-| `--port <PORT>` | `-p` | Kill configured TCP listener or UDP socket using the specified port |
+| `--port <PORT>` | `-p` | Kill configured TCP listener or UDP socket using the specified port (`1`-`65535`; `0` is rejected) |
 | `--signal <SIGNAL>` | `-s` | Signal to send (default: SIGTERM) |
 | `--list` | `-l` | List killable processes |
 | `--dry-run` | `-n` | Preview without sending signals |
@@ -136,7 +136,7 @@ For `--name` and `--port` dry runs, batch summaries use `would kill` so preview 
 
 When multiple processes match `--name`, results are processed and displayed in ascending PID order so repeated runs stay stable.
 
-`--port` targets TCP sockets only when they are in `LISTEN` state. Established TCP client sockets with the same local port are ignored. UDP has no connection state, so UDP matches use the local port.
+`--port` targets TCP sockets only when they are in `LISTEN` state. Established TCP client sockets with the same local port are ignored. UDP has no connection state, so UDP matches use the local port. Port `0` is always rejected because it is an OS auto-assignment sentinel, not a kill target.
 
 ### Error Handling
 
@@ -158,6 +158,7 @@ processes = ["postgres"]
 
 # Allowed ports for --port option
 # If not specified, --port option is disabled (no ports can be killed)
+# Valid values are 1-65535. Port 0 is always rejected even if configured.
 [allowed_ports]
 ports = ["1420", "3000-3010", "5173", "8080"]
 #   - 1420: Tauri dev server
@@ -175,6 +176,8 @@ The following system processes are protected by default:
 **Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
 
 User-defined `[denylist]` entries are appended to this built-in protection set. Customizing the list does not remove system safeguards.
+
+If `config.toml` exists but cannot be read or parsed, kill/list commands fail with a configuration error instead of falling back to partial defaults. This prevents a malformed custom denylist from being ignored during process termination.
 
 ## Architecture
 
@@ -246,9 +249,9 @@ flowchart TB
 
 **Key Points**:
 - `safe-kill --name node`: Only `node` processes within your session (green area) are terminated. Requires ancestry check.
-- `safe-kill --port 3000`: Kills a TCP listener or UDP socket using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, and root PID protections. Useful for killing orphaned dev servers started in other terminals.
+- `safe-kill --port 3000`: Kills a TCP listener or UDP socket using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, root PID, and port validation protections. Useful for killing orphaned dev servers started in other terminals.
 - TCP port matching ignores `ESTABLISHED` and other non-listening sockets so client connections are not selected just because their local port matches.
-- `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled.
+- `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. Port `0` is invalid even when a configured range includes it; use `1-65535` for a full valid range.
 - `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
 
 ## Exit Codes
@@ -260,7 +263,7 @@ flowchart TB
 | 2 | Permission denied |
 | 3 | Configuration error |
 | 4 | Port not allowed |
-| 255 | General error (invalid signal, suicide attempt, etc.) |
+| 255 | General error (invalid signal/port, suicide attempt, etc.) |
 
 ## Environment Variables
 

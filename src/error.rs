@@ -44,6 +44,10 @@ pub enum SafeKillError {
     #[error("Invalid signal: {0}")]
     InvalidSignal(String),
 
+    /// ポート番号が不正
+    #[error("Invalid port: {0}")]
+    InvalidPort(String),
+
     /// 対象未指定
     #[error("No target specified. Use --help for usage.")]
     NoTarget,
@@ -158,6 +162,12 @@ mod tests {
     fn test_invalid_signal_error_message() {
         let err = SafeKillError::InvalidSignal("SIGFOO".to_string());
         assert_eq!(err.to_string(), "Invalid signal: SIGFOO");
+    }
+
+    #[test]
+    fn test_invalid_port_error_message() {
+        let err = SafeKillError::InvalidPort("0".to_string());
+        assert_eq!(err.to_string(), "Invalid port: 0");
     }
 
     #[test]
@@ -385,6 +395,10 @@ mod tests {
         );
         assert_eq!(
             SafeKillError::InvalidSignal("x".to_string()).exit_code(),
+            SafeKillExitCode::GeneralError
+        );
+        assert_eq!(
+            SafeKillError::InvalidPort("0".to_string()).exit_code(),
             SafeKillExitCode::GeneralError
         );
         assert_eq!(

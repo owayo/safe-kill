@@ -3,7 +3,7 @@
 //! 実際のプロセスツリー、設定ファイル、シグナル操作を使って公開 API をテストする。
 
 use safe_kill::ancestry::AncestryChecker;
-use safe_kill::config::Config;
+use safe_kill::config::{Config, ProcessList};
 use safe_kill::error::SafeKillError;
 use safe_kill::killer::ProcessKiller;
 use safe_kill::policy::{KillPermission, PolicyEngine};
@@ -12,7 +12,31 @@ use safe_kill::signal::{Signal, SignalSender};
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::NamedTempFile;
+
+static UNIQUE_SLEEP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
+    let id = UNIQUE_SLEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let process_name = format!("skslp{:05}", id);
+    let executable = temp.path().join(&process_name);
+
+    std::fs::copy("/bin/sleep", &executable).expect("/bin/sleep をコピーできるべき");
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
+        .expect("コピーした sleep に実行権限を設定できるべき");
+
+    let child = Command::new(&executable)
+        .arg("60")
+        .spawn()
+        .expect("一意名の sleep プロセスを起動できるべき");
+
+    (temp, child, process_name)
+}
 
 // =============================================================================
 // 実際のプロセスツリーでの祖先判定テスト
@@ -611,7 +635,7 @@ fn test_port_range_boundary_in_config() {
     assert!(config.is_port_allowed(65535));
     assert!(!config.is_port_allowed(65534));
 
-    // 最小ポート値のテスト
+    // ポート 0 は OS の自動割り当て用の特殊値なので許可しない
     let config_min = Config {
         allowlist: None,
         denylist: None,
@@ -620,25 +644,30 @@ fn test_port_range_boundary_in_config() {
         }),
     };
 
-    assert!(config_min.is_port_allowed(0));
+    assert!(!config_min.is_port_allowed(0));
     assert!(!config_min.is_port_allowed(1));
+    assert!(matches!(
+        config_min.check_port_allowed(0),
+        Err(SafeKillError::InvalidPort(_))
+    ));
 }
 
 #[test]
 fn test_port_full_range_config() {
     use safe_kill::config::AllowedPorts;
 
-    // 全ポート範囲のテスト
+    // 有効な全ポート範囲のテスト
     let config = Config {
         allowlist: None,
         denylist: None,
         allowed_ports: Some(AllowedPorts {
-            ports: vec!["0-65535".to_string()],
+            ports: vec!["1-65535".to_string()],
         }),
     };
 
     // 境界値
-    assert!(config.is_port_allowed(0));
+    assert!(!config.is_port_allowed(0));
+    assert!(config.is_port_allowed(1));
     assert!(config.is_port_allowed(65535));
 
     // 中間値
@@ -1011,23 +1040,33 @@ fn test_signal_send_success_to_child_integration() {
 /// kill_by_name で子プロセスを実際に kill するテスト
 #[test]
 fn test_policy_engine_kill_by_name_actual_kill() {
-    use std::process::Command;
-
-    let child = Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("sleep プロセスの起動に失敗");
+    let (_temp, child, process_name) = spawn_unique_sleep();
     let child_pid = child.id();
 
-    let config = Config::load();
+    // 実シグナル送信の検証に集中するため、ユーザー設定や環境変数由来の root 検出に依存させない。
+    let config = Config {
+        allowlist: Some(ProcessList {
+            processes: vec![process_name.clone()],
+        }),
+        denylist: None,
+        allowed_ports: None,
+    };
     let engine = PolicyEngine::new(config);
 
-    let result = engine.kill_by_name("sleep", Signal::SIGTERM, false);
+    let result = engine.kill_by_name(&process_name, Signal::SIGTERM, false);
     assert!(result.is_ok(), "子プロセスの kill_by_name は Ok を返すべき");
 
     let batch = result.unwrap();
-    assert!(batch.total_matched > 0, "sleep プロセスが見つかるべき");
-    assert!(batch.any_success(), "少なくとも1件は成功するべき");
+    assert_eq!(batch.total_matched, 1, "一意名のプロセスだけが見つかるべき");
+    assert!(
+        batch.results.iter().all(|result| result.pid == child_pid),
+        "kill_by_name は対象 PID 以外を含めるべきではない"
+    );
+    assert!(
+        batch.any_success(),
+        "少なくとも1件は成功するべき: {:?}",
+        batch.results
+    );
 
     // 終了済みプロセスの回収
     let mut child = child;
@@ -1348,16 +1387,16 @@ fn test_denylist_overrides_ancestry_for_child() {
     let _ = child.wait();
 }
 
-/// allowlist に入っていれば ancestry チェックをバイパスできる
+/// allowlist に入っていてもデフォルト denylist のシステム保護が優先される
 #[test]
-fn test_allowlist_bypasses_ancestry_check() {
+fn test_allowlist_cannot_bypass_default_denylist() {
     use safe_kill::config::ProcessList;
 
     // PID 1 のプロセス名を取得
     let provider = ProcessInfoProvider::new();
     let pid1_info = provider.get(1).expect("PID 1 should exist");
 
-    // PID 1 を allowlist に入れ、denylist からは除外
+    // PID 1 を allowlist に入れても、PolicyEngine::new でデフォルト denylist が合流される
     let config = Config {
         allowlist: Some(ProcessList {
             processes: vec![pid1_info.name.clone()],
@@ -1367,13 +1406,12 @@ fn test_allowlist_bypasses_ancestry_check() {
     };
     let engine = PolicyEngine::new(config);
 
-    // can_kill では AllowedByAllowlist が返るべき
+    // システムプロセスは常に denylist で保護されるべき
     let permission = engine.can_kill(&pid1_info);
-    assert_eq!(
+    assert!(matches!(
         permission,
-        KillPermission::AllowedByAllowlist,
-        "allowlist のプロセスは ancestry チェックをバイパスすべき"
-    );
+        KillPermission::DeniedByDenylist(ref name) if name == &pid1_info.name
+    ));
 }
 
 /// PortRange の同一ポート範囲テスト（start == end）

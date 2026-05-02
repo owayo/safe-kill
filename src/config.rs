@@ -56,14 +56,8 @@ impl PortRange {
                 return Err(SafeKillError::InvalidPortRange(spec.to_string()));
             }
 
-            let start = parts[0]
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| SafeKillError::InvalidPortRange(spec.to_string()))?;
-            let end = parts[1]
-                .trim()
-                .parse::<u16>()
-                .map_err(|_| SafeKillError::InvalidPortRange(spec.to_string()))?;
+            let start = Self::parse_port(parts[0], spec)?;
+            let end = Self::parse_port(parts[1], spec)?;
 
             if start > end {
                 return Err(SafeKillError::InvalidPortRange(spec.to_string()));
@@ -71,11 +65,23 @@ impl PortRange {
 
             Ok(PortRange::Range { start, end })
         } else {
-            let port = spec
-                .parse::<u16>()
-                .map_err(|_| SafeKillError::InvalidPortRange(spec.to_string()))?;
+            let port = Self::parse_port(spec, spec)?;
             Ok(PortRange::Single(port))
         }
+    }
+
+    /// ポート 0 は OS に割り当てを委ねる特殊値なので終了対象として扱わない。
+    fn parse_port(value: &str, spec: &str) -> Result<u16, SafeKillError> {
+        let port = value
+            .trim()
+            .parse::<u16>()
+            .map_err(|_| SafeKillError::InvalidPortRange(spec.to_string()))?;
+
+        if port == 0 {
+            return Err(SafeKillError::InvalidPort(spec.to_string()));
+        }
+
+        Ok(port)
     }
 
     /// ポートがこの範囲内に含まれるか確認する
@@ -96,38 +102,53 @@ impl Config {
         Self::load_from_path(Self::config_path())
     }
 
+    /// ~/.config/safe-kill/config.toml から設定を厳格に読み込む
+    ///
+    /// 設定ファイルが存在するのに読めない、または解析できない場合は
+    /// デフォルトにフォールバックせず、設定エラーとして返す。
+    pub fn try_load() -> Result<Self, SafeKillError> {
+        Self::try_load_from_path(Self::config_path())
+    }
+
     /// 指定されたパスから設定を読み込む
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
-        let Some(path) = path else {
-            return Self::with_defaults();
-        };
-
-        if !path.exists() {
-            return Self::with_defaults();
-        }
-
-        match fs::read_to_string(&path) {
-            Ok(content) => match toml::from_str::<Config>(&content) {
-                Ok(mut config) => {
-                    config.merge_defaults();
-                    config
-                }
-                Err(e) => {
+        match Self::try_load_from_path(path.clone()) {
+            Ok(config) => config,
+            Err(e) => {
+                if let Some(path) = path {
                     eprintln!(
-                        "Warning: Failed to parse config file {:?}: {}. Using defaults.",
+                        "Warning: Failed to load config file {:?}: {}. Using defaults.",
                         path, e
                     );
-                    Self::with_defaults()
+                } else {
+                    eprintln!(
+                        "Warning: Failed to load config file: {}. Using defaults.",
+                        e
+                    );
                 }
-            },
-            Err(e) => {
-                eprintln!(
-                    "Warning: Failed to read config file {:?}: {}. Using defaults.",
-                    path, e
-                );
                 Self::with_defaults()
             }
         }
+    }
+
+    /// 指定されたパスから設定を厳格に読み込む
+    pub fn try_load_from_path(path: Option<PathBuf>) -> Result<Self, SafeKillError> {
+        let Some(path) = path else {
+            return Ok(Self::with_defaults());
+        };
+
+        if !path.exists() {
+            return Ok(Self::with_defaults());
+        }
+
+        let content = fs::read_to_string(&path).map_err(|e| {
+            SafeKillError::ConfigError(format!("Failed to read {}: {}", path.display(), e))
+        })?;
+        let mut config = toml::from_str::<Config>(&content).map_err(|e| {
+            SafeKillError::ConfigError(format!("Failed to parse {}: {}", path.display(), e))
+        })?;
+        config.merge_defaults();
+        Ok(config)
     }
 
     /// デフォルトの設定ファイルパスを取得する
@@ -154,7 +175,7 @@ impl Config {
     }
 
     /// 既存の設定にデフォルト値をマージする
-    fn merge_defaults(&mut self) {
+    pub(crate) fn merge_defaults(&mut self) {
         let mut processes = self
             .denylist
             .take()
@@ -255,6 +276,10 @@ impl Config {
     /// ports = ["1420", "3000-3010", "5173", "8080"]
     /// ```
     pub fn is_port_allowed(&self, port: u16) -> bool {
+        if port == 0 {
+            return false;
+        }
+
         let Some(allowed_ports) = &self.allowed_ports else {
             return false;
         };
@@ -299,6 +324,10 @@ impl Config {
     /// `is_port_allowed` とヒント付きエラー生成を組み合わせた
     /// 便利メソッド。
     pub fn check_port_allowed(&self, port: u16) -> Result<(), SafeKillError> {
+        if port == 0 {
+            return Err(SafeKillError::InvalidPort(port.to_string()));
+        }
+
         if self.is_port_allowed(port) {
             Ok(())
         } else {
@@ -468,6 +497,24 @@ processes = ["node"]
         let config = Config::load_from_path(Some(file.path().to_path_buf()));
         // 解析エラー時はデフォルトにフォールバックするべき
         assert!(config.denylist.is_some());
+    }
+
+    #[test]
+    fn test_try_load_config_invalid_toml_returns_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "this is not valid TOML {{{{").unwrap();
+
+        let result = Config::try_load_from_path(Some(file.path().to_path_buf()));
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[test]
+    fn test_try_load_config_invalid_type_returns_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[allowed_ports]\nports = [3000, 8080]").unwrap();
+
+        let result = Config::try_load_from_path(Some(file.path().to_path_buf()));
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
     }
 
     // is_allowed のテスト
@@ -682,10 +729,8 @@ processes = ["node"]
 
     #[test]
     fn test_port_range_boundary_values() {
-        // ポート0は有効
-        assert!(PortRange::parse("0").is_ok());
-        assert_eq!(PortRange::parse("0").unwrap(), PortRange::Single(0));
-        assert!(PortRange::parse("0").unwrap().contains(0));
+        // ポート 0 は OS に割り当てを委ねる特殊値なので対象外
+        assert!(PortRange::parse("0").is_err());
 
         // ポート65535は最大有効値
         assert!(PortRange::parse("65535").is_ok());
@@ -693,9 +738,9 @@ processes = ["node"]
         assert!(PortRange::parse("65535").unwrap().contains(65535));
 
         // 最大範囲
-        assert!(PortRange::parse("0-65535").is_ok());
-        let full_range = PortRange::parse("0-65535").unwrap();
-        assert!(full_range.contains(0));
+        assert!(PortRange::parse("0-65535").is_err());
+        let full_range = PortRange::parse("1-65535").unwrap();
+        assert!(full_range.contains(1));
         assert!(full_range.contains(32768));
         assert!(full_range.contains(65535));
     }
@@ -1000,10 +1045,12 @@ ports = ["3000-3100", "3306", "5432"]
 
     #[test]
     fn test_port_range_single_port_zero() {
-        // ポート 0 は u16 として有効だが境界値
-        let range = PortRange::parse("0").unwrap();
-        assert!(range.contains(0));
-        assert!(!range.contains(1));
+        // ポート 0 は実サービスの終了対象としては無効
+        assert!(matches!(
+            PortRange::parse("0"),
+            Err(SafeKillError::InvalidPort(_))
+        ));
+        assert!(!Config::default().is_port_allowed(0));
     }
 
     #[test]
@@ -1041,6 +1088,24 @@ ports = ["3000-3100", "3306", "5432"]
         assert!(!config.is_port_allowed(3000));
         assert!(!config.is_port_allowed(0));
         assert!(!config.is_port_allowed(65535));
+    }
+
+    #[test]
+    fn test_check_port_allowed_rejects_port_zero_even_when_configured() {
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(AllowedPorts {
+                ports: vec!["0-65535".to_string(), "0".to_string()],
+            }),
+        };
+
+        assert!(!config.is_port_allowed(0));
+        assert!(matches!(
+            config.check_port_allowed(0),
+            Err(SafeKillError::InvalidPort(port)) if port == "0"
+        ));
+        assert!(!config.is_port_allowed(3000));
     }
 
     #[test]

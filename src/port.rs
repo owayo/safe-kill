@@ -53,6 +53,10 @@ impl PortDetector {
     /// ポートでリッスンしているプロセスを返す（TCP と UDP の両方）。
     /// ポートを共有している場合、複数のプロセスが返される可能性がある。
     pub fn find_by_port(&self, port: u16) -> Result<Vec<PortProcess>, SafeKillError> {
+        if port == 0 {
+            return Err(SafeKillError::InvalidPort(port.to_string()));
+        }
+
         let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
         let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
 
@@ -250,10 +254,9 @@ mod tests {
     #[test]
     fn test_find_by_port_zero() {
         let detector = PortDetector::new();
-        // ポート0は有効な値だが、通常は使用されていない
+        // ポート 0 は OS の自動割り当て用の特殊値なので終了対象にしない
         let result = detector.find_by_port(0);
-        assert!(result.is_ok());
-        // 結果は空か、何かのシステムプロセスが使っている可能性
+        assert!(matches!(result, Err(SafeKillError::InvalidPort(_))));
     }
 
     #[test]

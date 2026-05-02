@@ -51,7 +51,9 @@ pub struct PolicyEngine {
 
 impl PolicyEngine {
     /// 指定された設定で PolicyEngine を生成する
-    pub fn new(config: Config) -> Self {
+    pub fn new(mut config: Config) -> Self {
+        config.merge_defaults();
+
         let provider = ProcessInfoProvider::new();
         let ancestry = AncestryChecker::new(ProcessInfoProvider::new());
         let killer = ProcessKiller::new();
@@ -69,6 +71,11 @@ impl PolicyEngine {
     /// デフォルト設定で PolicyEngine を生成する
     pub fn with_defaults() -> Self {
         Self::new(Config::load())
+    }
+
+    /// 設定ファイルエラーを呼び出し元へ返して PolicyEngine を生成する
+    pub fn try_with_defaults() -> Result<Self, SafeKillError> {
+        Ok(Self::new(Config::try_load()?))
     }
 
     /// プロセス情報を更新する
@@ -377,7 +384,21 @@ mod tests {
         assert!(engine.config().is_allowed("node"));
     }
 
-    fn engine_with_root_pid(config: Config, root_pid: u32) -> PolicyEngine {
+    #[test]
+    fn test_policy_engine_new_merges_default_denylist() {
+        let engine = PolicyEngine::new(Config::default());
+
+        for process in Config::default_denylist() {
+            assert!(
+                engine.config().is_denied(&process),
+                "デフォルト denylist の {process} が PolicyEngine::new で合流されるべき"
+            );
+        }
+    }
+
+    fn engine_with_root_pid(mut config: Config, root_pid: u32) -> PolicyEngine {
+        config.merge_defaults();
+
         PolicyEngine {
             config,
             ancestry: AncestryChecker::with_root_pid(ProcessInfoProvider::new(), root_pid),

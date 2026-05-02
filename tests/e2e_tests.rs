@@ -469,6 +469,38 @@ fn test_denylist_prevents_kill() {
 }
 
 #[test]
+fn test_invalid_config_does_not_fall_back_for_kill() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[denylist]\nprocesses = [\"sleep\"]\n{{invalid}}\n",
+    )
+    .unwrap();
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg(child.id().to_string())
+        .arg("--dry-run")
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("Config parse error"));
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
 fn test_custom_config_file_path() {
     // 一時的な設定ファイルを作成
     let mut config_file = NamedTempFile::new().unwrap();
@@ -878,10 +910,36 @@ fn test_signal_option_whitespace() {
 
 #[test]
 fn test_port_boundary_zero() {
-    // ポート0は有効な指定だが、プロセスがないはず
+    // ポート 0 は OS の自動割り当て用の特殊値なので拒否する
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
-    // ポート0が許可設定されていない場合はPortNotAllowed
-    cmd.arg("--port").arg("0").assert().failure();
+    cmd.arg("--port")
+        .arg("0")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid port: 0"));
+}
+
+#[test]
+fn test_port_zero_rejected_even_when_configured() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[allowed_ports]\nports = [\"0-65535\", \"0\"]",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--port")
+        .arg("0")
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Invalid port: 0"));
 }
 
 #[test]
