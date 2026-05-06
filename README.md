@@ -253,6 +253,7 @@ flowchart TB
 - TCP port matching ignores `ESTABLISHED` and other non-listening sockets so client connections are not selected just because their local port matches.
 - `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. Port `0` is invalid even when a configured range includes it; use `1-65535` for a full valid range.
 - `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
+- When the process information for a port-bound PID cannot be resolved (e.g., the process exited between detection and policy check), `safe-kill` fails closed with `ProcessNotFound` instead of falling back to a placeholder name like `pid:<pid>`. This prevents denylist bypass when the real process name is unavailable.
 
 ## Exit Codes
 
@@ -333,10 +334,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 314 tests covering all modules
+- **Library Unit Tests**: 323 tests covering all modules
 - **Binary Unit Tests**: 26 tests for CLI output utilities and version checks
 - **Integration Tests**: 77 tests with real process trees
-- **E2E Tests**: 80 tests for CLI behavior
+- **E2E Tests**: 82 tests for CLI behavior
 
 ## Contributing
 

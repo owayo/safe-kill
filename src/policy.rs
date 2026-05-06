@@ -211,9 +211,22 @@ impl PolicyEngine {
             return Err(SafeKillError::NoProcessOnPort(port));
         }
 
+        Ok(self.kill_port_processes(port_processes, signal, dry_run))
+    }
+
+    /// 検出済みの `PortProcess` 一覧から kill を実行する内部ヘルパー
+    ///
+    /// `kill_by_port` の中身を切り出してテスト容易性を高めるために存在する。
+    /// 名前解決失敗時の fail-closed 挙動を直接検証できるようにする目的。
+    fn kill_port_processes(
+        &self,
+        port_processes: Vec<crate::port::PortProcess>,
+        signal: Signal,
+        dry_run: bool,
+    ) -> BatchKillResult {
         let mut batch_result = BatchKillResult::new();
 
-        // 3. 各プロセスに対して自殺防止と denylist チェックのみ適用
+        // 各プロセスに対して自殺防止と denylist チェックのみ適用
         for pp in port_processes {
             // プロセス情報が取得できない PID は denylist 名前一致を回避するために
             // 即座に失敗扱いにする（fail-closed）。
@@ -251,7 +264,7 @@ impl PolicyEngine {
             batch_result.add(result);
         }
 
-        Ok(batch_result)
+        batch_result
     }
 
     /// ポート指定 kill 用のプロセス kill 可否判定
@@ -957,6 +970,87 @@ mod tests {
         assert!(
             matches!(result, Err(SafeKillError::ProcessNotFound(_))),
             "i32::MAX は有効な PID 値だが対応プロセスが存在しないため ProcessNotFound になるべき"
+        );
+    }
+
+    // ポート指定 kill の名前解決失敗時 fail-closed 回帰テスト
+    //
+    // 過去のバグ: PortDetector のフォールバック名 "pid:<pid>" を denylist
+    // 判定に使うと、名前不明なプロセスが denylist 保護をバイパスしていた。
+    // 今後のリグレッションを防ぐため、フォールバック名のままでは絶対に
+    // 許可判定に到達しないことを検証する。
+    #[test]
+    fn test_kill_port_processes_unknown_pid_fails_closed() {
+        use crate::port::{PortProcess, PortProtocol};
+
+        // 存在しない可能性が極めて高い PID
+        let unknown_pid = 999_999_999u32;
+        let placeholder_name = format!("pid:{}", unknown_pid);
+
+        // この placeholder を denylist に登録しても、ロジック上 denylist チェックに
+        // 到達せず ProcessNotFound として失敗するべき。
+        let mut config = Config::default();
+        config.denylist = Some(ProcessList {
+            processes: vec![placeholder_name.clone()],
+        });
+        let engine = PolicyEngine::new(config);
+
+        let port_processes = vec![PortProcess {
+            pid: unknown_pid,
+            name: placeholder_name.clone(),
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+        }];
+
+        let batch = engine.kill_port_processes(port_processes, Signal::SIGTERM, true);
+
+        assert_eq!(batch.results.len(), 1);
+        assert!(!batch.results[0].success);
+        assert_eq!(
+            batch.results[0].error,
+            Some(SafeKillError::ProcessNotFound(unknown_pid)),
+            "名前解決できない PID は ProcessNotFound で fail-closed されるべき (denylist バイパス防止)"
+        );
+        assert_eq!(
+            batch.results[0].name, placeholder_name,
+            "表示名としてはフォールバック名がそのまま残るべき"
+        );
+    }
+
+    #[test]
+    fn test_kill_port_processes_unknown_pid_does_not_match_real_denylist() {
+        use crate::port::{PortProcess, PortProtocol};
+
+        // フォールバック名で denylist 一致した場合に Denylisted エラーが返る
+        // 経路を完全に塞いだことを検証する。
+        let unknown_pid = 999_999_998u32;
+        let placeholder_name = format!("pid:{}", unknown_pid);
+
+        let mut config = Config::default();
+        // フォールバック名と「実プロセス名らしき名前」両方を denylist に入れる
+        config.denylist = Some(ProcessList {
+            processes: vec![placeholder_name.clone(), "denied_proc".to_string()],
+        });
+        let engine = PolicyEngine::new(config);
+
+        let port_processes = vec![PortProcess {
+            pid: unknown_pid,
+            name: placeholder_name.clone(),
+            port: 3000,
+            protocol: PortProtocol::Tcp,
+        }];
+
+        let batch = engine.kill_port_processes(port_processes, Signal::SIGTERM, true);
+
+        // ProcessNotFound で fail-closed されるため、Denylisted エラーには
+        // ならないことを確認（denylist 判定そのものに到達してはならない）。
+        assert!(
+            !matches!(batch.results[0].error, Some(SafeKillError::Denylisted(_))),
+            "プレースホルダ名で denylist 判定に到達してはならない"
+        );
+        assert_eq!(
+            batch.results[0].error,
+            Some(SafeKillError::ProcessNotFound(unknown_pid))
         );
     }
 }
