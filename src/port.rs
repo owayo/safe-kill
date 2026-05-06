@@ -76,6 +76,9 @@ impl PortDetector {
 
             for pid in &si.associated_pids {
                 let pid = *pid;
+                // プロセス情報が取れない場合は表示用のプレースホルダ名を入れる。
+                // この名前はあくまで UI 出力用であり、denylist 等のポリシー判定には
+                // 使ってはならない（呼び出し側で fresh なプロセス情報を再取得すること）。
                 let name = self
                     .provider
                     .get(pid)

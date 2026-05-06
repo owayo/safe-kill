@@ -215,12 +215,16 @@ impl PolicyEngine {
 
         // 3. 各プロセスに対して自殺防止と denylist チェックのみ適用
         for pp in port_processes {
-            // 利用可能な場合、完全なプロセス情報を取得
-            let process_name = self
-                .provider
-                .get(pp.pid)
-                .map(|p| p.name.clone())
-                .unwrap_or_else(|| pp.name.clone());
+            // プロセス情報が取得できない PID は denylist 名前一致を回避するために
+            // 即座に失敗扱いにする（fail-closed）。
+            // PortDetector のフォールバック名（"pid:<pid>"）で denylist 判定すると
+            // 名前不明なプロセスがバイパスされてしまうため。
+            let Some(process) = self.provider.get(pp.pid) else {
+                let error = SafeKillError::ProcessNotFound(pp.pid);
+                batch_result.add(KillResult::failure(pp.pid, &pp.name, &error));
+                continue;
+            };
+            let process_name = process.name;
 
             // 許可判定（自殺防止と denylist のみ）
             let permission = self.can_kill_for_port(pp.pid, &process_name);
