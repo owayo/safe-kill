@@ -989,10 +989,13 @@ mod tests {
 
         // この placeholder を denylist に登録しても、ロジック上 denylist チェックに
         // 到達せず ProcessNotFound として失敗するべき。
-        let mut config = Config::default();
-        config.denylist = Some(ProcessList {
-            processes: vec![placeholder_name.clone()],
-        });
+        let config = Config {
+            allowlist: None,
+            denylist: Some(ProcessList {
+                processes: vec![placeholder_name.clone()],
+            }),
+            allowed_ports: None,
+        };
         let engine = PolicyEngine::new(config);
 
         let port_processes = vec![PortProcess {
@@ -1026,11 +1029,14 @@ mod tests {
         let unknown_pid = 999_999_998u32;
         let placeholder_name = format!("pid:{}", unknown_pid);
 
-        let mut config = Config::default();
         // フォールバック名と「実プロセス名らしき名前」両方を denylist に入れる
-        config.denylist = Some(ProcessList {
-            processes: vec![placeholder_name.clone(), "denied_proc".to_string()],
-        });
+        let config = Config {
+            allowlist: None,
+            denylist: Some(ProcessList {
+                processes: vec![placeholder_name.clone(), "denied_proc".to_string()],
+            }),
+            allowed_ports: None,
+        };
         let engine = PolicyEngine::new(config);
 
         let port_processes = vec![PortProcess {
