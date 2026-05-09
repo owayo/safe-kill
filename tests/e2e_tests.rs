@@ -36,7 +36,7 @@ fn test_list_command_shows_header_format() {
 }
 
 #[test]
-fn test_list_with_dry_run_is_invalid() {
+fn test_list_with_dry_run_succeeds_as_list() {
     // `--list` では `--dry-run` が指定されても一覧表示として成功する
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.arg("--list").arg("--dry-run").assert().success();

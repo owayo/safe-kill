@@ -39,7 +39,7 @@ jobs:
       - name: Bump version
         id: bump
         run: |
-          # Use 2-digit year (YY) for Windows MSI compatibility (major version must be <= 255)
+          # Windows MSI 互換のため、年は 2 桁 (YY) にする（major version は 255 以下が必要）
           YEAR=$(date +%y)
           MONTH=$(date +%-m)
 
@@ -50,7 +50,7 @@ jobs:
             OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
             OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
             OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            # Handle both 2-digit and 4-digit year formats
+            # 2 桁年と 4 桁年の両方を扱う
             OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
             if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
               NEW_COUNTER=$((OLD_COUNTER + 1))
@@ -146,7 +146,7 @@ jobs:
           mkdir -p release-assets
           for dir in artifacts/*/; do
             name=$(basename "$dir")
-            # Find the binary file (not directory)
+            # ディレクトリではなくバイナリファイルを探す
             find "$dir" -type f -exec cp {} "release-assets/$name" \;
           done
           ls -la release-assets/

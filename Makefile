@@ -1,26 +1,26 @@
 .PHONY: build release install install-hooks clean test fmt check help
 
-# Default target
+# デフォルトターゲット
 .DEFAULT_GOAL := help
 
-# Variables
+# 変数
 BINARY_NAME := safe-kill
 INSTALL_PATH := /usr/local/bin
 
-## Build Commands
+## ビルドコマンド
 
-build: ## Build debug version
+build: ## デバッグビルド
 	cargo build
 
-release: ## Build release version
+release: ## リリースビルド
 	cargo build --release
 
-## Installation
+## インストール
 
-install: release ## Build release and install to /usr/local/bin
+install: release ## リリースビルドを作成して /usr/local/bin にインストール
 	cp target/release/$(BINARY_NAME) $(INSTALL_PATH)/
 
-install-hooks: ## Show Claude Code hook setup instructions
+install-hooks: ## Claude Code hook の設定手順を表示
 	@echo "Claude Code Integration Setup"
 	@echo ""
 	@echo "1. Add to .claude/settings.json:"
@@ -30,30 +30,30 @@ install-hooks: ## Show Claude Code hook setup instructions
 	@echo ""
 	@echo "3. Grant permission: claude /permissions add Bash \"safe-kill*\""
 
-## Development
+## 開発
 
-test: ## Run tests
+test: ## テストを実行
 	cargo test
 
-test-e2e: ## Run E2E tests only
+test-e2e: ## E2E テストのみ実行
 	cargo test --test e2e_tests
 
-test-integration: ## Run integration tests only
+test-integration: ## 統合テストのみ実行
 	cargo test --test integration_tests
 
-fmt: ## Format code
+fmt: ## コードをフォーマット
 	cargo fmt
 
-check: ## Run clippy and check
+check: ## clippy と check を実行
 	cargo clippy -- -D warnings
 	cargo check
 
-clean: ## Clean build artifacts
+clean: ## ビルド成果物を削除
 	cargo clean
 
-## Help
+## ヘルプ
 
-help: ## Show this help message
+help: ## このヘルプを表示
 	@echo "safe-kill Build Commands"
 	@echo ""
 	@echo "Usage: make [target]"

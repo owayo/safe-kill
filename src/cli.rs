@@ -537,6 +537,21 @@ mod tests {
     }
 
     #[test]
+    fn test_init_command_rejects_signal_option_value() {
+        let args = CliArgs {
+            command: Some(Command::Init { force: false }),
+            pid: None,
+            name: None,
+            port: None,
+            signal: "SIGKILL".to_string(),
+            list: false,
+            dry_run: false,
+        };
+        let result = args.validate();
+        assert!(matches!(result, Err(SafeKillError::InvalidUsage(_))));
+    }
+
+    #[test]
     fn test_cli_parser_rejects_list_with_init_subcommand() {
         let result = CliArgs::try_parse_from(["safe-kill", "--list", "init"]);
         assert!(result.is_err());
@@ -545,6 +560,12 @@ mod tests {
     #[test]
     fn test_cli_parser_rejects_pid_with_init_subcommand() {
         let result = CliArgs::try_parse_from(["safe-kill", "1234", "init"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_signal_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "init", "--signal", "SIGTERM"]);
         assert!(result.is_err());
     }
 }
