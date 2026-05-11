@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 /// メイン設定構造体
 #[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// ancestry チェックをバイパスするプロセス（子孫検証なしで kill 可能）
     pub allowlist: Option<ProcessList>,
@@ -20,6 +21,7 @@ pub struct Config {
 
 /// プロセス名リスト
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessList {
     /// リスト内のプロセス名
     pub processes: Vec<String>,
@@ -27,6 +29,7 @@ pub struct ProcessList {
 
 /// 許可ポート設定
 #[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AllowedPorts {
     /// ポート指定（単一ポート "3306" または範囲 "3000-3100"）
     pub ports: Vec<String>,
@@ -137,8 +140,16 @@ impl Config {
             return Ok(Self::with_defaults());
         };
 
-        if !path.exists() {
-            return Ok(Self::with_defaults());
+        match path.try_exists() {
+            Ok(false) => return Ok(Self::with_defaults()),
+            Ok(true) => {}
+            Err(e) => {
+                return Err(SafeKillError::ConfigError(format!(
+                    "Failed to access {}: {}",
+                    path.display(),
+                    e
+                )));
+            }
         }
 
         let content = fs::read_to_string(&path).map_err(|e| {
@@ -514,6 +525,42 @@ processes = ["node"]
         writeln!(file, "[allowed_ports]\nports = [3000, 8080]").unwrap();
 
         let result = Config::try_load_from_path(Some(file.path().to_path_buf()));
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[test]
+    fn test_try_load_config_unknown_top_level_field_returns_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[denylst]\nprocesses = [\"postgres\"]").unwrap();
+
+        let result = Config::try_load_from_path(Some(file.path().to_path_buf()));
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[test]
+    fn test_try_load_config_unknown_nested_field_returns_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[denylist]\nprocesses = [\"postgres\"]\nextra = true").unwrap();
+
+        let result = Config::try_load_from_path(Some(file.path().to_path_buf()));
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_load_config_inaccessible_path_returns_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let locked_dir = dir.path().join("locked");
+        std::fs::create_dir(&locked_dir).unwrap();
+        let config_path = locked_dir.join("config.toml");
+
+        // 親ディレクトリに入れない場合、存在確認自体を設定エラーとして扱う。
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = Config::try_load_from_path(Some(config_path));
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
         assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
     }
 

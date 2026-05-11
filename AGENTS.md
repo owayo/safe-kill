@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 325 + bin 26 + E2E 82 + integration 77)
+make test               # 全テスト実行 (lib 328 + bin 26 + E2E 83 + integration 77)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -57,7 +57,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却も担う |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
-| `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行では設定エラーを fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流 |
+| `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流 |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。結果は PID 昇順で安定化 |

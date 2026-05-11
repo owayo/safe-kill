@@ -177,7 +177,7 @@ The following system processes are protected by default:
 
 User-defined `[denylist]` entries are appended to this built-in protection set. Customizing the list does not remove system safeguards.
 
-If `config.toml` exists but cannot be read or parsed, kill/list commands fail with a configuration error instead of falling back to partial defaults. This prevents a malformed custom denylist from being ignored during process termination.
+If `config.toml` exists but cannot be accessed, read, or parsed, or if it contains unknown fields, kill/list commands fail with a configuration error instead of falling back to partial defaults. This prevents a malformed custom denylist from being ignored during process termination.
 
 ## Architecture
 
