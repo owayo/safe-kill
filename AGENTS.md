@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 328 + bin 26 + E2E 83 + integration 77)
+make test               # 全テスト実行 (lib 341 + bin 26 + E2E 83 + integration 77)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -44,6 +44,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 4. **Root PID保護**: `SAFE_KILL_ROOT_PID` または自動検出された信頼ルート自体は kill 禁止
 5. **Allowlist**: 信頼プロセスは ancestry チェックをバイパス
 6. **Ancestry検証**: セッションの子孫のみ kill 可能
+7. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、kill 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証する。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` として fail-closed する。`start_time` は秒精度のため、同一秒内の同名プロセスへの再利用は検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要だが、現状は窓を大幅に狭めている
 
 ### Port-based killing の特殊性
 
@@ -54,13 +55,13 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | Module | Role |
 |--------|------|
 | `cli.rs` | clap ベースの CLI 定義と実行モード判定。`init` サブコマンドと通常 kill オプションの排他も担う |
-| `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却も担う |
+| `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却、kill 直前の PID 再利用検証 (`verify_identity_before_kill`) も担う |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流 |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
-| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。結果は PID 昇順で安定化 |
+| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は新しい `System` を作って指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
 | `init.rs` | `safe-kill init` で config.toml を生成 |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 

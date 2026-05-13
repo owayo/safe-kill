@@ -135,15 +135,43 @@ impl PolicyEngine {
 
         // 許可判定
         match self.can_kill(&process) {
-            KillPermission::Allowed | KillPermission::AllowedByAllowlist => Ok(self
-                .killer
-                .kill_with_result(pid, &process.name, signal, dry_run)),
+            KillPermission::Allowed | KillPermission::AllowedByAllowlist => {
+                // 判定後・kill 前に PID 再利用が発生していないか再検証する。
+                // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
+                self.verify_identity_before_kill(&process)?;
+                Ok(self
+                    .killer
+                    .kill_with_result(pid, &process.name, signal, dry_run))
+            }
             KillPermission::DeniedByDenylist(name) => Err(SafeKillError::Denylisted(name)),
             KillPermission::DeniedNotDescendant => {
                 Err(SafeKillError::NotDescendant(pid, process.name))
             }
             KillPermission::DeniedSuicidePrevention => Err(SafeKillError::SuicidePrevention(pid)),
         }
+    }
+
+    /// kill 直前のプロセス同一性検証
+    ///
+    /// ポリシー判定に使った `expected` と、OS から取得した最新情報を比較する。
+    /// PID 再利用や対象プロセスの消失を検出した場合は `ProcessNotFound` を返し、
+    /// fail-closed（誤って別プロセスへシグナルを送らない）を保証する。
+    ///
+    /// 注意（残るレース）:
+    ///
+    /// - 検証から実際の `kill(2)` までの間（マイクロ秒オーダー）に PID が再利用
+    ///   された場合は検出できない。完全に閉じるには Linux の `pidfd_open` +
+    ///   `pidfd_send_signal` のような、PID ではなくプロセス実体に結びついた
+    ///   識別子が必要。
+    /// - `start_time` は秒精度のため、同一秒内に同名プロセスへ PID が再利用
+    ///   された場合は検出できない。実用上は極めて稀。
+    fn verify_identity_before_kill(&self, expected: &ProcessInfo) -> Result<(), SafeKillError> {
+        let fresh = ProcessInfoProvider::fetch_fresh(expected.pid)
+            .ok_or(SafeKillError::ProcessNotFound(expected.pid))?;
+        if !fresh.is_same_process(expected) {
+            return Err(SafeKillError::ProcessNotFound(expected.pid));
+        }
+        Ok(())
     }
 
     /// プロセス名を指定して kill する
@@ -165,8 +193,14 @@ impl PolicyEngine {
             let permission = self.can_kill(&process);
 
             let result = if permission.is_allowed() {
-                self.killer
-                    .kill_with_result(process.pid, &process.name, signal, dry_run)
+                // PID 再利用検出のため、kill 直前に最新情報と同一性を検証する。
+                match self.verify_identity_before_kill(&process) {
+                    Ok(()) => {
+                        self.killer
+                            .kill_with_result(process.pid, &process.name, signal, dry_run)
+                    }
+                    Err(err) => KillResult::failure(process.pid, &process.name, &err),
+                }
             } else {
                 // 拒否されたプロセスの失敗結果を生成
                 let error = match permission {
@@ -237,14 +271,20 @@ impl PolicyEngine {
                 batch_result.add(KillResult::failure(pp.pid, &pp.name, &error));
                 continue;
             };
-            let process_name = process.name;
 
             // 許可判定（自殺防止と denylist のみ）
-            let permission = self.can_kill_for_port(pp.pid, &process_name);
+            let permission = self.can_kill_for_port(pp.pid, &process.name);
 
             let result = if permission.is_allowed() {
-                self.killer
-                    .kill_with_result(pp.pid, &process_name, signal, dry_run)
+                // PID 再利用検出のため、kill 直前に同一性を再検証する。
+                // ポート指定 kill は ancestry をバイパスするため、TOCTOU で
+                // 別プロセスにシグナルを送る危険性が PID/名前指定より高い。
+                match self.verify_identity_before_kill(&process) {
+                    Ok(()) => self
+                        .killer
+                        .kill_with_result(pp.pid, &process.name, signal, dry_run),
+                    Err(err) => KillResult::failure(pp.pid, &process.name, &err),
+                }
             } else {
                 let error = match permission {
                     KillPermission::DeniedByDenylist(ref name) => {
@@ -254,11 +294,11 @@ impl PolicyEngine {
                         SafeKillError::SuicidePrevention(pp.pid)
                     }
                     KillPermission::DeniedNotDescendant => {
-                        SafeKillError::NotDescendant(pp.pid, process_name.clone())
+                        SafeKillError::NotDescendant(pp.pid, process.name.clone())
                     }
                     _ => SafeKillError::SystemError("Unexpected permission".to_string()),
                 };
-                KillResult::failure(pp.pid, &process_name, &error)
+                KillResult::failure(pp.pid, &process.name, &error)
             };
 
             batch_result.add(result);
@@ -468,6 +508,7 @@ mod tests {
             parent_pid: Some(1),
             name: "test_denied_process".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
 
         match engine.can_kill(&process) {
@@ -494,6 +535,7 @@ mod tests {
             parent_pid: Some(1),
             name: "test_allowed_process".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
 
         // 自プロセスの PID だと自殺防止チェックに引っかかるため
@@ -519,6 +561,7 @@ mod tests {
             parent_pid: None,
             name: "trusted_root".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
 
         // root PID は信頼境界であり、allowlist でも終了対象にしない。
@@ -544,6 +587,7 @@ mod tests {
             parent_pid: Some(1),
             name: "conflicted_process".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
 
         match engine.can_kill(&process) {
@@ -683,6 +727,7 @@ mod tests {
             parent_pid: Some(1),
             name: "both_listed".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
 
         match engine.can_kill(&process) {
@@ -847,6 +892,7 @@ mod tests {
             parent_pid: Some(1),
             name: "unrelated_process".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
         let permission = engine.can_kill(&process);
         // allowlist に含まれず、子孫でもない -> DeniedNotDescendant
@@ -1057,6 +1103,87 @@ mod tests {
         assert_eq!(
             batch.results[0].error,
             Some(SafeKillError::ProcessNotFound(unknown_pid))
+        );
+    }
+
+    // =============================================================================
+    // TOCTOU 検証（PID 再利用）の回帰テスト
+    //
+    // ポリシー判定後、kill 直前に対象プロセスが消えた・別プロセスに再利用された
+    // ケースで、誤って認可外プロセスにシグナルが送られないことを保証する。
+    // =============================================================================
+
+    #[test]
+    fn test_verify_identity_before_kill_succeeds_for_current_process() {
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let process = engine
+            .provider
+            .get(current_pid)
+            .expect("現在プロセスが取得できるべき");
+
+        // 直後に検証すれば必ず一致する
+        let result = engine.verify_identity_before_kill(&process);
+        assert!(
+            result.is_ok(),
+            "現在プロセスの直近スナップショットは同一性検証を通過すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_identity_before_kill_fails_when_pid_disappeared() {
+        let engine = PolicyEngine::with_defaults();
+        // 存在しない可能性が極めて高い PID を使った擬似 ProcessInfo
+        let stale = ProcessInfo {
+            pid: 999_999_999,
+            parent_pid: Some(1),
+            name: "ghost_process".to_string(),
+            cmd: vec![],
+            start_time: 1,
+        };
+        let result = engine.verify_identity_before_kill(&stale);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == 999_999_999),
+            "fetch_fresh で None になる PID は ProcessNotFound として失敗するべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_identity_before_kill_fails_on_start_time_mismatch() {
+        // PID 再利用シミュレーション: 現在プロセスの PID で、start_time だけ
+        // 改ざんした擬似スナップショットを渡す。OS から取得し直した start_time
+        // とは一致しないため、ProcessNotFound として fail-closed されるべき。
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let mut tampered = engine
+            .provider
+            .get(current_pid)
+            .expect("現在プロセスが取得できるべき");
+        tampered.start_time = tampered.start_time.wrapping_add(1);
+
+        let result = engine.verify_identity_before_kill(&tampered);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == current_pid),
+            "start_time が一致しなければ PID 再利用とみなして fail-closed すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_identity_before_kill_fails_on_name_mismatch() {
+        // 同じ秒に PID 再利用された場合の補助検証として、名前が異なれば
+        // 別プロセスと判定する。
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let mut tampered = engine
+            .provider
+            .get(current_pid)
+            .expect("現在プロセスが取得できるべき");
+        tampered.name = format!("{}_pretender", tampered.name);
+
+        let result = engine.verify_identity_before_kill(&tampered);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == current_pid),
+            "プロセス名が一致しなければ fail-closed すべき"
         );
     }
 }

@@ -32,6 +32,7 @@
 - **Ancestry Verification**: Only kill processes spawned by your session
 - **Suicide Prevention**: Cannot kill self or parent processes
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`)
+- **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
@@ -199,6 +200,7 @@ flowchart TB
 4. **Root PID Protection**: The trust root itself is not killable, even if allowlisted
 5. **Allowlist Bypass**: Trusted processes can skip ancestry checks
 6. **Ancestry Verification**: Only descendants of root session are killable
+7. **PID Reuse Detection (TOCTOU mitigation)**: Re-validates `pid + start_time + name` immediately before `kill(2)`. If the OS has reused the PID for another process between policy decision and signal dispatch, the kill fails closed with `ProcessNotFound`. The `start_time` granularity is seconds, so reuse to a same-named process within the same second cannot be detected (extremely rare in practice). Full coverage would require Linux `pidfd_open` + `pidfd_send_signal`.
 
 ### Process Tree and Killable Scope
 

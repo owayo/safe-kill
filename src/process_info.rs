@@ -15,6 +15,21 @@ pub struct ProcessInfo {
     pub name: String,
     /// コマンドライン引数
     pub cmd: Vec<String>,
+    /// プロセスの起動時刻（UNIXエポック秒）。
+    /// PID 再利用検出に使用する。同じ PID でも異なるプロセスは別の起動時刻を持つ。
+    pub start_time: u64,
+}
+
+impl ProcessInfo {
+    /// 同一プロセスかを判定する（PID 再利用検出用）
+    ///
+    /// PID と `start_time` の両方が一致していれば同一プロセスとみなす。
+    /// `start_time` は同一秒内に再利用された場合に区別できないため、
+    /// 名前も補助的に検証する。これにより、ポリシー判定後に kill 直前で
+    /// PID 再利用を検出できる。
+    pub fn is_same_process(&self, other: &ProcessInfo) -> bool {
+        self.pid == other.pid && self.start_time == other.start_time && self.name == other.name
+    }
 }
 
 /// sysinfo を使用したプロセス情報プロバイダー
@@ -35,10 +50,9 @@ impl ProcessInfoProvider {
         self.system.refresh_processes(ProcessesToUpdate::All, true);
     }
 
-    /// PID でプロセス情報を取得
-    pub fn get(&self, pid: u32) -> Option<ProcessInfo> {
-        let sysinfo_pid = Pid::from_u32(pid);
-        self.system.process(sysinfo_pid).map(|proc| ProcessInfo {
+    /// `sysinfo::Process` から `ProcessInfo` を構築する内部ヘルパー
+    fn build_info(pid: u32, proc: &sysinfo::Process) -> ProcessInfo {
+        ProcessInfo {
             pid,
             parent_pid: proc.parent().map(|p| p.as_u32()),
             name: proc.name().to_string_lossy().to_string(),
@@ -47,7 +61,31 @@ impl ProcessInfoProvider {
                 .iter()
                 .map(|s| s.to_string_lossy().to_string())
                 .collect(),
-        })
+            start_time: proc.start_time(),
+        }
+    }
+
+    /// PID でプロセス情報を取得
+    pub fn get(&self, pid: u32) -> Option<ProcessInfo> {
+        let sysinfo_pid = Pid::from_u32(pid);
+        self.system
+            .process(sysinfo_pid)
+            .map(|proc| Self::build_info(pid, proc))
+    }
+
+    /// 指定 PID の最新プロセス情報を OS から直接取得する
+    ///
+    /// kill 直前の TOCTOU 検証用。新しい `System` インスタンスを生成して
+    /// 指定 PID のみ refresh するため、`ProcessInfoProvider` の保持する
+    /// スナップショットに依存しない。PID 再利用が発生した場合は新しい
+    /// プロセスの `start_time` が返るため、判定時の `start_time` と比較
+    /// することで再利用を検出できる。
+    pub fn fetch_fresh(pid: u32) -> Option<ProcessInfo> {
+        let mut sys = System::new();
+        let sysinfo_pid = Pid::from_u32(pid);
+        sys.refresh_processes(ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+        sys.process(sysinfo_pid)
+            .map(|proc| Self::build_info(pid, proc))
     }
 
     /// 指定名に一致するすべてのプロセスを検索（完全一致）
@@ -57,16 +95,7 @@ impl ProcessInfoProvider {
             .processes()
             .iter()
             .filter(|(_, proc)| proc.name().to_string_lossy() == name)
-            .map(|(pid, proc)| ProcessInfo {
-                pid: pid.as_u32(),
-                parent_pid: proc.parent().map(|p| p.as_u32()),
-                name: proc.name().to_string_lossy().to_string(),
-                cmd: proc
-                    .cmd()
-                    .iter()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .collect(),
-            })
+            .map(|(pid, proc)| Self::build_info(pid.as_u32(), proc))
             .collect();
 
         // `sysinfo` の内部マップ順に依存させず、複数一致時の処理順を安定させる。
@@ -80,16 +109,7 @@ impl ProcessInfoProvider {
             .system
             .processes()
             .iter()
-            .map(|(pid, proc)| ProcessInfo {
-                pid: pid.as_u32(),
-                parent_pid: proc.parent().map(|p| p.as_u32()),
-                name: proc.name().to_string_lossy().to_string(),
-                cmd: proc
-                    .cmd()
-                    .iter()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .collect(),
-            })
+            .map(|(pid, proc)| Self::build_info(pid.as_u32(), proc))
             .collect();
 
         // 一覧表示の出力順が毎回ぶれないよう PID 昇順にそろえる。
@@ -125,6 +145,7 @@ mod tests {
             parent_pid: Some(1),
             name: "test".to_string(),
             cmd: vec!["test".to_string(), "--arg".to_string()],
+            start_time: 0,
         };
         assert_eq!(info.pid, 1234);
         assert_eq!(info.parent_pid, Some(1));
@@ -139,6 +160,7 @@ mod tests {
             parent_pid: None,
             name: "proc".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
         let cloned = info.clone();
         assert_eq!(info, cloned);
@@ -296,6 +318,7 @@ mod tests {
             parent_pid: Some(1),
             name: "test".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
         assert_eq!(info.parent_pid, Some(1));
     }
@@ -307,6 +330,7 @@ mod tests {
             parent_pid: None,
             name: "init".to_string(),
             cmd: vec![],
+            start_time: 0,
         };
         assert_eq!(info.parent_pid, None);
     }
@@ -318,18 +342,21 @@ mod tests {
             parent_pid: Some(1),
             name: "test".to_string(),
             cmd: vec!["arg1".to_string()],
+            start_time: 0,
         };
         let b = ProcessInfo {
             pid: 100,
             parent_pid: Some(1),
             name: "test".to_string(),
             cmd: vec!["arg1".to_string()],
+            start_time: 0,
         };
         let c = ProcessInfo {
             pid: 200,
             parent_pid: Some(1),
             name: "test".to_string(),
             cmd: vec!["arg1".to_string()],
+            start_time: 0,
         };
         assert_eq!(a, b);
         assert_ne!(a, c);
@@ -342,6 +369,7 @@ mod tests {
             parent_pid: Some(1),
             name: "test_proc".to_string(),
             cmd: vec!["test".to_string()],
+            start_time: 0,
         };
         let debug_str = format!("{:?}", info);
         assert!(debug_str.contains("42"));
@@ -425,5 +453,157 @@ mod tests {
         // u32::MAX に近い PID は通常存在しない
         let result = provider.get(u32::MAX - 1);
         assert!(result.is_none(), "非常に大きい PID は存在しないはず");
+    }
+
+    // start_time 関連テスト
+
+    #[test]
+    fn test_get_includes_start_time() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let info = provider
+            .get(current_pid)
+            .expect("現在のプロセスが取得できるべき");
+        // start_time は通常 0 ではない（プロセス起動後の epoch 秒）
+        assert!(
+            info.start_time > 0,
+            "現在プロセスの start_time は 0 以外であるべき"
+        );
+    }
+
+    #[test]
+    fn test_fetch_fresh_returns_current_process() {
+        let current_pid = ProcessInfoProvider::current_pid();
+        let info = ProcessInfoProvider::fetch_fresh(current_pid)
+            .expect("現在プロセスは fetch_fresh で取得できるべき");
+        assert_eq!(info.pid, current_pid);
+        assert!(!info.name.is_empty());
+        assert!(info.start_time > 0);
+    }
+
+    #[test]
+    fn test_fetch_fresh_returns_none_for_nonexistent_pid() {
+        // 存在しない可能性が極めて高い PID
+        let info = ProcessInfoProvider::fetch_fresh(999_999_999);
+        assert!(
+            info.is_none(),
+            "存在しない PID は fetch_fresh で None を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_fetch_fresh_consistent_with_get() {
+        let provider = ProcessInfoProvider::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let from_get = provider.get(current_pid).expect("get できるべき");
+        let from_fresh =
+            ProcessInfoProvider::fetch_fresh(current_pid).expect("fetch_fresh できるべき");
+
+        // PID と name と start_time は必ず一致するべき
+        // （cmd や parent_pid はタイミングや表示形式の差で揺れる可能性がある）
+        assert_eq!(from_get.pid, from_fresh.pid);
+        assert_eq!(from_get.name, from_fresh.name);
+        assert_eq!(from_get.start_time, from_fresh.start_time);
+    }
+
+    #[test]
+    fn test_is_same_process_identical() {
+        let info = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec!["arg".to_string()],
+            start_time: 12345,
+        };
+        let cloned = info.clone();
+        assert!(info.is_same_process(&cloned));
+    }
+
+    #[test]
+    fn test_is_same_process_different_pid() {
+        let a = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec![],
+            start_time: 12345,
+        };
+        let b = ProcessInfo {
+            pid: 101,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec![],
+            start_time: 12345,
+        };
+        assert!(!a.is_same_process(&b), "PID 不一致は別プロセス");
+    }
+
+    #[test]
+    fn test_is_same_process_different_start_time() {
+        // PID 再利用ケース: 同じ PID/同じ名前でも起動時刻が違えば別プロセス
+        let original = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec![],
+            start_time: 12345,
+        };
+        let reused = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec![],
+            start_time: 99999,
+        };
+        assert!(
+            !original.is_same_process(&reused),
+            "start_time が異なれば PID 再利用とみなして別プロセスと判定するべき"
+        );
+    }
+
+    #[test]
+    fn test_is_same_process_different_name() {
+        // 同じ秒に PID 再利用された場合に名前で識別する補助検証
+        let a = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "process_a".to_string(),
+            cmd: vec![],
+            start_time: 12345,
+        };
+        let b = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "process_b".to_string(),
+            cmd: vec![],
+            start_time: 12345,
+        };
+        assert!(
+            !a.is_same_process(&b),
+            "プロセス名が異なれば別プロセスと判定するべき"
+        );
+    }
+
+    #[test]
+    fn test_is_same_process_ignores_parent_and_cmd() {
+        // parent_pid と cmd は同一性判定に使わない（プロセスの状態として変動し得るため）
+        let a = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(1),
+            name: "test".to_string(),
+            cmd: vec!["arg1".to_string()],
+            start_time: 12345,
+        };
+        let b = ProcessInfo {
+            pid: 100,
+            parent_pid: Some(2),
+            name: "test".to_string(),
+            cmd: vec!["arg2".to_string()],
+            start_time: 12345,
+        };
+        assert!(
+            a.is_same_process(&b),
+            "parent_pid と cmd の差異は同一性判定に影響しないべき"
+        );
     }
 }
