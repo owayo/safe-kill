@@ -537,6 +537,53 @@ mod tests {
     }
 
     #[test]
+    fn test_init_command_rejects_each_runtime_option() {
+        let cases = [
+            CliArgs {
+                command: Some(Command::Init { force: false }),
+                pid: None,
+                name: Some("node".to_string()),
+                port: None,
+                signal: "SIGTERM".to_string(),
+                list: false,
+                dry_run: false,
+            },
+            CliArgs {
+                command: Some(Command::Init { force: false }),
+                pid: None,
+                name: None,
+                port: Some(3000),
+                signal: "SIGTERM".to_string(),
+                list: false,
+                dry_run: false,
+            },
+            CliArgs {
+                command: Some(Command::Init { force: false }),
+                pid: None,
+                name: None,
+                port: None,
+                signal: "SIGTERM".to_string(),
+                list: true,
+                dry_run: false,
+            },
+            CliArgs {
+                command: Some(Command::Init { force: false }),
+                pid: None,
+                name: None,
+                port: None,
+                signal: "SIGTERM".to_string(),
+                list: false,
+                dry_run: true,
+            },
+        ];
+
+        for args in cases {
+            let result = args.validate();
+            assert!(matches!(result, Err(SafeKillError::InvalidUsage(_))));
+        }
+    }
+
+    #[test]
     fn test_init_command_rejects_signal_option_value() {
         let args = CliArgs {
             command: Some(Command::Init { force: false }),
@@ -566,6 +613,24 @@ mod tests {
     #[test]
     fn test_cli_parser_rejects_signal_with_init_subcommand() {
         let result = CliArgs::try_parse_from(["safe-kill", "init", "--signal", "SIGTERM"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_name_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "init", "--name", "node"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_port_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "init", "--port", "3000"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_cli_parser_rejects_dry_run_with_init_subcommand() {
+        let result = CliArgs::try_parse_from(["safe-kill", "init", "--dry-run"]);
         assert!(result.is_err());
     }
 }
