@@ -18,7 +18,6 @@ use tempfile::NamedTempFile;
 static UNIQUE_SLEEP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
@@ -26,9 +25,10 @@ fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
     let process_name = format!("skslp{:05}", id);
     let executable = temp.path().join(&process_name);
 
-    std::fs::copy("/bin/sleep", &executable).expect("/bin/sleep をコピーできるべき");
-    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755))
-        .expect("コピーした sleep に実行権限を設定できるべき");
+    // macOS のシステムバイナリは別パスへコピーして実行すると即時終了する環境がある。
+    // symlink 経由なら一意なプロセス名を維持しつつ、元の署名済みバイナリを実行できる。
+    std::os::unix::fs::symlink("/bin/sleep", &executable)
+        .expect("/bin/sleep への symlink を作成できるべき");
 
     let child = Command::new(&executable)
         .arg("60")
@@ -36,6 +36,32 @@ fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
         .expect("一意名の sleep プロセスを起動できるべき");
 
     (temp, child, process_name)
+}
+
+#[test]
+fn test_spawn_unique_sleep_stays_alive_and_is_discoverable() {
+    let (_temp, mut child, process_name) = spawn_unique_sleep();
+    let child_pid = child.id();
+
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(
+        child
+            .try_wait()
+            .expect("子プロセスの状態を確認できるべき")
+            .is_none(),
+        "一意名の sleep プロセスは起動直後に終了するべきではない"
+    );
+
+    let provider = ProcessInfoProvider::new();
+    let matches = provider.find_by_name(&process_name);
+    assert!(
+        matches.iter().any(|process| process.pid == child_pid),
+        "一意名の sleep プロセスはプロセス名で検出できるべき: {:?}",
+        matches
+    );
+
+    SignalSender::send(child_pid, Signal::SIGTERM).expect("子プロセスに SIGTERM を送れるべき");
+    let _ = child.wait();
 }
 
 // =============================================================================
