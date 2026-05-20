@@ -101,6 +101,37 @@ impl PortDetector {
         Ok(results)
     }
 
+    /// 指定 PID が指定ポート/プロトコルをいま保持しているかを再確認する
+    ///
+    /// kill 直前の TOCTOU 緩和用。`find_by_port` と同様の OS 問い合わせを行うが、
+    /// 1 PID あたりの軽量チェックとして使うことを想定する。
+    /// 取得に失敗した場合は安全側に倒して `false` を返す（fail-closed）。
+    pub fn pid_holds_port(&self, pid: u32, port: u16, protocol: PortProtocol) -> bool {
+        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+        let proto_flags = match protocol {
+            PortProtocol::Tcp => ProtocolFlags::TCP,
+            PortProtocol::Udp => ProtocolFlags::UDP,
+        };
+
+        let Ok(sockets_info) = get_sockets_info(af_flags, proto_flags) else {
+            return false;
+        };
+
+        for si in sockets_info {
+            if !si.associated_pids.contains(&pid) {
+                continue;
+            }
+            let Some(matched_protocol) = socket_matches_port(&si.protocol_socket_info, port) else {
+                continue;
+            };
+            if matched_protocol == protocol {
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// 指定ポートを使用するすべてのプロセスのプロセス情報を取得
     pub fn get_process_info(&self, port: u16) -> Result<Vec<ProcessInfo>, SafeKillError> {
         let port_processes = self.find_by_port(port)?;

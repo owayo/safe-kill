@@ -33,6 +33,7 @@
 - **Suicide Prevention**: Cannot kill self or parent processes
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`)
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
+- **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
@@ -201,6 +202,7 @@ flowchart TB
 5. **Allowlist Bypass**: Trusted processes can skip ancestry checks
 6. **Ancestry Verification**: Only descendants of root session are killable
 7. **PID Reuse Detection (TOCTOU mitigation)**: Re-validates `pid + start_time + name` immediately before `kill(2)`. If the OS has reused the PID for another process between policy decision and signal dispatch, the kill fails closed with `ProcessNotFound`. The `start_time` granularity is seconds, so reuse to a same-named process within the same second cannot be detected (extremely rare in practice). Full coverage would require Linux `pidfd_open` + `pidfd_send_signal`.
+8. **Port Hold Re-check (port mode only)**: For `--port` kills, the set of current holders of the target port is re-queried just before signaling. If the candidate PID/protocol is no longer present in that set (the target released the port between policy decision and `kill(2)`), the kill fails closed with `NoProcessOnPort`. This avoids killing a now-unrelated workload that happens to share the same PID after the user's intent (releasing the port) has already been satisfied.
 
 ### Process Tree and Killable Scope
 
@@ -256,6 +258,7 @@ flowchart TB
 - `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. Port `0` is invalid even when a configured range includes it; use `1-65535` for a full valid range.
 - `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
 - When the process information for a port-bound PID cannot be resolved (e.g., the process exited between detection and policy check), `safe-kill` fails closed with `ProcessNotFound` instead of falling back to a placeholder name like `pid:<pid>`. This prevents denylist bypass when the real process name is unavailable.
+- Immediately before signaling, the live port-holder set is re-queried. If the target PID is no longer holding the port (e.g., the dev server already exited), the kill is aborted as `NoProcessOnPort` so that a same-PID process now doing unrelated work is not signaled.
 
 ## Exit Codes
 

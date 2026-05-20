@@ -245,15 +245,16 @@ impl PolicyEngine {
             return Err(SafeKillError::NoProcessOnPort(port));
         }
 
-        Ok(self.kill_port_processes(port_processes, signal, dry_run))
+        Ok(self.kill_port_processes(port, port_processes, signal, dry_run))
     }
 
     /// 検出済みの `PortProcess` 一覧から kill を実行する内部ヘルパー
     ///
     /// `kill_by_port` の中身を切り出してテスト容易性を高めるために存在する。
-    /// 名前解決失敗時の fail-closed 挙動を直接検証できるようにする目的。
+    /// 名前解決失敗時の fail-closed 挙動と、各 PID の kill 直前のポート保持再検証を担う。
     fn kill_port_processes(
         &self,
+        port: u16,
         port_processes: Vec<crate::port::PortProcess>,
         signal: Signal,
         dry_run: bool,
@@ -276,14 +277,24 @@ impl PolicyEngine {
             let permission = self.can_kill_for_port(pp.pid, &process.name);
 
             let result = if permission.is_allowed() {
-                // PID 再利用検出のため、kill 直前に同一性を再検証する。
-                // ポート指定 kill は ancestry をバイパスするため、TOCTOU で
-                // 別プロセスにシグナルを送る危険性が PID/名前指定より高い。
-                match self.verify_identity_before_kill(&process) {
-                    Ok(()) => self
-                        .killer
-                        .kill_with_result(pp.pid, &process.name, signal, dry_run),
-                    Err(err) => KillResult::failure(pp.pid, &process.name, &err),
+                // ポート kill 固有の TOCTOU 緩和は「保持確認 → 同一性確認 → kill」の順で行う。
+                // 1. ポート保持確認 (pid_holds_port): バッチ実行中に対象がポートを離した場合は kill しない。
+                //    取得失敗時は安全側に倒して fail-closed（NoProcessOnPort）。
+                // 2. 同一性再検証 (verify_identity_before_kill): `pid + start_time + name` を OS から
+                //    取り直して PID 再利用を検出する。順序を最後にすることで、ポート確認に要する時間内に
+                //    起きた PID 再利用も検出できる。
+                // ポート指定 kill は ancestry をバイパスするため、PID/名前指定より TOCTOU リスクが高い。
+                if !self.port_detector.pid_holds_port(pp.pid, port, pp.protocol) {
+                    let err = SafeKillError::NoProcessOnPort(port);
+                    KillResult::failure(pp.pid, &process.name, &err)
+                } else {
+                    match self.verify_identity_before_kill(&process) {
+                        Ok(()) => {
+                            self.killer
+                                .kill_with_result(pp.pid, &process.name, signal, dry_run)
+                        }
+                        Err(err) => KillResult::failure(pp.pid, &process.name, &err),
+                    }
                 }
             } else {
                 let error = match permission {
@@ -1051,7 +1062,7 @@ mod tests {
             protocol: PortProtocol::Tcp,
         }];
 
-        let batch = engine.kill_port_processes(port_processes, Signal::SIGTERM, true);
+        let batch = engine.kill_port_processes(3000, port_processes, Signal::SIGTERM, true);
 
         assert_eq!(batch.results.len(), 1);
         assert!(!batch.results[0].success);
@@ -1092,7 +1103,7 @@ mod tests {
             protocol: PortProtocol::Tcp,
         }];
 
-        let batch = engine.kill_port_processes(port_processes, Signal::SIGTERM, true);
+        let batch = engine.kill_port_processes(3000, port_processes, Signal::SIGTERM, true);
 
         // ProcessNotFound で fail-closed されるため、Denylisted エラーには
         // ならないことを確認（denylist 判定そのものに到達してはならない）。
@@ -1104,6 +1115,61 @@ mod tests {
             batch.results[0].error,
             Some(SafeKillError::ProcessNotFound(unknown_pid))
         );
+    }
+
+    /// kill 直前にポートを保持していない PID は kill されないことを保証する
+    ///
+    /// シナリオ: ポリシー判定の対象に渡された PID が、判定～kill の間に
+    /// 対象ポートを離した（あるいは別の理由で対象ポートを持っていない）場合、
+    /// ユーザーの意図（そのポートを解放したい）は既に達成されているため、
+    /// 該当 PID は kill せず NoProcessOnPort として fail-closed する。
+    #[test]
+    fn test_kill_port_processes_skips_pid_not_holding_port() {
+        use crate::port::{PortProcess, PortProtocol};
+        use std::process::Command;
+
+        // sleep プロセスを起動し、その PID をポート保持者として偽装する。
+        // 実際にはポートを開いていないため、fresh_holders には含まれない。
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep プロセスの起動に失敗");
+        let pid = child.id();
+
+        // ポート 59990 は未使用想定（fresh_holders は空になるはず）。
+        let config = Config {
+            allowlist: None,
+            denylist: None,
+            allowed_ports: Some(crate::config::AllowedPorts {
+                ports: vec!["59990".to_string()],
+            }),
+        };
+        let engine = PolicyEngine::new(config);
+
+        let port_processes = vec![PortProcess {
+            pid,
+            name: "sleep".to_string(),
+            port: 59990,
+            protocol: PortProtocol::Tcp,
+        }];
+
+        // dry_run=true で副作用なく検証する
+        let batch = engine.kill_port_processes(59990, port_processes, Signal::SIGTERM, true);
+
+        assert_eq!(batch.results.len(), 1);
+        assert!(
+            !batch.results[0].success,
+            "ポートを保持していない PID は kill されないべき"
+        );
+        assert_eq!(
+            batch.results[0].error,
+            Some(SafeKillError::NoProcessOnPort(59990)),
+            "kill 直前にポートを保持していなければ NoProcessOnPort で fail-closed されるべき"
+        );
+
+        // クリーンアップ
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     // =============================================================================
