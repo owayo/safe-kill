@@ -178,6 +178,9 @@ impl Default for PortDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn test_port_detector_new() {
@@ -372,6 +375,46 @@ mod tests {
         // PIDの重複がないこと
         sorted_pids.dedup();
         assert_eq!(pids.len(), sorted_pids.len());
+    }
+
+    #[test]
+    fn test_pid_holds_port_detects_current_tcp_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        // OS のソケット一覧へ反映されるまで短く待つ。通常は初回で成功する。
+        let holds_port = (0..10).any(|_| {
+            let detected = detector.pid_holds_port(current_pid, port, PortProtocol::Tcp);
+            if !detected {
+                thread::sleep(Duration::from_millis(50));
+            }
+            detected
+        });
+
+        assert!(
+            holds_port,
+            "自プロセスが TCP ポート {} を保持していることを検出できるべき",
+            port
+        );
+
+        drop(listener);
+    }
+
+    #[test]
+    fn test_pid_holds_port_rejects_protocol_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        assert!(
+            !detector.pid_holds_port(current_pid, port, PortProtocol::Udp),
+            "TCP で保持しているポートは UDP 保持として扱わない"
+        );
+
+        drop(listener);
     }
 
     #[test]
