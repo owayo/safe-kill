@@ -178,7 +178,7 @@ impl Default for PortDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, UdpSocket};
     use std::thread;
     use std::time::Duration;
 
@@ -400,6 +400,40 @@ mod tests {
         );
 
         drop(listener);
+    }
+
+    #[test]
+    fn test_find_by_port_detects_current_udp_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("UDP ソケットの作成に失敗");
+        let port = socket.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        // UDP ソケットも OS のソケット一覧へ反映されるまで短く待つ。
+        let detected = (0..10).find_map(|_| {
+            let processes = detector.find_by_port(port).ok()?;
+            let matched = processes
+                .into_iter()
+                .any(|process| process.pid == current_pid && process.protocol == PortProtocol::Udp);
+            if !matched {
+                thread::sleep(Duration::from_millis(50));
+                return None;
+            }
+            Some(())
+        });
+
+        assert!(
+            detected.is_some(),
+            "自プロセスが UDP ポート {} を保持していることを検出できるべき",
+            port
+        );
+
+        assert!(
+            detector.pid_holds_port(current_pid, port, PortProtocol::Udp),
+            "UDP ポート保持の再検証でも現在プロセスを検出できるべき"
+        );
+
+        drop(socket);
     }
 
     #[test]
