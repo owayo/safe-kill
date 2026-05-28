@@ -403,6 +403,44 @@ mod tests {
     }
 
     #[test]
+    fn test_pid_holds_port_rejects_released_tcp_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        let detected_before_drop = (0..10).any(|_| {
+            let detected = detector.pid_holds_port(current_pid, port, PortProtocol::Tcp);
+            if !detected {
+                thread::sleep(Duration::from_millis(50));
+            }
+            detected
+        });
+        assert!(
+            detected_before_drop,
+            "テスト前提として TCP ポート {} の保持を検出できるべき",
+            port
+        );
+
+        drop(listener);
+
+        // ソケット一覧から閉じたリスナーが消えるまで短く待つ。
+        let released = (0..10).any(|_| {
+            let released = !detector.pid_holds_port(current_pid, port, PortProtocol::Tcp);
+            if !released {
+                thread::sleep(Duration::from_millis(50));
+            }
+            released
+        });
+
+        assert!(
+            released,
+            "解放済み TCP ポート {} は保持中として扱われるべきではない",
+            port
+        );
+    }
+
+    #[test]
     fn test_find_by_port_detects_current_udp_socket() {
         let socket = UdpSocket::bind("127.0.0.1:0").expect("UDP ソケットの作成に失敗");
         let port = socket.local_addr().unwrap().port();
