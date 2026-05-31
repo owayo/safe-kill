@@ -342,7 +342,7 @@ cargo build --release
 - **Library Unit Tests**: 350 tests covering all modules
 - **Binary Unit Tests**: 26 tests for CLI output utilities and version checks
 - **Integration Tests**: 78 tests with real process trees
-- **E2E Tests**: 83 tests for CLI behavior
+- **E2E Tests**: 84 tests for CLI behavior
 
 ## Contributing
 

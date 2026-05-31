@@ -501,6 +501,28 @@ fn test_invalid_config_does_not_fall_back_for_kill() {
 }
 
 #[test]
+fn test_invalid_config_does_not_fall_back_for_port_kill() {
+    use std::fs;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[allowed_ports]\nports = [\"3000\"]\n{{invalid}}\n",
+    )
+    .unwrap();
+
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("--port")
+        .arg("3000")
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("Config parse error"));
+}
+
+#[test]
 fn test_unknown_config_field_does_not_fall_back_for_list() {
     use std::fs;
 
