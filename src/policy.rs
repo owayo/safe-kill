@@ -136,9 +136,10 @@ impl PolicyEngine {
         // 許可判定
         match self.can_kill(&process) {
             KillPermission::Allowed | KillPermission::AllowedByAllowlist => {
-                // 判定後・kill 前に PID 再利用が発生していないか再検証する。
+                // 判定後・kill 前に、自殺防止（最新の親 PID 解決）と PID 再利用検出を
+                // 最終ガードとしてまとめて再検証する。
                 // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
-                self.verify_identity_before_kill(&process)?;
+                self.verify_final_safety_before_kill(&process)?;
                 Ok(self
                     .killer
                     .kill_with_result(pid, &process.name, signal, dry_run))
@@ -174,6 +175,50 @@ impl PolicyEngine {
         Ok(())
     }
 
+    /// kill 直前の自殺防止最終ガード
+    ///
+    /// `can_kill` / `can_kill_for_port` の `is_suicide` 判定は PolicyEngine 構築時の
+    /// スナップショットに基づく早期拒否であり、判定～kill の間に現在プロセスの親が
+    /// 変化（元の親の終了に伴う再ペアレント）した場合を捕捉できない。
+    /// この関数は signal 送信直前に現在プロセスと「最新の」親 PID を OS から取得し直し、
+    /// 対象が自プロセスまたは現在の親であれば `SuicidePrevention` として fail-closed する。
+    ///
+    /// 現在プロセス情報の取得に失敗した場合も、安全側に倒して `SystemError` で拒否する。
+    fn verify_not_suicide_before_kill(target_pid: u32) -> Result<(), SafeKillError> {
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        // 自分自身の kill を拒否
+        if target_pid == current_pid {
+            return Err(SafeKillError::SuicidePrevention(target_pid));
+        }
+
+        // 現在プロセスの最新情報を取得し、親 PID を fresh に確認する。
+        // 取得できない場合は安全側に倒して fail-closed する。
+        let current = ProcessInfoProvider::fetch_fresh(current_pid).ok_or_else(|| {
+            SafeKillError::SystemError(
+                "failed to resolve current process during suicide prevention".to_string(),
+            )
+        })?;
+
+        // 最新の親 PID が対象と一致すれば自殺行為として拒否
+        if current.parent_pid == Some(target_pid) {
+            return Err(SafeKillError::SuicidePrevention(target_pid));
+        }
+
+        Ok(())
+    }
+
+    /// kill 直前の最終安全検証（自殺防止 + プロセス同一性）
+    ///
+    /// signal 送信直前の最終ガードとして、以下を fresh な OS 情報で再検証し
+    /// fail-closed を保証する:
+    /// 1. 自殺防止（最新の親 PID 解決による自プロセス・親プロセス保護）
+    /// 2. PID 再利用検出（`pid + start_time + name` の同一性）
+    fn verify_final_safety_before_kill(&self, expected: &ProcessInfo) -> Result<(), SafeKillError> {
+        Self::verify_not_suicide_before_kill(expected.pid)?;
+        self.verify_identity_before_kill(expected)
+    }
+
     /// プロセス名を指定して kill する
     pub fn kill_by_name(
         &self,
@@ -193,8 +238,8 @@ impl PolicyEngine {
             let permission = self.can_kill(&process);
 
             let result = if permission.is_allowed() {
-                // PID 再利用検出のため、kill 直前に最新情報と同一性を検証する。
-                match self.verify_identity_before_kill(&process) {
+                // kill 直前の最終ガード（自殺防止の再確認 + PID 再利用検出）。
+                match self.verify_final_safety_before_kill(&process) {
                     Ok(()) => {
                         self.killer
                             .kill_with_result(process.pid, &process.name, signal, dry_run)
@@ -280,15 +325,15 @@ impl PolicyEngine {
                 // ポート kill 固有の TOCTOU 緩和は「保持確認 → 同一性確認 → kill」の順で行う。
                 // 1. ポート保持確認 (pid_holds_port): バッチ実行中に対象がポートを離した場合は kill しない。
                 //    取得失敗時は安全側に倒して fail-closed（NoProcessOnPort）。
-                // 2. 同一性再検証 (verify_identity_before_kill): `pid + start_time + name` を OS から
-                //    取り直して PID 再利用を検出する。順序を最後にすることで、ポート確認に要する時間内に
-                //    起きた PID 再利用も検出できる。
+                // 2. 最終安全検証 (verify_final_safety_before_kill): 自殺防止（最新の親 PID 解決）と
+                //    `pid + start_time + name` の同一性を OS から取り直して再検証する。順序を最後に
+                //    することで、ポート確認に要する時間内に起きた再ペアレントや PID 再利用も検出できる。
                 // ポート指定 kill は ancestry をバイパスするため、PID/名前指定より TOCTOU リスクが高い。
                 if !self.port_detector.pid_holds_port(pp.pid, port, pp.protocol) {
                     let err = SafeKillError::NoProcessOnPort(port);
                     KillResult::failure(pp.pid, &process.name, &err)
                 } else {
-                    match self.verify_identity_before_kill(&process) {
+                    match self.verify_final_safety_before_kill(&process) {
                         Ok(()) => {
                             self.killer
                                 .kill_with_result(pp.pid, &process.name, signal, dry_run)
@@ -1251,5 +1296,66 @@ mod tests {
             matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == current_pid),
             "プロセス名が一致しなければ fail-closed すべき"
         );
+    }
+
+    // verify_not_suicide_before_kill / verify_final_safety_before_kill テスト
+    // kill 直前の自殺防止最終ガードが、最新の親 PID をもとに自プロセス・親プロセスを
+    // 拒否することを検証する（判定～kill 間の再ペアレントに対する fail-closed）。
+
+    #[test]
+    fn test_verify_not_suicide_before_kill_fails_for_self() {
+        // 自分自身の PID は常に自殺防止で拒否される
+        let current_pid = ProcessInfoProvider::current_pid();
+        let result = PolicyEngine::verify_not_suicide_before_kill(current_pid);
+        assert!(
+            matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == current_pid),
+            "自プロセスの kill は SuicidePrevention で拒否すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_not_suicide_before_kill_fails_for_current_parent() {
+        // kill 直前に OS から取得した最新の親 PID は自殺防止で拒否される
+        let current_pid = ProcessInfoProvider::current_pid();
+        let parent_pid = ProcessInfoProvider::fetch_fresh(current_pid)
+            .and_then(|p| p.parent_pid)
+            .expect("現在プロセスには親が存在するべき");
+
+        let result = PolicyEngine::verify_not_suicide_before_kill(parent_pid);
+        assert!(
+            matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == parent_pid),
+            "現在の親プロセスの kill は SuicidePrevention で拒否すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_not_suicide_before_kill_allows_unrelated_pid() {
+        // 自分でも親でもない PID は自殺防止を通過する（許可可否は別レイヤーで判定）。
+        // 999_999_998 は通常の pid_max を超えるため、実在の自/親プロセス PID とは一致しない。
+        let result = PolicyEngine::verify_not_suicide_before_kill(999_999_998);
+        assert!(
+            result.is_ok(),
+            "自分でも親でもない PID は自殺防止を通過すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_final_safety_rejects_current_parent() {
+        // 最終安全検証は、自殺防止（親）と同一性検証の複合ガードとして機能する。
+        // 現在の親プロセスを対象にすると SuicidePrevention で拒否される。
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        let parent_pid = ProcessInfoProvider::fetch_fresh(current_pid)
+            .and_then(|p| p.parent_pid)
+            .expect("現在プロセスには親が存在するべき");
+
+        // 親のスナップショット情報が取得できる場合のみ検証する
+        if let Some(parent_info) = engine.provider.get(parent_pid) {
+            let result = engine.verify_final_safety_before_kill(&parent_info);
+            assert!(
+                matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == parent_pid),
+                "最終安全検証は現在の親プロセスを SuicidePrevention で拒否すべき"
+            );
+        }
     }
 }
