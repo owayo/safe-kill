@@ -30,7 +30,7 @@
 ## Features
 
 - **Ancestry Verification**: Only kill processes spawned by your session
-- **Suicide Prevention**: Cannot kill self or parent processes
+- **Suicide Prevention**: Cannot kill self or parent processes; the current parent PID is re-resolved from the OS immediately before signaling, failing closed even if the process was re-parented between the policy decision and the kill
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`)
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
@@ -195,7 +195,7 @@ flowchart TB
 
 ### Safety Layers
 
-1. **Suicide Prevention**: Cannot kill own process or parent
+1. **Suicide Prevention**: Cannot kill own process or parent. Beyond the early policy-time check, the current parent PID is re-resolved from the OS immediately before `kill(2)`, failing closed against re-parenting between the policy decision and signal dispatch (and also when the parent PID is unknown)
 2. **PID Validation**: Reject unsafe PID values (`0`, out-of-range) before signal dispatch
 3. **Denylist Check**: System processes are always protected
 4. **Root PID Protection**: The trust root itself is not killable, even if allowlisted

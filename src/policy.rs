@@ -187,7 +187,7 @@ impl PolicyEngine {
     fn verify_not_suicide_before_kill(target_pid: u32) -> Result<(), SafeKillError> {
         let current_pid = ProcessInfoProvider::current_pid();
 
-        // 自分自身の kill を拒否
+        // 自分自身は現在プロセス情報の取得成否に関わらず、必ず拒否する（最も確実な保護）。
         if target_pid == current_pid {
             return Err(SafeKillError::SuicidePrevention(target_pid));
         }
@@ -200,8 +200,27 @@ impl PolicyEngine {
             )
         })?;
 
+        Self::check_parent_not_suicide(target_pid, current.parent_pid)
+    }
+
+    /// 自殺防止の親判定（純粋関数）
+    ///
+    /// 対象が現在の親プロセスであれば `SuicidePrevention` を返す。
+    /// 親 PID が不明（`None`）な場合は「対象が現在の親ではない」と証明できないため、
+    /// fail-closed の原則に従い `SystemError` で拒否する（親なしと取得失敗を区別できないため）。
+    fn check_parent_not_suicide(
+        target_pid: u32,
+        current_parent_pid: Option<u32>,
+    ) -> Result<(), SafeKillError> {
+        // 親 PID が不明な場合は安全側に倒して fail-closed する。
+        let parent_pid = current_parent_pid.ok_or_else(|| {
+            SafeKillError::SystemError(
+                "failed to resolve current parent process during suicide prevention".to_string(),
+            )
+        })?;
+
         // 最新の親 PID が対象と一致すれば自殺行為として拒否
-        if current.parent_pid == Some(target_pid) {
+        if parent_pid == target_pid {
             return Err(SafeKillError::SuicidePrevention(target_pid));
         }
 
@@ -1357,5 +1376,39 @@ mod tests {
                 "最終安全検証は現在の親プロセスを SuicidePrevention で拒否すべき"
             );
         }
+    }
+
+    // check_parent_not_suicide（純粋関数）テスト
+    // 親 PID の一致・不一致・不明（None）の各分岐を OS 非依存で検証する。
+
+    #[test]
+    fn test_check_parent_not_suicide_rejects_matching_parent() {
+        // 対象が現在の親 PID と一致すれば SuicidePrevention で拒否する
+        let result = PolicyEngine::check_parent_not_suicide(100, Some(100));
+        assert!(
+            matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == 100),
+            "対象が現在の親 PID と一致すれば自殺防止で拒否すべき"
+        );
+    }
+
+    #[test]
+    fn test_check_parent_not_suicide_allows_different_parent() {
+        // 対象が現在の親 PID と異なれば通過する
+        let result = PolicyEngine::check_parent_not_suicide(100, Some(200));
+        assert!(
+            result.is_ok(),
+            "対象が現在の親と異なれば自殺防止を通過すべき"
+        );
+    }
+
+    #[test]
+    fn test_check_parent_not_suicide_fails_closed_on_unknown_parent() {
+        // 親 PID が不明（None）な場合は fail-closed（SystemError）で拒否する。
+        // 「親なし」と「取得失敗」を区別できないため、安全側に倒す。
+        let result = PolicyEngine::check_parent_not_suicide(100, None);
+        assert!(
+            matches!(result, Err(SafeKillError::SystemError(_))),
+            "親 PID 不明時は fail-closed（SystemError）すべき"
+        );
     }
 }
