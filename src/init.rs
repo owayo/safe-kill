@@ -9,6 +9,18 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::error::SafeKillError;
 
+/// `safe-kill init` の実行結果
+///
+/// 設定ファイルを生成したか、既存ファイルを残してスキップしたかを表す。
+/// ユーザーが上書きを拒否した場合は「エラー」ではなく正常な no-op（スキップ）として扱う。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitOutcome {
+    /// 設定ファイルを新規生成（または `--force` で上書き）した
+    Created(PathBuf),
+    /// 既存ファイルがあり、ユーザーが上書きを拒否したため変更しなかった
+    SkippedExisting(PathBuf),
+}
+
 /// 設定ファイル生成のための init コマンド
 pub struct InitCommand;
 
@@ -19,9 +31,10 @@ impl InitCommand {
     /// * `force` - true の場合、確認なしで既存ファイルを上書き
     ///
     /// # 戻り値
-    /// * `Ok(PathBuf)` - 生成されたファイルのパス
+    /// * `Ok(InitOutcome::Created)` - 設定ファイルを生成した
+    /// * `Ok(InitOutcome::SkippedExisting)` - ユーザーが上書きを拒否し、既存ファイルを残した
     /// * `Err(SafeKillError)` - 生成に失敗した場合
-    pub fn execute(force: bool) -> Result<PathBuf, SafeKillError> {
+    pub fn execute(force: bool) -> Result<InitOutcome, SafeKillError> {
         let config_dir = Config::config_dir().ok_or_else(|| {
             SafeKillError::ConfigCreationError("Unable to determine config directory".to_string())
         })?;
@@ -30,14 +43,11 @@ impl InitCommand {
             SafeKillError::ConfigCreationError("Unable to determine config path".to_string())
         })?;
 
-        // ファイルの存在チェック
-        if config_path.exists() && !force {
-            // 上書き確認
-            if !Self::confirm_overwrite(&config_path)? {
-                return Err(SafeKillError::ConfigCreationError(
-                    "Operation cancelled".to_string(),
-                ));
-            }
+        // 既存ファイルがあり force でない場合は上書き確認する。
+        // ユーザーが拒否した場合は作成失敗ではなく「正常なスキップ」（no-op）として扱い、
+        // 終了コード 0 で正常終了させる。
+        if config_path.exists() && !force && !Self::confirm_overwrite(&config_path)? {
+            return Ok(InitOutcome::SkippedExisting(config_path));
         }
 
         // ディレクトリが存在しない場合は作成
@@ -59,7 +69,7 @@ impl InitCommand {
             ))
         })?;
 
-        Ok(config_path)
+        Ok(InitOutcome::Created(config_path))
     }
 
     /// コメント付きのデフォルト設定内容を生成

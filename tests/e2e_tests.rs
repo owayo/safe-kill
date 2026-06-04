@@ -858,14 +858,16 @@ fn test_init_cancel_preserves_existing_config() {
     let config_path = config_dir.join("config.toml");
     fs::write(&config_path, "# existing config\ndummy = 1").unwrap();
 
-    // "n"を入力してキャンセル
+    // "n"を入力してキャンセル。
+    // キャンセルはユーザーの意図的な操作であり、設定ファイル作成エラーではない。
+    // 既存ファイルを変更しない正常な no-op として終了コード 0 を返す。
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.env("HOME", temp.path())
         .arg("init")
         .write_stdin("n\n")
         .assert()
-        .code(3) // ConfigError exit code
-        .stderr(predicate::str::contains("cancelled"));
+        .code(0) // 正常な no-op（既存ファイルを保持）
+        .stderr(predicate::str::contains("Skipped"));
 
     // 既存のファイルが保持されていることを確認
     let content = fs::read_to_string(&config_path).unwrap();

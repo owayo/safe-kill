@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use safe_kill::cli::{CliArgs, ExecutionMode};
 use safe_kill::error::SafeKillError;
-use safe_kill::init::InitCommand;
+use safe_kill::init::{InitCommand, InitOutcome};
 use safe_kill::killer::{BatchKillResult, KillResult};
 use safe_kill::policy::PolicyEngine;
 use safe_kill::process_info;
@@ -77,11 +77,23 @@ fn run() -> Result<(), SafeKillError> {
             }
         }
         ExecutionMode::InitConfig { force } => {
-            let path = InitCommand::execute(force)?;
-            println!("Created: {}", path.display());
-            println!();
-            println!("Hint: Edit the config file to customize allowed ports and process lists.");
-            println!("      Then use `safe-kill --port <PORT>` to kill processes by port.");
+            match InitCommand::execute(force)? {
+                InitOutcome::Created(path) => {
+                    println!("Created: {}", path.display());
+                    println!();
+                    println!(
+                        "Hint: Edit the config file to customize allowed ports and process lists."
+                    );
+                    println!("      Then use `safe-kill --port <PORT>` to kill processes by port.");
+                }
+                InitOutcome::SkippedExisting(path) => {
+                    // ユーザーが上書きを拒否した場合は正常な no-op として扱う（終了コード 0）。
+                    eprintln!(
+                        "Skipped. Existing config left unchanged: {}",
+                        path.display()
+                    );
+                }
+            }
             Ok(())
         }
     }

@@ -38,6 +38,27 @@ impl KillPermission {
     pub fn is_denied(&self) -> bool {
         !self.is_allowed()
     }
+
+    /// 拒否系の判定結果を、対応する `SafeKillError` に変換する
+    ///
+    /// `pid` は対象 PID、`name` は対象プロセスの表示名。
+    /// 許可系（`Allowed` / `AllowedByAllowlist`）には対応するエラーがないため、
+    /// 呼び出し側で `is_allowed()` による分岐を済ませてから使うこと。
+    /// 万一許可系が渡された場合は防御的に `SystemError` を返す（fail-closed）。
+    fn to_error(&self, pid: u32, name: &str) -> SafeKillError {
+        match self {
+            KillPermission::DeniedByDenylist(denied_name) => {
+                SafeKillError::Denylisted(denied_name.clone())
+            }
+            KillPermission::DeniedNotDescendant => {
+                SafeKillError::NotDescendant(pid, name.to_string())
+            }
+            KillPermission::DeniedSuicidePrevention => SafeKillError::SuicidePrevention(pid),
+            KillPermission::Allowed | KillPermission::AllowedByAllowlist => {
+                SafeKillError::SystemError("Unexpected permission".to_string())
+            }
+        }
+    }
 }
 
 /// kill 許可判定を統括するポリシーエンジン
@@ -134,21 +155,17 @@ impl PolicyEngine {
             .ok_or(SafeKillError::ProcessNotFound(pid))?;
 
         // 許可判定
-        match self.can_kill(&process) {
-            KillPermission::Allowed | KillPermission::AllowedByAllowlist => {
-                // 判定後・kill 前に、自殺防止（最新の親 PID 解決）と PID 再利用検出を
-                // 最終ガードとしてまとめて再検証する。
-                // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
-                self.verify_final_safety_before_kill(&process)?;
-                Ok(self
-                    .killer
-                    .kill_with_result(pid, &process.name, signal, dry_run))
-            }
-            KillPermission::DeniedByDenylist(name) => Err(SafeKillError::Denylisted(name)),
-            KillPermission::DeniedNotDescendant => {
-                Err(SafeKillError::NotDescendant(pid, process.name))
-            }
-            KillPermission::DeniedSuicidePrevention => Err(SafeKillError::SuicidePrevention(pid)),
+        let permission = self.can_kill(&process);
+        if permission.is_allowed() {
+            // 判定後・kill 前に、自殺防止（最新の親 PID 解決）と PID 再利用検出を
+            // 最終ガードとしてまとめて再検証する。
+            // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
+            self.verify_final_safety_before_kill(&process)?;
+            Ok(self
+                .killer
+                .kill_with_result(pid, &process.name, signal, dry_run))
+        } else {
+            Err(permission.to_error(pid, &process.name))
         }
     }
 
@@ -267,18 +284,7 @@ impl PolicyEngine {
                 }
             } else {
                 // 拒否されたプロセスの失敗結果を生成
-                let error = match permission {
-                    KillPermission::DeniedByDenylist(ref name) => {
-                        SafeKillError::Denylisted(name.clone())
-                    }
-                    KillPermission::DeniedNotDescendant => {
-                        SafeKillError::NotDescendant(process.pid, process.name.clone())
-                    }
-                    KillPermission::DeniedSuicidePrevention => {
-                        SafeKillError::SuicidePrevention(process.pid)
-                    }
-                    _ => SafeKillError::SystemError("Unexpected permission".to_string()),
-                };
+                let error = permission.to_error(process.pid, &process.name);
                 KillResult::failure(process.pid, &process.name, &error)
             };
 
@@ -361,18 +367,7 @@ impl PolicyEngine {
                     }
                 }
             } else {
-                let error = match permission {
-                    KillPermission::DeniedByDenylist(ref name) => {
-                        SafeKillError::Denylisted(name.clone())
-                    }
-                    KillPermission::DeniedSuicidePrevention => {
-                        SafeKillError::SuicidePrevention(pp.pid)
-                    }
-                    KillPermission::DeniedNotDescendant => {
-                        SafeKillError::NotDescendant(pp.pid, process.name.clone())
-                    }
-                    _ => SafeKillError::SystemError("Unexpected permission".to_string()),
-                };
+                let error = permission.to_error(pp.pid, &process.name);
                 KillResult::failure(pp.pid, &process.name, &error)
             };
 
@@ -465,6 +460,52 @@ mod tests {
     fn test_kill_permission_denied_suicide() {
         assert!(!KillPermission::DeniedSuicidePrevention.is_allowed());
         assert!(KillPermission::DeniedSuicidePrevention.is_denied());
+    }
+
+    // KillPermission::to_error 変換テスト
+    // 拒否系の判定結果が、対応する SafeKillError に正しく変換されることを検証する。
+    // kill_by_pid / kill_by_name / kill_port_processes が共有する変換ロジックのため、
+    // 各バリアントの変換結果をここで一元的に保証する。
+    #[test]
+    fn test_kill_permission_to_error_denylist() {
+        let perm = KillPermission::DeniedByDenylist("systemd".to_string());
+        assert_eq!(
+            perm.to_error(1234, "systemd"),
+            SafeKillError::Denylisted("systemd".to_string())
+        );
+    }
+
+    #[test]
+    fn test_kill_permission_to_error_not_descendant() {
+        // NotDescendant には対象 PID と表示名の両方が含まれるべき
+        let perm = KillPermission::DeniedNotDescendant;
+        assert_eq!(
+            perm.to_error(1234, "nginx"),
+            SafeKillError::NotDescendant(1234, "nginx".to_string())
+        );
+    }
+
+    #[test]
+    fn test_kill_permission_to_error_suicide() {
+        let perm = KillPermission::DeniedSuicidePrevention;
+        assert_eq!(
+            perm.to_error(5678, "bash"),
+            SafeKillError::SuicidePrevention(5678)
+        );
+    }
+
+    #[test]
+    fn test_kill_permission_to_error_allowed_falls_back_to_system_error() {
+        // 許可系が渡された場合は防御的に SystemError を返す（fail-closed）。
+        // 通常は is_allowed() で分岐済みのため、この経路には到達しない。
+        assert!(matches!(
+            KillPermission::Allowed.to_error(1, "x"),
+            SafeKillError::SystemError(_)
+        ));
+        assert!(matches!(
+            KillPermission::AllowedByAllowlist.to_error(1, "x"),
+            SafeKillError::SystemError(_)
+        ));
     }
 
     #[test]
