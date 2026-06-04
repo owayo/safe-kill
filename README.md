@@ -86,6 +86,8 @@ safe-kill init [--force]
 
 `init` is a standalone subcommand. It cannot be combined with `PID`, `--name`, `--port`, `--list`, `--signal`, or `--dry-run`.
 
+If the config file already exists, `init` prompts for confirmation before overwriting (use `--force` to skip the prompt). Declining the prompt leaves the existing file unchanged and exits successfully (code 0); only an actual write failure is reported as a configuration error (code 3).
+
 ### Options
 
 | Option | Short | Description |

@@ -56,14 +56,14 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | Module | Role |
 |--------|------|
 | `cli.rs` | clap ベースの CLI 定義と実行モード判定。`init` サブコマンドと通常 kill オプションの排他も担う |
-| `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却、kill 直前の最終安全検証 (`verify_final_safety_before_kill` = 自殺防止の再確認 `verify_not_suicide_before_kill` + PID 再利用検証 `verify_identity_before_kill`) も担う |
+| `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却（拒否判定→`SafeKillError` 変換は `KillPermission::to_error` に集約）、kill 直前の最終安全検証 (`verify_final_safety_before_kill` = 自殺防止の再確認 `verify_not_suicide_before_kill` + PID 再利用検証 `verify_identity_before_kill`) も担う |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流 |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は新しい `System` を作って指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
-| `init.rs` | `safe-kill init` で config.toml を生成 |
+| `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 
 ## Versioning

@@ -899,6 +899,30 @@ fn test_init_overwrite_yes() {
     assert!(!content.contains("old = 1"));
 }
 
+#[test]
+fn test_init_write_failure_reports_config_error() {
+    use std::fs;
+
+    // config.toml を「ディレクトリ」として作成しておくと、ファイル書き込みが失敗する。
+    // InitOutcome 導入後も、ユーザーキャンセル（正常な no-op / 終了コード0）とは区別して、
+    // 実際の作成失敗は ConfigCreationError（終了コード3）で報告されることを保証する回帰テスト。
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+    // config.toml をディレクトリにすることで fs::write が必ず失敗する状況を作る
+    let config_path_as_dir = config_dir.join("config.toml");
+    fs::create_dir_all(&config_path_as_dir).unwrap();
+
+    // --force で上書き確認をスキップし、書き込み試行まで進める
+    let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+    cmd.env("HOME", temp.path())
+        .arg("init")
+        .arg("--force")
+        .assert()
+        .code(3) // ConfigError exit code（実際の作成失敗）
+        .stderr(predicate::str::contains("Failed to"));
+}
+
 // =============================================================================
 // シグナルの境界値・異常入力テスト
 // =============================================================================
