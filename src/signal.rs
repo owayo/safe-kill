@@ -213,7 +213,7 @@ mod tests {
             SignalSender::parse_signal("10").is_err(),
             "macOS ではシグナル番号 10 は拒否されるべき"
         );
-        // macOS ではシグナル番号 12 は SIGPIPE であり SIGUSR2 ではない
+        // macOS ではシグナル番号 12 は SIGSYS であり SIGUSR2 ではない（SIGPIPE は 13）
         assert!(
             SignalSender::parse_signal("12").is_err(),
             "macOS ではシグナル番号 12 は拒否されるべき"

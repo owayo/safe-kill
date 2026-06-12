@@ -29,10 +29,22 @@ impl AncestryChecker {
         Self { provider, root_pid }
     }
 
+    /// 信頼ルートとして妥当な PID か判定する
+    ///
+    /// PID 0（無効値）と PID 1（init/launchd）は信頼ルートにできない。
+    /// PID 1 を信頼ルートにすると、親チェーンをたどれば事実上すべての
+    /// プロセスが init に到達するため、ほぼ全プロセスが「子孫」と誤判定され、
+    /// ancestry による安全境界が消失してしまう（fail-open）。
+    /// コンテナ・systemd サービス・直接 spawn されたシェル配下など、
+    /// 祖父/親が PID 1 になり得る環境を考慮し、1 以下は常に拒否する。
+    fn is_valid_root_pid(pid: u32) -> bool {
+        pid > 1
+    }
+
     /// 環境変数からルート PID を解析する
     fn parse_root_pid(value: &str) -> Option<u32> {
         let pid = value.trim().parse::<u32>().ok()?;
-        if pid == 0 {
+        if !Self::is_valid_root_pid(pid) {
             return None;
         }
         Some(pid)
@@ -43,7 +55,13 @@ impl AncestryChecker {
     /// 優先順位:
     /// 1. `SAFE_KILL_ROOT_PID` 環境変数
     /// 2. 呼び出しシェルの親（現在プロセスの祖父）
-    /// 3. 現在プロセス PID（フォールバック）
+    /// 3. 呼び出しシェル（現在プロセスの親）
+    /// 4. 現在プロセス PID（フォールバック）
+    ///
+    /// 祖父・親が PID 1（init/launchd）等で信頼ルートに不適格な場合は、
+    /// より内側（親→現在プロセス）へフォールバックして fail-closed に倒す。
+    /// これにより、コンテナや systemd サービス配下で親が PID 1 になる場合でも
+    /// 「全プロセスが子孫」と誤判定せず、自プロセスの子孫のみを kill 対象とする。
     pub fn get_root_pid(provider: &ProcessInfoProvider) -> u32 {
         // まず環境変数を確認する
         if let Ok(env_pid) = env::var(ROOT_PID_ENV_VAR) {
@@ -58,16 +76,22 @@ impl AncestryChecker {
 
         if let Some(current_info) = provider.get(current_pid) {
             if let Some(parent_pid) = current_info.parent_pid {
+                // 祖父が妥当な信頼ルートであれば採用する
                 if let Some(parent_info) = provider.get(parent_pid) {
                     if let Some(grandparent_pid) = parent_info.parent_pid {
-                        return grandparent_pid;
+                        if Self::is_valid_root_pid(grandparent_pid) {
+                            return grandparent_pid;
+                        }
                     }
                 }
-                return parent_pid;
+                // 祖父が不適格（PID 1 等）な場合は親へフォールバックする
+                if Self::is_valid_root_pid(parent_pid) {
+                    return parent_pid;
+                }
             }
         }
 
-        // フォールバックとして現在 PID を使用する
+        // 最終フォールバックは現在 PID（自プロセスの子孫のみ kill 可能=fail-closed）
         current_pid
     }
 
@@ -77,18 +101,31 @@ impl AncestryChecker {
     }
 
     /// `target_pid` が `root_pid` の子孫か判定する
-    ///
-    /// `target_pid` から親 PID チェーンをたどり、以下の条件で停止する:
-    /// - `root_pid` に到達した（`true`）
-    /// - PID 1（init/launchd）に到達した（`false`）
-    /// - 最大深度を超えた（`false`）
-    /// - プロセス情報が取得できない（`false`）
     pub fn is_descendant(&self, target_pid: u32) -> bool {
         self.is_descendant_of(target_pid, self.root_pid)
     }
 
     /// `target_pid` が特定の `ancestor_pid` の子孫か判定する
+    ///
+    /// `ancestor_pid` が信頼ルートに不適格（PID 0/1）な場合は、誰も子孫とみなさず
+    /// `false` を返す（fail-closed）。PID 1（init/launchd）を祖先とみなすと、親チェーンを
+    /// たどれば事実上すべてのプロセスが子孫扱いになり ancestry の安全境界が崩れるため、
+    /// 公開 API 境界でガードする（ライブラリ利用者が直接呼んでも安全）。
     pub fn is_descendant_of(&self, target_pid: u32, ancestor_pid: u32) -> bool {
+        if !Self::is_valid_root_pid(ancestor_pid) {
+            return false;
+        }
+        self.is_descendant_of_unchecked(target_pid, ancestor_pid)
+    }
+
+    /// 親チェーンをたどる木探索の本体（`ancestor_pid` の妥当性は確認済み前提）
+    ///
+    /// `target_pid` から親 PID チェーンをたどり、以下の条件で停止する:
+    /// - `ancestor_pid` に到達した（`true`）
+    /// - PID 1（init/launchd）に到達した（`false`）
+    /// - 最大深度を超えた（`false`）
+    /// - プロセス情報が取得できない（`false`）
+    fn is_descendant_of_unchecked(&self, target_pid: u32, ancestor_pid: u32) -> bool {
         // 同一 PID の場合は子孫とみなす
         if target_pid == ancestor_pid {
             return true;
@@ -179,7 +216,12 @@ mod tests {
     fn test_get_root_pid_returns_valid() {
         let provider = ProcessInfoProvider::new();
         let root_pid = AncestryChecker::get_root_pid(&provider);
-        assert!(root_pid > 0);
+        // get_root_pid は信頼ルートとして PID 1 以下（init/launchd・無効値）を返さない。
+        // 祖父/親が PID 1 でもより内側へフォールバックするため、常に 1 より大きい。
+        assert!(
+            root_pid > 1,
+            "get_root_pid は PID 1 以下を返すべきでない: {root_pid}"
+        );
     }
 
     // 補足: 環境変数の直接テストは並列実行時に競合しやすいため、
@@ -198,6 +240,12 @@ mod tests {
     #[test]
     fn test_parse_root_pid_zero_rejected() {
         assert_eq!(AncestryChecker::parse_root_pid("0"), None);
+    }
+
+    #[test]
+    fn test_parse_root_pid_one_rejected() {
+        // PID 1（init/launchd）を信頼ルートにすると全プロセスが子孫扱いになるため拒否する。
+        assert_eq!(AncestryChecker::parse_root_pid("1"), None);
     }
 
     #[test]
@@ -336,15 +384,52 @@ mod tests {
     }
 
     #[test]
-    fn test_root_pid_one() {
+    fn test_root_pid_one_is_fail_closed() {
+        // PID 1（init/launchd）を信頼ルートにすると全プロセスが子孫扱いになり
+        // ancestry の安全境界が消失する（fail-open）。そのため root_pid が 1 の
+        // 場合は誰も子孫とみなさず fail-closed に倒すことを検証する。
         let provider = ProcessInfoProvider::new();
         let checker = AncestryChecker::with_root_pid(provider, 1);
 
-        assert!(checker.is_descendant(1));
+        // PID 1 自身も子孫扱いしない（root PID 自体は policy 側で別途保護される）
+        assert!(
+            !checker.is_descendant(1),
+            "root_pid=1 では PID 1 も子孫扱いしないべき"
+        );
 
-        // 結果は実行環境に依存するため、panic しないことのみ確認
+        // 現在プロセスも子孫扱いしない（全プロセス kill 可能化を防ぐ）
         let current_pid = ProcessInfoProvider::current_pid();
-        let _result = checker.is_descendant(current_pid);
+        assert!(
+            !checker.is_descendant(current_pid),
+            "root_pid=1 では現在プロセスも子孫扱いしないべき（fail-closed）"
+        );
+    }
+
+    #[test]
+    fn test_root_pid_zero_is_fail_closed() {
+        // 信頼ルートが 0（無効値）の場合も誰も子孫扱いしない（fail-closed）。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 0);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(!checker.is_descendant(current_pid));
+        assert!(!checker.is_descendant(0));
+    }
+
+    #[test]
+    fn test_is_descendant_of_rejects_init_ancestor() {
+        // 公開 API の is_descendant_of は ancestor=0/1 を直接渡されても fail-closed
+        // （false）に倒す。ライブラリ利用者が PID 1 経由の旧 fail-open を踏めないことを保証。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::new(provider);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(
+            !checker.is_descendant_of(current_pid, 1),
+            "ancestor=1 は子孫判定を fail-closed にすべき"
+        );
+        assert!(
+            !checker.is_descendant_of(current_pid, 0),
+            "ancestor=0 は子孫判定を fail-closed にすべき"
+        );
     }
 
     #[test]

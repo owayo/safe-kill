@@ -23,7 +23,7 @@ path = "src/main.rs"
 clap = { version = "4.6.1", features = ["derive"] }
 
 # プロセス情報取得（クロスプラットフォーム）
-sysinfo = "0.39.2"
+sysinfo = "0.39.3"
 
 # Unix シグナル処理
 nix = { version = "0.31.3", features = ["signal", "process"] }

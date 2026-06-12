@@ -202,7 +202,7 @@ flowchart TB
 3. **Denylist Check**: System processes are always protected
 4. **Root PID Protection**: The trust root itself is not killable, even if allowlisted
 5. **Allowlist Bypass**: Trusted processes can skip ancestry checks
-6. **Ancestry Verification**: Only descendants of root session are killable
+6. **Ancestry Verification**: Only descendants of root session are killable. PID 1 (init/launchd) is never trusted as the root — when auto-detection would resolve the root to PID 1 (e.g. inside a container or a systemd service where the parent is PID 1), it falls back inward (parent → current process) and fails closed, instead of treating every process as a descendant
 7. **PID Reuse Detection (TOCTOU mitigation)**: Re-validates `pid + start_time + name` immediately before `kill(2)`. If the OS has reused the PID for another process between policy decision and signal dispatch, the kill fails closed with `ProcessNotFound`. The `start_time` granularity is seconds, so reuse to a same-named process within the same second cannot be detected (extremely rare in practice). Full coverage would require Linux `pidfd_open` + `pidfd_send_signal`.
 8. **Port Hold Re-check (port mode only)**: For `--port` kills, the set of current holders of the target port is re-queried just before signaling. If the candidate PID/protocol is no longer present in that set (the target released the port between policy decision and `kill(2)`), the kill fails closed with `NoProcessOnPort`. This avoids killing a now-unrelated workload that happens to share the same PID after the user's intent (releasing the port) has already been satisfied.
 
@@ -277,7 +277,7 @@ flowchart TB
 
 | Variable | Description |
 |----------|-------------|
-| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0` or invalid values are ignored; the root PID itself is not killable) |
+| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0`, `1` (init/launchd), or invalid values are ignored; the root PID itself is not killable) |
 
 ## Claude Code Integration
 

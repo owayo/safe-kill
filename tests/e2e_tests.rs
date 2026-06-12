@@ -1024,8 +1024,10 @@ fn test_port_boundary_max() {
 // =============================================================================
 
 #[test]
-fn test_env_var_root_pid_override() {
-    // SAFE_KILL_ROOT_PID=1 を設定すると、すべてのプロセスが子孫とみなされる
+fn test_env_var_root_pid_one_is_ignored() {
+    // SAFE_KILL_ROOT_PID=1 は信頼ルートとして不適格（PID 1 を許すと全プロセスが
+    // 子孫扱いになる fail-open）なため無視され、自動検出ルートにフォールバックする。
+    // --list 自体は（自動検出ルート配下を列挙して）常に成功する。
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
     cmd.env("SAFE_KILL_ROOT_PID", "1")
         .arg("--list")

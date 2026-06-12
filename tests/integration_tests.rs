@@ -1735,18 +1735,19 @@ fn test_ancestry_checker_child_process_is_descendant() {
     let _ = child.wait();
 }
 
-/// PID 1 をルートに設定した場合、現在プロセスが子孫になることを確認
+/// PID 1 をルートに設定した場合、fail-closed（誰も子孫扱いしない）になることを確認
 #[test]
-fn test_ancestry_checker_pid1_as_root_current_is_descendant() {
+fn test_ancestry_checker_pid1_as_root_is_fail_closed() {
     let provider = ProcessInfoProvider::new();
     let checker = AncestryChecker::with_root_pid(provider, 1);
     let current_pid = ProcessInfoProvider::current_pid();
 
-    // PID 1 をルートとした場合、現在プロセスはその子孫であるべき
-    // （macOS/Linux では全プロセスが PID 1 の子孫）
+    // PID 1 を信頼ルートにすると、macOS/Linux では全プロセスが PID 1 の子孫となり
+    // ancestry の安全境界が消失する（fail-open）。これを防ぐため root_pid=1 では
+    // 誰も子孫とみなさず fail-closed に倒す。
     assert!(
-        checker.is_descendant(current_pid),
-        "現在プロセスは PID 1 の子孫であるべき"
+        !checker.is_descendant(current_pid),
+        "root_pid=1 では現在プロセスを子孫扱いしないべき（fail-closed）"
     );
 }
 

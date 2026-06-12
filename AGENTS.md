@@ -43,7 +43,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 3. **Denylist**: システムプロセスは常に保護
 4. **Root PID保護**: `SAFE_KILL_ROOT_PID` または自動検出された信頼ルート自体は kill 禁止
 5. **Allowlist**: 信頼プロセスは ancestry チェックをバイパス
-6. **Ancestry検証**: セッションの子孫のみ kill 可能
+6. **Ancestry検証**: セッションの子孫のみ kill 可能。信頼ルートは PID 1（init/launchd）を採用せず、自動検出で祖父が PID 1 になる場合（コンテナ・systemd サービス配下など）は親→現在プロセスへフォールバックして fail-closed に倒す（PID 1 をルートにすると、親チェーンが init に到達する全プロセスが子孫扱いになる fail-open を防止）。公開 API の `is_descendant_of` も `ancestor_pid` が 0/1 なら子孫判定を拒否する
 7. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、kill 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証する。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` として fail-closed する。`start_time` は秒精度のため、同一秒内の同名プロセスへの再利用は検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要だが、現状は窓を大幅に狭めている
 8. **ポート保持の再検証**: `--port` 指定 kill では、判定～kill の間に対象 PID が当該ポートを離していないかを再取得した保持者集合と照合する。離していれば `NoProcessOnPort` として fail-closed する（既に意図したサービスは停止しているため余計な kill を抑止する）
 
@@ -57,7 +57,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 |--------|------|
 | `cli.rs` | clap ベースの CLI 定義と実行モード判定。`init` サブコマンドと通常 kill オプションの排他も担う |
 | `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、既定 denylist の強制合流、`KillPermission` enum の返却（拒否判定→`SafeKillError` 変換は `KillPermission::to_error` に集約）、kill 直前の最終安全検証 (`verify_final_safety_before_kill` = 自殺防止の再確認 `verify_not_suicide_before_kill` + PID 再利用検証 `verify_identity_before_kill`) も担う |
-| `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/無効値は無視）または祖父プロセスをルートとする |
+| `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/1/無効値は無視）または祖父プロセスをルートとする。PID 1（init/launchd）は信頼ルートにできず、祖父が PID 1 等で不適格なら親→現在プロセスへフォールバックする（fail-closed）。木探索本体は `is_descendant_of_unchecked` に分離し、公開 API 側でルート妥当性をガードする |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流 |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
@@ -74,4 +74,4 @@ YY.M.COUNTER 形式（例: 26.1.105）。リリースは GitHub Actions の work
 
 - E2E テストは `assert_cmd` を使用し、実際のバイナリを実行する
 - 統合テストは実プロセスツリーを使ったテスト
-- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0` や無効値は無視、root PID 自体は kill 不可）
+- ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0`・`1` や無効値は無視、root PID 自体は kill 不可）
