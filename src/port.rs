@@ -514,6 +514,21 @@ mod tests {
     }
 
     #[test]
+    fn test_socket_matches_port_rejects_tcp_listen_on_other_port() {
+        // LISTEN 状態でもローカルポートが一致しなければ対象外（None）。
+        // 別ポートで待ち受けるサービスを誤って巻き込まないことを保証する。
+        let tcp_listen = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
+            local_addr: "127.0.0.1".parse().unwrap(),
+            local_port: 3000,
+            remote_addr: "0.0.0.0".parse().unwrap(),
+            remote_port: 0,
+            state: TcpState::Listen,
+        });
+
+        assert_eq!(socket_matches_port(&tcp_listen, 9999), None);
+    }
+
+    #[test]
     fn test_socket_matches_port_accepts_udp_by_local_port() {
         let udp = ProtocolSocketInfo::Udp(netstat2::UdpSocketInfo {
             local_addr: "127.0.0.1".parse().unwrap(),

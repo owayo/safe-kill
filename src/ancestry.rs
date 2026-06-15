@@ -273,6 +273,24 @@ mod tests {
         assert_eq!(AncestryChecker::parse_root_pid("   "), None);
     }
 
+    // is_valid_root_pid（信頼ルート妥当性判定）の直接テスト。
+    // PID 1 fail-open 修正の安全境界を回帰テストとして固定する。
+    #[test]
+    fn test_is_valid_root_pid_rejects_zero_and_one() {
+        // PID 0（無効値）と PID 1（init/launchd）は信頼ルートにできない。
+        // これを許すと親チェーンが init に到達する全プロセスが子孫扱いになる（fail-open）。
+        assert!(!AncestryChecker::is_valid_root_pid(0));
+        assert!(!AncestryChecker::is_valid_root_pid(1));
+    }
+
+    #[test]
+    fn test_is_valid_root_pid_accepts_two_and_above() {
+        // 2 以上は信頼ルートとして妥当。境界値 2・通常値・u32 最大値で確認する。
+        assert!(AncestryChecker::is_valid_root_pid(2));
+        assert!(AncestryChecker::is_valid_root_pid(12345));
+        assert!(AncestryChecker::is_valid_root_pid(u32::MAX));
+    }
+
     // is_descendant テスト
     #[test]
     fn test_current_process_is_descendant_of_root() {
