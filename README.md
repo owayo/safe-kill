@@ -341,7 +341,7 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 367 tests covering all modules
+- **Library Unit Tests**: 369 tests covering all modules
 - **Binary Unit Tests**: 26 tests for CLI output utilities and version checks
 - **Integration Tests**: 78 tests with real process trees
 - **E2E Tests**: 85 tests for CLI behavior

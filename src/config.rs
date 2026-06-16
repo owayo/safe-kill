@@ -440,10 +440,28 @@ mod tests {
     }
 
     #[test]
+    fn test_try_load_from_nonexistent_path_returns_defaults() {
+        let config =
+            Config::try_load_from_path(Some(PathBuf::from("/nonexistent/path/config.toml")))
+                .unwrap();
+        // 厳格読み込みでも、設定ファイル未作成はエラーにせずデフォルトを使う。
+        assert!(config.denylist.is_some());
+        assert!(config.allowed_ports.is_none());
+    }
+
+    #[test]
     fn test_load_from_none_path() {
         let config = Config::load_from_path(None);
         // デフォルト値が返されるべき
         assert!(config.denylist.is_some());
+    }
+
+    #[test]
+    fn test_try_load_from_none_path_returns_defaults() {
+        let config = Config::try_load_from_path(None).unwrap();
+        // ホームディレクトリが解決できない環境では安全なデフォルトを使う。
+        assert!(config.denylist.is_some());
+        assert!(config.allowed_ports.is_none());
     }
 
     #[test]
