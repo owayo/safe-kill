@@ -2,7 +2,7 @@
 //!
 //! プロセスが現在セッションの子孫かどうかを判定する。
 
-use crate::process_info::ProcessInfoProvider;
+use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use std::env;
 
 /// 無限ループを防ぐための ancestry 走査最大深度
@@ -15,18 +15,48 @@ const ROOT_PID_ENV_VAR: &str = "SAFE_KILL_ROOT_PID";
 pub struct AncestryChecker {
     provider: ProcessInfoProvider,
     root_pid: u32,
+    /// 信頼ルートの初期取得時 identity（PID 再利用検出の基準点）。
+    ///
+    /// `pid + start_time + name` の同一性を後続の判定で検証することで、
+    /// 長寿命の `AncestryChecker`（ライブラリ利用シナリオ）で信頼ルートの
+    /// PID が再利用された場合に認可境界が別プロセスへ移ることを防ぐ。
+    ///
+    /// `None` の場合は信頼ルートが妥当でない（PID 0/1）か、初期取得に
+    /// 失敗した状態を表し、以後の子孫判定はすべて `false`（fail-closed）になる。
+    root_identity: Option<ProcessInfo>,
 }
 
 impl AncestryChecker {
     /// ルート PID を自動検出して `AncestryChecker` を生成する
     pub fn new(provider: ProcessInfoProvider) -> Self {
         let root_pid = Self::get_root_pid(&provider);
-        Self { provider, root_pid }
+        let root_identity = Self::capture_root_identity(root_pid);
+        Self {
+            provider,
+            root_pid,
+            root_identity,
+        }
     }
 
     /// ルート PID を明示指定して `AncestryChecker` を生成する
     pub fn with_root_pid(provider: ProcessInfoProvider, root_pid: u32) -> Self {
-        Self { provider, root_pid }
+        let root_identity = Self::capture_root_identity(root_pid);
+        Self {
+            provider,
+            root_pid,
+            root_identity,
+        }
+    }
+
+    /// 信頼ルートの初期 identity を OS から取得する。
+    ///
+    /// PID 0/1 や OS から情報が取れない PID では `None` を返し、
+    /// 以後の子孫判定が fail-closed に倒れるようにする。
+    fn capture_root_identity(root_pid: u32) -> Option<ProcessInfo> {
+        if !Self::is_valid_root_pid(root_pid) {
+            return None;
+        }
+        ProcessInfoProvider::fetch_fresh(root_pid)
     }
 
     /// 信頼ルートとして妥当な PID か判定する
@@ -100,9 +130,36 @@ impl AncestryChecker {
         self.root_pid
     }
 
+    /// 信頼ルートの identity が初期取得時から変わっていないかを fresh に検証する。
+    ///
+    /// 以下のいずれかが成立しなければ `false`（fail-closed）を返す:
+    /// - 信頼ルート PID が妥当（PID 0/1 は不可）
+    /// - 初期 identity を保持している
+    /// - OS から取得し直した identity と `pid + start_time + name` が一致
+    ///
+    /// 長寿命の `AncestryChecker`（ライブラリ利用シナリオ）で、信頼ルートの
+    /// 祖父シェルが終了して同じ PID が別プロセスに割り当てられた場合に、
+    /// 認可境界が別プロセス配下へ移るのを防ぐ。
+    pub fn verify_root_identity_unchanged(&self) -> bool {
+        if !Self::is_valid_root_pid(self.root_pid) {
+            return false;
+        }
+        let Some(expected) = &self.root_identity else {
+            return false;
+        };
+        ProcessInfoProvider::fetch_fresh(self.root_pid)
+            .is_some_and(|fresh| fresh.is_same_process(expected))
+    }
+
     /// `target_pid` が `root_pid` の子孫か判定する
+    ///
+    /// 信頼ルートの identity が初期取得時から変わっていれば `false`（fail-closed）。
+    /// `is_descendant_of` 経由でも同じ検証を通す。
     pub fn is_descendant(&self, target_pid: u32) -> bool {
-        self.is_descendant_of(target_pid, self.root_pid)
+        if !self.verify_root_identity_unchanged() {
+            return false;
+        }
+        self.is_descendant_of_unchecked(target_pid, self.root_pid)
     }
 
     /// `target_pid` が特定の `ancestor_pid` の子孫か判定する
@@ -111,21 +168,55 @@ impl AncestryChecker {
     /// `false` を返す（fail-closed）。PID 1（init/launchd）を祖先とみなすと、親チェーンを
     /// たどれば事実上すべてのプロセスが子孫扱いになり ancestry の安全境界が崩れるため、
     /// 公開 API 境界でガードする（ライブラリ利用者が直接呼んでも安全）。
+    ///
+    /// `ancestor_pid` が自身の `root_pid` と一致する場合は、加えて root identity の
+    /// 同一性も検証する（信頼ルートの PID 再利用を検出するため）。
     pub fn is_descendant_of(&self, target_pid: u32, ancestor_pid: u32) -> bool {
         if !Self::is_valid_root_pid(ancestor_pid) {
+            return false;
+        }
+        if ancestor_pid == self.root_pid && !self.verify_root_identity_unchanged() {
             return false;
         }
         self.is_descendant_of_unchecked(target_pid, ancestor_pid)
     }
 
+    /// fresh な OS 情報で子孫判定する（kill 直前の TOCTOU 緩和用）
+    ///
+    /// 信頼ルートの identity 整合性に加え、新しい `ProcessInfoProvider` snapshot で
+    /// 子孫判定をやり直す。`AncestryChecker` 構築時の親子関係 snapshot に依存しないため、
+    /// 判定〜kill の間に対象プロセスが再ペアレントされて信頼ルート外に出たケースを
+    /// 捕捉できる。
+    ///
+    /// `ProcessInfoProvider::new()` で都度 fresh 取得するため、頻繁な呼び出しは
+    /// オーバーヘッドが大きい。kill 直前の最終ガード用途に限定する。
+    pub fn is_descendant_fresh(&self, target_pid: u32) -> bool {
+        if !self.verify_root_identity_unchanged() {
+            return false;
+        }
+        let fresh = ProcessInfoProvider::new();
+        Self::is_descendant_of_with_provider(&fresh, target_pid, self.root_pid)
+    }
+
     /// 親チェーンをたどる木探索の本体（`ancestor_pid` の妥当性は確認済み前提）
+    ///
+    /// 内部 provider を使った既存挙動を維持するためのシム。
+    fn is_descendant_of_unchecked(&self, target_pid: u32, ancestor_pid: u32) -> bool {
+        Self::is_descendant_of_with_provider(&self.provider, target_pid, ancestor_pid)
+    }
+
+    /// 任意の `provider` を使った木探索本体
     ///
     /// `target_pid` から親 PID チェーンをたどり、以下の条件で停止する:
     /// - `ancestor_pid` に到達した（`true`）
     /// - PID 1（init/launchd）に到達した（`false`）
     /// - 最大深度を超えた（`false`）
     /// - プロセス情報が取得できない（`false`）
-    fn is_descendant_of_unchecked(&self, target_pid: u32, ancestor_pid: u32) -> bool {
+    fn is_descendant_of_with_provider(
+        provider: &ProcessInfoProvider,
+        target_pid: u32,
+        ancestor_pid: u32,
+    ) -> bool {
         // 同一 PID の場合は子孫とみなす
         if target_pid == ancestor_pid {
             return true;
@@ -136,7 +227,7 @@ impl AncestryChecker {
 
         while depth < MAX_ANCESTRY_DEPTH {
             // 現在 PID のプロセス情報を取得
-            let Some(info) = self.provider.get(current_pid) else {
+            let Some(info) = provider.get(current_pid) else {
                 // プロセスが見つからない
                 return false;
             };
@@ -187,8 +278,16 @@ impl AncestryChecker {
     }
 
     /// プロセス情報を再取得する
+    ///
+    /// 内部 provider を最新化する。信頼ルートの identity が初期取得時から変わって
+    /// いれば `root_identity` を `None` にして以後の子孫判定を fail-closed に倒す。
+    /// 初期取得した identity 自体は再取得しない（新しい identity を信頼すると
+    /// PID 再利用後のプロセスを信頼ルートとして受け入れてしまうため）。
     pub fn refresh(&mut self) {
         self.provider.refresh();
+        if self.root_identity.is_some() && !self.verify_root_identity_unchanged() {
+            self.root_identity = None;
+        }
     }
 }
 
@@ -475,5 +574,148 @@ mod tests {
     #[test]
     fn test_max_depth_constant() {
         assert_eq!(MAX_ANCESTRY_DEPTH, 100);
+    }
+
+    // =====================================================================
+    // 信頼ルート identity 検証の回帰テスト
+    //
+    // 長寿命の AncestryChecker（ライブラリ利用シナリオ）で、信頼ルートの
+    // 祖父シェルが終了して同じ PID が別プロセスに割り当てられた場合に、
+    // 認可境界が別プロセス配下へ移らないよう fail-closed する。
+    // =====================================================================
+
+    #[test]
+    fn test_verify_root_identity_unchanged_for_current_process() {
+        // 現在プロセスを信頼ルートとして指定した直後は、identity 取得が成功し
+        // 同一性検証も通過する（生きているプロセスへの指定）。
+        let current_pid = ProcessInfoProvider::current_pid();
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, current_pid);
+        assert!(
+            checker.verify_root_identity_unchanged(),
+            "現在プロセスを root とした直後は identity 検証が成功すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_root_identity_unchanged_fails_for_nonexistent_pid() {
+        // 存在しない可能性が極めて高い PID を root に指定すると、初期 identity が
+        // 取得できないため verify_root_identity_unchanged は false（fail-closed）。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 999_999_998);
+        assert!(
+            !checker.verify_root_identity_unchanged(),
+            "初期 identity が取れない root では検証は fail-closed すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_root_identity_unchanged_fails_for_pid_zero() {
+        // PID 0 は信頼ルートに不適格。capture_root_identity も None になる。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 0);
+        assert!(!checker.verify_root_identity_unchanged());
+    }
+
+    #[test]
+    fn test_verify_root_identity_unchanged_fails_for_pid_one() {
+        // PID 1 は信頼ルートに不適格。capture_root_identity も None になる。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 1);
+        assert!(!checker.verify_root_identity_unchanged());
+    }
+
+    #[test]
+    fn test_is_descendant_fails_closed_when_root_identity_missing() {
+        // 信頼ルートの identity を取得できない場合、is_descendant は誰も子孫
+        // としない（fail-closed）。これは PID 再利用検出を兼ねる安全境界。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 999_999_997);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(
+            !checker.is_descendant(current_pid),
+            "root identity が未取得なら is_descendant は false（fail-closed）"
+        );
+    }
+
+    #[test]
+    fn test_is_descendant_of_fails_closed_when_targeted_root_identity_missing() {
+        // is_descendant_of の ancestor が自身の root_pid と一致するときも、
+        // identity 検証を経由するため fail-closed する。
+        let provider = ProcessInfoProvider::new();
+        let root_pid = 999_999_996;
+        let checker = AncestryChecker::with_root_pid(provider, root_pid);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(
+            !checker.is_descendant_of(current_pid, root_pid),
+            "ancestor が root_pid と一致するときは identity 検証で fail-closed すべき"
+        );
+    }
+
+    #[test]
+    fn test_is_descendant_fresh_succeeds_for_current_process_as_root() {
+        // 現在プロセスを root にすれば、新しい provider snapshot でも自分自身が
+        // 子孫として true になる（target == ancestor は常に true）。
+        let current_pid = ProcessInfoProvider::current_pid();
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, current_pid);
+        assert!(
+            checker.is_descendant_fresh(current_pid),
+            "現在プロセスは fresh 判定でも自身の子孫として認識されるべき"
+        );
+    }
+
+    #[test]
+    fn test_is_descendant_fresh_fails_closed_when_root_identity_missing() {
+        // 信頼ルートが取得不能な状態では、fresh 判定でも fail-closed。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 999_999_995);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(
+            !checker.is_descendant_fresh(current_pid),
+            "root identity が未取得なら is_descendant_fresh は false（fail-closed）"
+        );
+    }
+
+    #[test]
+    fn test_refresh_invalidates_root_identity_when_mismatched() {
+        // 信頼ルートが取得不能な状態で refresh を呼んでも、それまで保持していた
+        // root_identity （ここでは元から None）が None のままで、is_descendant は
+        // fail-closed のままであることを確認する。
+        let provider = ProcessInfoProvider::new();
+        let mut checker = AncestryChecker::with_root_pid(provider, 999_999_994);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(!checker.is_descendant(current_pid));
+        checker.refresh();
+        assert!(
+            !checker.is_descendant(current_pid),
+            "refresh 後も root identity が未取得なら fail-closed のまま"
+        );
+    }
+
+    #[test]
+    fn test_refresh_keeps_validity_when_root_identity_stable() {
+        // 現在プロセスを root にしてから refresh しても、identity は安定で
+        // is_descendant が true を返し続ける（既存挙動の維持を保証）。
+        let current_pid = ProcessInfoProvider::current_pid();
+        let provider = ProcessInfoProvider::new();
+        let mut checker = AncestryChecker::with_root_pid(provider, current_pid);
+        assert!(checker.is_descendant(current_pid));
+        checker.refresh();
+        assert!(
+            checker.is_descendant(current_pid),
+            "現在プロセスを root にしている限り refresh 後も is_descendant は維持されるべき"
+        );
+        assert!(checker.verify_root_identity_unchanged());
+    }
+
+    #[test]
+    fn test_capture_root_identity_returns_none_for_invalid_root() {
+        // capture_root_identity は内部関数だが、is_valid_root_pid と組み合わせ
+        // PID 0/1 では即 None を返す。これは構築直後の挙動として外から観測できる。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::with_root_pid(provider, 0);
+        // root_identity が None なら verify_root_identity_unchanged が false
+        assert!(!checker.verify_root_identity_unchanged());
     }
 }

@@ -25,6 +25,35 @@ pub enum KillPermission {
     DeniedSuicidePrevention,
 }
 
+/// kill 直前の最終安全検証における ancestry 再評価の要否
+///
+/// boolean ではなく enum とすることで、呼び出し側が「ancestry をバイパス」する
+/// 意図を明示的に表現できるようにする（安全側に倒すデフォルトを取り違えにくくする）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalAncestryCheck {
+    /// 信頼ルート配下に「今も」あるかを fresh provider snapshot で再評価する。
+    /// PID/名前指定で `KillPermission::Allowed`（ancestry 経由）で許可された場合に使う。
+    Required,
+    /// ancestry 再評価をバイパスする。設計上 ancestry を適用しない経路で使う:
+    /// - `KillPermission::AllowedByAllowlist`（allowlist は ancestry バイパス）
+    /// - ポート指定 kill（明示的に ancestry をバイパス）
+    Bypassed,
+}
+
+impl FinalAncestryCheck {
+    /// 許可判定結果から ancestry 再評価の要否を決定する。
+    ///
+    /// 拒否系の値が渡された場合は防御的に `Bypassed` を返す（呼び出し側が
+    /// `is_allowed()` で分岐済みのため通常は到達しない）。
+    fn from_permission(permission: &KillPermission) -> Self {
+        match permission {
+            KillPermission::Allowed => Self::Required,
+            KillPermission::AllowedByAllowlist => Self::Bypassed,
+            _ => Self::Bypassed,
+        }
+    }
+}
+
 impl KillPermission {
     /// kill が許可されているかを確認する
     pub fn is_allowed(&self) -> bool {
@@ -157,10 +186,13 @@ impl PolicyEngine {
         // 許可判定
         let permission = self.can_kill(&process);
         if permission.is_allowed() {
-            // 判定後・kill 前に、自殺防止（最新の親 PID 解決）と PID 再利用検出を
-            // 最終ガードとしてまとめて再検証する。
+            // 判定後・kill 前に、自殺防止（最新の親 PID 解決）、ancestry 再評価
+            // （Allowed の場合のみ）、PID 再利用検出を最終ガードとしてまとめて再検証する。
             // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
-            self.verify_final_safety_before_kill(&process)?;
+            self.verify_final_safety_before_kill(
+                &process,
+                FinalAncestryCheck::from_permission(&permission),
+            )?;
             Ok(self
                 .killer
                 .kill_with_result(pid, &process.name, signal, dry_run))
@@ -244,14 +276,35 @@ impl PolicyEngine {
         Ok(())
     }
 
-    /// kill 直前の最終安全検証（自殺防止 + プロセス同一性）
+    /// kill 直前の最終安全検証（自殺防止 + ancestry 再評価 + プロセス同一性）
     ///
     /// signal 送信直前の最終ガードとして、以下を fresh な OS 情報で再検証し
     /// fail-closed を保証する:
     /// 1. 自殺防止（最新の親 PID 解決による自プロセス・親プロセス保護）
-    /// 2. PID 再利用検出（`pid + start_time + name` の同一性）
-    fn verify_final_safety_before_kill(&self, expected: &ProcessInfo) -> Result<(), SafeKillError> {
+    /// 2. ancestry 再評価（`ancestry_check == Required` のときのみ）
+    ///    信頼ルートの identity 同一性と、新しい provider snapshot での子孫判定を
+    ///    やり直す。`PolicyEngine` 構築時の親子関係 snapshot に依存しないため、
+    ///    判定〜kill 間の対象プロセス再ペアレントを捕捉できる。
+    /// 3. PID 再利用検出（`pid + start_time + name` の同一性）
+    ///
+    /// 順序は「自殺防止 → ancestry 再評価 → 同一性」とし、もっとも重要な保護を
+    /// 先に実行する。
+    fn verify_final_safety_before_kill(
+        &self,
+        expected: &ProcessInfo,
+        ancestry_check: FinalAncestryCheck,
+    ) -> Result<(), SafeKillError> {
         Self::verify_not_suicide_before_kill(expected.pid)?;
+
+        if ancestry_check == FinalAncestryCheck::Required
+            && !self.ancestry.is_descendant_fresh(expected.pid)
+        {
+            return Err(SafeKillError::NotDescendant(
+                expected.pid,
+                expected.name.clone(),
+            ));
+        }
+
         self.verify_identity_before_kill(expected)
     }
 
@@ -274,8 +327,10 @@ impl PolicyEngine {
             let permission = self.can_kill(&process);
 
             let result = if permission.is_allowed() {
-                // kill 直前の最終ガード（自殺防止の再確認 + PID 再利用検出）。
-                match self.verify_final_safety_before_kill(&process) {
+                // kill 直前の最終ガード（自殺防止の再確認 + ancestry 再評価 +
+                // PID 再利用検出）。`Allowed` の場合のみ ancestry を再評価する。
+                let ancestry_check = FinalAncestryCheck::from_permission(&permission);
+                match self.verify_final_safety_before_kill(&process, ancestry_check) {
                     Ok(()) => {
                         self.killer
                             .kill_with_result(process.pid, &process.name, signal, dry_run)
@@ -358,7 +413,11 @@ impl PolicyEngine {
                     let err = SafeKillError::NoProcessOnPort(port);
                     KillResult::failure(pp.pid, &process.name, &err)
                 } else {
-                    match self.verify_final_safety_before_kill(&process) {
+                    // ポート kill は ancestry を意図的にバイパスする設計のため、
+                    // 最終ガードでも ancestry 再評価は行わない（Bypassed）。
+                    match self
+                        .verify_final_safety_before_kill(&process, FinalAncestryCheck::Bypassed)
+                    {
                         Ok(()) => {
                             self.killer
                                 .kill_with_result(pp.pid, &process.name, signal, dry_run)
@@ -1411,7 +1470,8 @@ mod tests {
 
         // 親のスナップショット情報が取得できる場合のみ検証する
         if let Some(parent_info) = engine.provider.get(parent_pid) {
-            let result = engine.verify_final_safety_before_kill(&parent_info);
+            let result =
+                engine.verify_final_safety_before_kill(&parent_info, FinalAncestryCheck::Required);
             assert!(
                 matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == parent_pid),
                 "最終安全検証は現在の親プロセスを SuicidePrevention で拒否すべき"
@@ -1451,5 +1511,87 @@ mod tests {
             matches!(result, Err(SafeKillError::SystemError(_))),
             "親 PID 不明時は fail-closed（SystemError）すべき"
         );
+    }
+
+    // =========================================================================
+    // FinalAncestryCheck / verify_final_safety_before_kill の回帰テスト
+    //
+    // ancestry の fresh 再評価が「ancestry 経由の許可（KillPermission::Allowed）」
+    // でのみ Required になり、allowlist / port 経路では Bypassed になる仕様を保証する。
+    // =========================================================================
+
+    #[test]
+    fn test_final_ancestry_check_from_allowed_is_required() {
+        assert_eq!(
+            FinalAncestryCheck::from_permission(&KillPermission::Allowed),
+            FinalAncestryCheck::Required
+        );
+    }
+
+    #[test]
+    fn test_final_ancestry_check_from_allowlist_is_bypassed() {
+        // allowlist は設計上 ancestry をバイパスするため、最終ガードでも Bypassed。
+        assert_eq!(
+            FinalAncestryCheck::from_permission(&KillPermission::AllowedByAllowlist),
+            FinalAncestryCheck::Bypassed
+        );
+    }
+
+    #[test]
+    fn test_final_ancestry_check_from_denied_defaults_to_bypassed() {
+        // 拒否系の permission は通常 verify_final_safety_before_kill へ到達しないが、
+        // 防御的に Bypassed を返すことで安全側に倒す（is_allowed 後の分岐が前提）。
+        assert_eq!(
+            FinalAncestryCheck::from_permission(&KillPermission::DeniedNotDescendant),
+            FinalAncestryCheck::Bypassed
+        );
+        assert_eq!(
+            FinalAncestryCheck::from_permission(&KillPermission::DeniedSuicidePrevention),
+            FinalAncestryCheck::Bypassed
+        );
+        assert_eq!(
+            FinalAncestryCheck::from_permission(&KillPermission::DeniedByDenylist("x".to_string())),
+            FinalAncestryCheck::Bypassed
+        );
+    }
+
+    #[test]
+    fn test_verify_final_safety_required_rejects_non_descendant() {
+        // ancestry_check=Required で「信頼ルートの子孫でない」プロセスを渡すと
+        // NotDescendant で拒否される。信頼ルートが取れない（PID 99999 想定）状況で
+        // is_descendant_fresh が fail-closed することを利用する。
+        let engine = PolicyEngine::with_defaults();
+        // 自殺防止・PID 同一性は通過するように、現在プロセス以外の存在しない PID で
+        // ダミー ProcessInfo を作成する。verify_not_suicide_before_kill は通過するが
+        // verify_identity_before_kill は ProcessNotFound で先に拒否される。
+        // よってここでは「fresh は ProcessNotFound が先に落とす」ことを確認する。
+        let dummy = ProcessInfo {
+            pid: 999_999_998,
+            parent_pid: Some(1),
+            name: "unrelated".to_string(),
+            cmd: vec![],
+            start_time: 0,
+        };
+        let result = engine.verify_final_safety_before_kill(&dummy, FinalAncestryCheck::Required);
+        assert!(
+            result.is_err(),
+            "存在しないプロセスは NotDescendant か ProcessNotFound で fail-closed すべき"
+        );
+    }
+
+    #[test]
+    fn test_verify_final_safety_bypassed_skips_ancestry_check() {
+        // ancestry_check=Bypassed では、ancestry 経由の NotDescendant では拒否されない。
+        // 自殺防止と同一性検証は引き続き適用される（現在プロセスは SuicidePrevention で拒否）。
+        let engine = PolicyEngine::with_defaults();
+        let current_pid = ProcessInfoProvider::current_pid();
+        if let Some(process) = engine.provider.get(current_pid) {
+            let result =
+                engine.verify_final_safety_before_kill(&process, FinalAncestryCheck::Bypassed);
+            assert!(
+                matches!(result, Err(SafeKillError::SuicidePrevention(pid)) if pid == current_pid),
+                "Bypassed でも自殺防止は通過させてはならない"
+            );
+        }
     }
 }
