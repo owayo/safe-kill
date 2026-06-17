@@ -43,13 +43,17 @@ enum FinalAncestryCheck {
 impl FinalAncestryCheck {
     /// 許可判定結果から ancestry 再評価の要否を決定する。
     ///
-    /// 拒否系の値が渡された場合は防御的に `Bypassed` を返す（呼び出し側が
-    /// `is_allowed()` で分岐済みのため通常は到達しない）。
-    fn from_permission(permission: &KillPermission) -> Self {
+    /// 拒否系の値が渡された場合は `Err(SystemError)` を返す（呼び出し側は
+    /// `is_allowed()` で分岐済みなので通常は到達しないが、将来の呼び出し漏れを
+    /// 早期検出するため fail-loud にする）。`Bypassed` フォールバックにすると
+    /// 拒否系を弱い最終検証にすり抜けさせる経路が残るため避ける。
+    fn try_from_permission(permission: &KillPermission) -> Result<Self, SafeKillError> {
         match permission {
-            KillPermission::Allowed => Self::Required,
-            KillPermission::AllowedByAllowlist => Self::Bypassed,
-            _ => Self::Bypassed,
+            KillPermission::Allowed => Ok(Self::Required),
+            KillPermission::AllowedByAllowlist => Ok(Self::Bypassed),
+            _ => Err(SafeKillError::SystemError(
+                "unexpected denied permission reached final ancestry check".to_string(),
+            )),
         }
     }
 }
@@ -189,10 +193,8 @@ impl PolicyEngine {
             // 判定後・kill 前に、自殺防止（最新の親 PID 解決）、ancestry 再評価
             // （Allowed の場合のみ）、PID 再利用検出を最終ガードとしてまとめて再検証する。
             // dry-run でも、ユーザーへの誤った成功表示を避けるために検証する。
-            self.verify_final_safety_before_kill(
-                &process,
-                FinalAncestryCheck::from_permission(&permission),
-            )?;
+            let ancestry_check = FinalAncestryCheck::try_from_permission(&permission)?;
+            self.verify_final_safety_before_kill(&process, ancestry_check)?;
             Ok(self
                 .killer
                 .kill_with_result(pid, &process.name, signal, dry_run))
@@ -329,8 +331,11 @@ impl PolicyEngine {
             let result = if permission.is_allowed() {
                 // kill 直前の最終ガード（自殺防止の再確認 + ancestry 再評価 +
                 // PID 再利用検出）。`Allowed` の場合のみ ancestry を再評価する。
-                let ancestry_check = FinalAncestryCheck::from_permission(&permission);
-                match self.verify_final_safety_before_kill(&process, ancestry_check) {
+                // 拒否系の permission が紛れ込んでも try_from_permission が
+                // SystemError として失敗扱いにするため、バッチ全体は壊れない。
+                match FinalAncestryCheck::try_from_permission(&permission)
+                    .and_then(|check| self.verify_final_safety_before_kill(&process, check))
+                {
                     Ok(()) => {
                         self.killer
                             .kill_with_result(process.pid, &process.name, signal, dry_run)
@@ -1521,50 +1526,46 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_final_ancestry_check_from_allowed_is_required() {
-        assert_eq!(
-            FinalAncestryCheck::from_permission(&KillPermission::Allowed),
-            FinalAncestryCheck::Required
-        );
+    fn test_final_ancestry_check_try_from_allowed_is_required() {
+        let result = FinalAncestryCheck::try_from_permission(&KillPermission::Allowed);
+        assert_eq!(result, Ok(FinalAncestryCheck::Required));
     }
 
     #[test]
-    fn test_final_ancestry_check_from_allowlist_is_bypassed() {
+    fn test_final_ancestry_check_try_from_allowlist_is_bypassed() {
         // allowlist は設計上 ancestry をバイパスするため、最終ガードでも Bypassed。
-        assert_eq!(
-            FinalAncestryCheck::from_permission(&KillPermission::AllowedByAllowlist),
-            FinalAncestryCheck::Bypassed
-        );
+        let result = FinalAncestryCheck::try_from_permission(&KillPermission::AllowedByAllowlist);
+        assert_eq!(result, Ok(FinalAncestryCheck::Bypassed));
     }
 
     #[test]
-    fn test_final_ancestry_check_from_denied_defaults_to_bypassed() {
-        // 拒否系の permission は通常 verify_final_safety_before_kill へ到達しないが、
-        // 防御的に Bypassed を返すことで安全側に倒す（is_allowed 後の分岐が前提）。
-        assert_eq!(
-            FinalAncestryCheck::from_permission(&KillPermission::DeniedNotDescendant),
-            FinalAncestryCheck::Bypassed
-        );
-        assert_eq!(
-            FinalAncestryCheck::from_permission(&KillPermission::DeniedSuicidePrevention),
-            FinalAncestryCheck::Bypassed
-        );
-        assert_eq!(
-            FinalAncestryCheck::from_permission(&KillPermission::DeniedByDenylist("x".to_string())),
-            FinalAncestryCheck::Bypassed
-        );
+    fn test_final_ancestry_check_try_from_denied_returns_error() {
+        // 拒否系の permission は本来 verify_final_safety_before_kill へ到達しないが、
+        // 将来の呼び出し漏れを早期検出するため Err(SystemError) で fail-loud にする。
+        // Bypassed フォールバックにすると拒否系が弱い最終検証をすり抜ける経路が残るため避ける。
+        let cases = [
+            KillPermission::DeniedNotDescendant,
+            KillPermission::DeniedSuicidePrevention,
+            KillPermission::DeniedByDenylist("x".to_string()),
+        ];
+        for permission in cases {
+            let result = FinalAncestryCheck::try_from_permission(&permission);
+            assert!(
+                matches!(result, Err(SafeKillError::SystemError(_))),
+                "拒否系 permission {:?} は SystemError で fail-loud すべき",
+                permission
+            );
+        }
     }
 
     #[test]
-    fn test_verify_final_safety_required_rejects_non_descendant() {
+    fn test_verify_final_safety_required_rejects_non_descendant_with_exact_error() {
         // ancestry_check=Required で「信頼ルートの子孫でない」プロセスを渡すと
-        // NotDescendant で拒否される。信頼ルートが取れない（PID 99999 想定）状況で
-        // is_descendant_fresh が fail-closed することを利用する。
+        // NotDescendant で拒否される。
+        // 順序: 自殺防止 → ancestry(Required) → 同一性 のため、ダミー PID が
+        // 信頼ルート配下でないことが ancestry 段で fail-closed され、
+        // NotDescendant が返ることを検証する。
         let engine = PolicyEngine::with_defaults();
-        // 自殺防止・PID 同一性は通過するように、現在プロセス以外の存在しない PID で
-        // ダミー ProcessInfo を作成する。verify_not_suicide_before_kill は通過するが
-        // verify_identity_before_kill は ProcessNotFound で先に拒否される。
-        // よってここでは「fresh は ProcessNotFound が先に落とす」ことを確認する。
         let dummy = ProcessInfo {
             pid: 999_999_998,
             parent_pid: Some(1),
@@ -1574,15 +1575,37 @@ mod tests {
         };
         let result = engine.verify_final_safety_before_kill(&dummy, FinalAncestryCheck::Required);
         assert!(
-            result.is_err(),
-            "存在しないプロセスは NotDescendant か ProcessNotFound で fail-closed すべき"
+            matches!(result, Err(SafeKillError::NotDescendant(pid, ref name))
+                if pid == dummy.pid && name == &dummy.name),
+            "Required では ancestry 段で NotDescendant に倒れるべき、実際: {:?}",
+            result
         );
     }
 
     #[test]
-    fn test_verify_final_safety_bypassed_skips_ancestry_check() {
+    fn test_verify_final_safety_bypassed_skips_ancestry_for_non_descendant() {
         // ancestry_check=Bypassed では、ancestry 経由の NotDescendant では拒否されない。
-        // 自殺防止と同一性検証は引き続き適用される（現在プロセスは SuicidePrevention で拒否）。
+        // 順序: 自殺防止 → ancestry(skip) → 同一性 のため、ダミー PID は
+        // 同一性検証段の ProcessNotFound で fail-closed される（NotDescendant ではない）。
+        let engine = PolicyEngine::with_defaults();
+        let dummy = ProcessInfo {
+            pid: 999_999_998,
+            parent_pid: Some(1),
+            name: "unrelated".to_string(),
+            cmd: vec![],
+            start_time: 0,
+        };
+        let result = engine.verify_final_safety_before_kill(&dummy, FinalAncestryCheck::Bypassed);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(pid)) if pid == dummy.pid),
+            "Bypassed では ancestry 段をスキップして同一性段の ProcessNotFound で落ちるべき、実際: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_final_safety_bypassed_still_rejects_self_kill() {
+        // ancestry_check=Bypassed でも自殺防止は引き続き適用される。
         let engine = PolicyEngine::with_defaults();
         let current_pid = ProcessInfoProvider::current_pid();
         if let Some(process) = engine.provider.get(current_pid) {

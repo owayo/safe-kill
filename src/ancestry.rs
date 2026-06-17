@@ -130,33 +130,47 @@ impl AncestryChecker {
         self.root_pid
     }
 
-    /// 信頼ルートの identity が初期取得時から変わっていないかを fresh に検証する。
+    /// 指定された `provider` snapshot 内で信頼ルートの identity 同一性を検証する内部ヘルパー。
     ///
     /// 以下のいずれかが成立しなければ `false`（fail-closed）を返す:
     /// - 信頼ルート PID が妥当（PID 0/1 は不可）
     /// - 初期 identity を保持している
-    /// - OS から取得し直した identity と `pid + start_time + name` が一致
+    /// - 渡された provider snapshot から取得した identity と `pid + start_time + name` が一致
     ///
-    /// 長寿命の `AncestryChecker`（ライブラリ利用シナリオ）で、信頼ルートの
-    /// 祖父シェルが終了して同じ PID が別プロセスに割り当てられた場合に、
-    /// 認可境界が別プロセス配下へ移るのを防ぐ。
-    pub fn verify_root_identity_unchanged(&self) -> bool {
+    /// 識別子検証と子孫判定を同一 snapshot 上で行えるようにすることで、両者の間に
+    /// 発生し得る微小な TOCTOU 窓を最小化する（例えば `is_descendant_fresh` 内で
+    /// 別タイミング snapshot を 2 つ使うと、その間隔で信頼ルート PID が再利用された場合に
+    /// identity 検証は通過したが子孫判定は別プロセスの親子関係を見ている、という不整合が起こりうる）。
+    fn root_identity_matches_in_provider(&self, provider: &ProcessInfoProvider) -> bool {
         if !Self::is_valid_root_pid(self.root_pid) {
             return false;
         }
         let Some(expected) = &self.root_identity else {
             return false;
         };
-        ProcessInfoProvider::fetch_fresh(self.root_pid)
+        provider
+            .get(self.root_pid)
             .is_some_and(|fresh| fresh.is_same_process(expected))
+    }
+
+    /// 信頼ルートの identity が初期取得時から変わっていないかを fresh に検証する。
+    ///
+    /// 新しい `ProcessInfoProvider` snapshot を生成して identity 同一性を確認する。
+    /// 長寿命の `AncestryChecker`（ライブラリ利用シナリオ）で、信頼ルートの祖父
+    /// シェルが終了して同じ PID が別プロセスに割り当てられた場合に、認可境界が
+    /// 別プロセス配下へ移るのを防ぐ。
+    pub fn verify_root_identity_unchanged(&self) -> bool {
+        let fresh = ProcessInfoProvider::new();
+        self.root_identity_matches_in_provider(&fresh)
     }
 
     /// `target_pid` が `root_pid` の子孫か判定する
     ///
-    /// 信頼ルートの identity が初期取得時から変わっていれば `false`（fail-closed）。
-    /// `is_descendant_of` 経由でも同じ検証を通す。
+    /// 自身の snapshot (`self.provider`) 内で信頼ルートの identity 同一性を確認した上で、
+    /// 同じ snapshot から子孫判定を行う。snapshot 一貫性を維持しつつ
+    /// PID 再利用を検出する。
     pub fn is_descendant(&self, target_pid: u32) -> bool {
-        if !self.verify_root_identity_unchanged() {
+        if !self.root_identity_matches_in_provider(&self.provider) {
             return false;
         }
         self.is_descendant_of_unchecked(target_pid, self.root_pid)
@@ -169,13 +183,14 @@ impl AncestryChecker {
     /// たどれば事実上すべてのプロセスが子孫扱いになり ancestry の安全境界が崩れるため、
     /// 公開 API 境界でガードする（ライブラリ利用者が直接呼んでも安全）。
     ///
-    /// `ancestor_pid` が自身の `root_pid` と一致する場合は、加えて root identity の
-    /// 同一性も検証する（信頼ルートの PID 再利用を検出するため）。
+    /// `ancestor_pid` が自身の `root_pid` と一致する場合は、自身の snapshot 内で
+    /// root identity の同一性も検証する（信頼ルートの PID 再利用を検出するため）。
     pub fn is_descendant_of(&self, target_pid: u32, ancestor_pid: u32) -> bool {
         if !Self::is_valid_root_pid(ancestor_pid) {
             return false;
         }
-        if ancestor_pid == self.root_pid && !self.verify_root_identity_unchanged() {
+        if ancestor_pid == self.root_pid && !self.root_identity_matches_in_provider(&self.provider)
+        {
             return false;
         }
         self.is_descendant_of_unchecked(target_pid, ancestor_pid)
@@ -188,13 +203,18 @@ impl AncestryChecker {
     /// 判定〜kill の間に対象プロセスが再ペアレントされて信頼ルート外に出たケースを
     /// 捕捉できる。
     ///
+    /// **重要**: identity 同一性検証と子孫判定は同一 snapshot で行う。
+    /// 別タイミング snapshot を使うと、その間隔で信頼ルート PID が再利用された場合に
+    /// identity 検証は通過したが子孫判定は別プロセスの親子関係を見ている、という
+    /// 不整合が起き得るため。
+    ///
     /// `ProcessInfoProvider::new()` で都度 fresh 取得するため、頻繁な呼び出しは
     /// オーバーヘッドが大きい。kill 直前の最終ガード用途に限定する。
     pub fn is_descendant_fresh(&self, target_pid: u32) -> bool {
-        if !self.verify_root_identity_unchanged() {
+        let fresh = ProcessInfoProvider::new();
+        if !self.root_identity_matches_in_provider(&fresh) {
             return false;
         }
-        let fresh = ProcessInfoProvider::new();
         Self::is_descendant_of_with_provider(&fresh, target_pid, self.root_pid)
     }
 
@@ -283,9 +303,11 @@ impl AncestryChecker {
     /// いれば `root_identity` を `None` にして以後の子孫判定を fail-closed に倒す。
     /// 初期取得した identity 自体は再取得しない（新しい identity を信頼すると
     /// PID 再利用後のプロセスを信頼ルートとして受け入れてしまうため）。
+    ///
+    /// identity 検証は最新化した自身の snapshot 上で行う（snapshot 一貫性維持）。
     pub fn refresh(&mut self) {
         self.provider.refresh();
-        if self.root_identity.is_some() && !self.verify_root_identity_unchanged() {
+        if self.root_identity.is_some() && !self.root_identity_matches_in_provider(&self.provider) {
             self.root_identity = None;
         }
     }
