@@ -151,17 +151,26 @@ impl PolicyEngine {
             return KillPermission::DeniedByDenylist(process.name.clone());
         }
 
-        // 3. 信頼ルート自体は子孫プロセスではないため保護する
+        // 3. PID 1（init/launchd 相当）は常に保護する
+        //    コンテナ環境では PID 1 が `node` / `python` などの非標準プロセスになり
+        //    既定 denylist に入らないことがある。その場合でも allowlist 経由や
+        //    ポート kill 経路で PID 1 を kill するとコンテナ全体を巻き添えにする
+        //    ため、ancestry / allowlist 判定より手前で fail-closed する。
+        if process.pid <= 1 {
+            return KillPermission::DeniedNotDescendant;
+        }
+
+        // 4. 信頼ルート自体は子孫プロセスではないため保護する
         if process.pid == self.ancestry.root_pid() {
             return KillPermission::DeniedNotDescendant;
         }
 
-        // 4. allowlist チェック（ancestry チェックをバイパス）
+        // 5. allowlist チェック（ancestry チェックをバイパス）
         if self.config.is_allowed(&process.name) {
             return KillPermission::AllowedByAllowlist;
         }
 
-        // 5. ancestry チェック（デフォルトのチェック）
+        // 6. ancestry チェック（デフォルトのチェック）
         if self.ancestry.is_descendant(process.pid) {
             return KillPermission::Allowed;
         }
@@ -446,7 +455,8 @@ impl PolicyEngine {
     /// 以下の簡略化されたチェックのみ適用:
     /// 1. 自殺防止（自プロセス・親プロセスの kill 不可）
     /// 2. denylist チェック
-    /// 3. root PID 保護（信頼ルート自体の kill 不可）
+    /// 3. PID 1 保護（コンテナ環境での巻き添え防止）
+    /// 4. root PID 保護（信頼ルート自体の kill 不可）
     ///
     /// ancestry 走査や allowlist は適用しない（ポート指定 kill 用）。
     fn can_kill_for_port(&self, pid: u32, name: &str) -> KillPermission {
@@ -460,7 +470,15 @@ impl PolicyEngine {
             return KillPermission::DeniedByDenylist(name.to_string());
         }
 
-        // 3. 信頼ルート自体はポート指定でも終了対象にしない
+        // 3. PID 1（init/launchd 相当）は常に保護する
+        //    コンテナ環境では PID 1 が非標準プロセスとして denylist 外になる
+        //    ことがある。ポート kill は ancestry をバイパスするため、ここで
+        //    明示的に PID 1 を拒否しないとコンテナ全体を巻き添えにする。
+        if pid <= 1 {
+            return KillPermission::DeniedNotDescendant;
+        }
+
+        // 4. 信頼ルート自体はポート指定でも終了対象にしない
         if pid == self.ancestry.root_pid() {
             return KillPermission::DeniedNotDescendant;
         }
@@ -1616,5 +1634,109 @@ mod tests {
                 "Bypassed でも自殺防止は通過させてはならない"
             );
         }
+    }
+
+    // =========================================================================
+    // PID 1（init/launchd 相当）保護の回帰テスト
+    //
+    // コンテナ環境では PID 1 が `node` / `python` などの非標準プロセスとなり、
+    // 既定 denylist に入らないケースがある。その場合でも:
+    //  - PID/名前指定の allowlist 経路（ancestry バイパス）
+    //  - ポート kill 経路（設計上 ancestry バイパス）
+    // で PID 1 を kill するとコンテナ全体が落ちるため、ancestry / allowlist 判定の
+    // 手前で常に fail-closed する。安全境界の回帰として固定する。
+    // =========================================================================
+
+    #[test]
+    fn test_can_kill_rejects_pid_one_even_when_allowlisted() {
+        // PID 1 が allowlist 名と一致しても、ancestry / allowlist より手前で
+        // NotDescendant として拒否されることを検証する。
+        let config = Config {
+            allowlist: Some(ProcessList {
+                processes: vec!["node".to_string()],
+            }),
+            denylist: None,
+            allowed_ports: None,
+        };
+        let engine = PolicyEngine::new(config);
+
+        let process = ProcessInfo {
+            pid: 1,
+            parent_pid: None,
+            name: "node".to_string(),
+            cmd: vec![],
+            start_time: 0,
+        };
+
+        let permission = engine.can_kill(&process);
+        assert_eq!(
+            permission,
+            KillPermission::DeniedNotDescendant,
+            "PID 1 は allowlist 一致でも常に保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_can_kill_rejects_pid_one_even_when_not_in_default_denylist() {
+        // 既定 denylist に含まれない名前（コンテナ環境の PID 1 を想定）の
+        // PID 1 でも拒否されることを検証する。
+        let engine = PolicyEngine::with_defaults();
+
+        let process = ProcessInfo {
+            pid: 1,
+            parent_pid: None,
+            name: "custom_container_init".to_string(),
+            cmd: vec![],
+            start_time: 0,
+        };
+
+        let permission = engine.can_kill(&process);
+        assert_eq!(
+            permission,
+            KillPermission::DeniedNotDescendant,
+            "PID 1 は denylist 非該当の名前でも常に保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_can_kill_for_port_rejects_pid_one() {
+        // ポート kill は ancestry をバイパスする設計のため、PID 1 を明示的に
+        // 拒否する経路がないと、PID 1 が許可ポートを listen しているケースで
+        // コンテナ全体が落ちる。常に NotDescendant で拒否されるべき。
+        let engine = PolicyEngine::with_defaults();
+        let permission = engine.can_kill_for_port(1, "custom_init");
+        assert_eq!(
+            permission,
+            KillPermission::DeniedNotDescendant,
+            "PID 1 はポート kill 経路でも常に保護されるべき"
+        );
+    }
+
+    #[test]
+    fn test_can_kill_for_port_rejects_pid_zero() {
+        // PID 0 はプロセスグループ用の特殊値であり、通常の kill 対象にできない。
+        // ポート kill の fail-closed として PID 1 と同じ扱いにする。
+        let engine = PolicyEngine::with_defaults();
+        let permission = engine.can_kill_for_port(0, "anything");
+        assert_eq!(permission, KillPermission::DeniedNotDescendant);
+    }
+
+    #[test]
+    fn test_can_kill_pid_one_protection_precedes_root_pid() {
+        // root PID を明示的に 1 ではない値にしても、PID 1 への kill は
+        // root_pid 判定より手前で拒否される（順序の回帰）。
+        let root_pid = ProcessInfoProvider::current_pid().saturating_add(100_000);
+        let engine = engine_with_root_pid(Config::default(), root_pid);
+
+        let process = ProcessInfo {
+            pid: 1,
+            parent_pid: None,
+            name: "totally_custom_name".to_string(),
+            cmd: vec![],
+            start_time: 0,
+        };
+
+        let permission = engine.can_kill(&process);
+        assert_eq!(permission, KillPermission::DeniedNotDescendant);
     }
 }

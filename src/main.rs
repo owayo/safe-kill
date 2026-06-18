@@ -118,7 +118,13 @@ fn batch_result_error(target: String, result: &BatchKillResult) -> SafeKillError
 /// 1 件の結果を表示する
 fn print_kill_result(name: &str, pid: u32, success: bool, message: &str) {
     let status = if success { "✓" } else { "✗" };
-    println!("{} {} (PID {}): {}", status, name, pid, message);
+    println!(
+        "{} {} (PID {}): {}",
+        status,
+        sanitize_terminal(name),
+        pid,
+        message
+    );
 }
 
 /// 複数件実行時の要約行を組み立てる
@@ -184,15 +190,36 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
         } else {
             p.cmd.join(" ")
         };
-        // Unicode を壊さないように切り詰める
-        let cmd_display = truncate(&cmd, 30);
-        println!(
-            "{:>8}  {:<20}  {}",
-            p.pid,
-            truncate(&p.name, 20),
-            cmd_display
-        );
+        // 端末制御文字（ANSI escape、改行、OSC など）はサニタイズしてから
+        // truncate する。サニタイズせずに truncate すると、escape sequence の
+        // 途中で切られて意図しない端末状態が残る可能性がある。
+        let cmd_display = truncate(&sanitize_terminal(&cmd), 30);
+        let name_display = truncate(&sanitize_terminal(&p.name), 20);
+        println!("{:>8}  {:<20}  {}", p.pid, name_display, cmd_display);
     }
+}
+
+/// 端末制御文字をエスケープ表記に置き換える
+///
+/// OS から取得したプロセス名やコマンドライン引数には、改行や ANSI escape
+/// （`\x1b[2J` で画面消去等）が含まれ得る。それらを無加工で表示すると、
+/// `--list` の出力行を上書き／消去する偽装表示や、端末状態の改ざんが可能。
+/// 表示の安全性のため、印字可能文字以外は `\xHH` 形式にエスケープする。
+fn sanitize_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\x{:02X}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 文字数上限で文字列を切り詰める
@@ -455,5 +482,69 @@ mod tests {
             port_result_summary(3000, &batch, false),
             "Port 3000: Found 1 process(es), killed 1:"
         );
+    }
+
+    // =========================================================================
+    // 端末制御文字サニタイズの回帰テスト
+    //
+    // OS から取得したプロセス名・コマンドライン引数に ANSI escape や改行が
+    // 含まれていても、表示行を上書きする偽装や端末状態の改ざんが起きないこと
+    // を保証する。
+    // =========================================================================
+
+    #[test]
+    fn test_sanitize_terminal_passes_printable_ascii() {
+        assert_eq!(sanitize_terminal("hello world"), "hello world");
+        assert_eq!(sanitize_terminal("safe-kill"), "safe-kill");
+        assert_eq!(sanitize_terminal(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_newline_carriage_return_tab() {
+        // 改行・復帰・タブはそれぞれリテラルなエスケープ表記に置き換える。
+        assert_eq!(sanitize_terminal("a\nb"), "a\\nb");
+        assert_eq!(sanitize_terminal("a\rb"), "a\\rb");
+        assert_eq!(sanitize_terminal("a\tb"), "a\\tb");
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_ansi_escape_sequence() {
+        // 画面消去（ESC[2J）のような ANSI escape は出力に残してはならない。
+        // ESC（U+001B）は `\x1B` 表記に置き換える。
+        let raw = "ok\x1b[2Jspoofed";
+        let sanitized = sanitize_terminal(raw);
+        assert!(
+            !sanitized.contains('\x1b'),
+            "ESC 文字（U+001B）はサニタイズで除去されるべき: {sanitized}"
+        );
+        assert!(
+            sanitized.contains("\\x1B"),
+            "ESC は `\\x1B` 形式のエスケープ表記に置き換わるべき: {sanitized}"
+        );
+        assert!(sanitized.contains("spoofed"));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_preserves_unicode_printable_chars() {
+        // マルチバイトの印字可能文字（日本語・絵文字）はそのまま残す。
+        assert_eq!(sanitize_terminal("日本語"), "日本語");
+        assert_eq!(sanitize_terminal("safe🛡️kill"), "safe🛡️kill");
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_other_control_chars() {
+        // 一般の制御文字（NUL、BEL、DEL など）も `\xHH` 表記に置き換える。
+        let raw = "a\x00b\x07c\x7fd";
+        let sanitized = sanitize_terminal(raw);
+        for forbidden in ['\x00', '\x07', '\x7f'] {
+            assert!(
+                !sanitized.contains(forbidden),
+                "制御文字 {:?} はサニタイズで除去されるべき: {sanitized}",
+                forbidden
+            );
+        }
+        assert!(sanitized.contains("\\x00"));
+        assert!(sanitized.contains("\\x07"));
+        assert!(sanitized.contains("\\x7F"));
     }
 }
