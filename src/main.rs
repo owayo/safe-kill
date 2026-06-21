@@ -16,7 +16,11 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("safe-kill: {}", e);
+            // エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
+            // OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
+            // ANSI escape を含む引数でプロセスを起動した場合に、エラー経路でも表示偽装や
+            // 端末状態改ざんが起きないよう、表示前に必ずサニタイズする。
+            eprintln!("safe-kill: {}", sanitize_terminal(&e.to_string()));
             e.exit_code().into()
         }
     }
@@ -118,12 +122,16 @@ fn batch_result_error(target: String, result: &BatchKillResult) -> SafeKillError
 /// 1 件の結果を表示する
 fn print_kill_result(name: &str, pid: u32, success: bool, message: &str) {
     let status = if success { "✓" } else { "✗" };
+    // `message` は失敗時に `SafeKillError::to_string()` を保持しており、エラー型によっては
+    // OS から取得したプロセス名がそのまま含まれる（例: `NotDescendant(pid, name)`、
+    // `Denylisted(name)`）。攻撃者が ANSI escape を含む引数でプロセスを起動した場合に
+    // 表示偽装や端末状態改ざんが起きないよう、`name` と `message` の両方をサニタイズする。
     println!(
         "{} {} (PID {}): {}",
         status,
         sanitize_terminal(name),
         pid,
-        message
+        sanitize_terminal(message)
     );
 }
 
@@ -546,5 +554,59 @@ mod tests {
         assert!(sanitized.contains("\\x00"));
         assert!(sanitized.contains("\\x07"));
         assert!(sanitized.contains("\\x7F"));
+    }
+
+    // =========================================================================
+    // エラー表示経路のサニタイズ回帰テスト
+    //
+    // `SafeKillError::NotDescendant(pid, name)` や `Denylisted(name)` のように、
+    // エラーメッセージに OS から取得したプロセス名が含まれるケースで、攻撃者の
+    // 制御文字が端末へ出ないことを保証する。
+    // =========================================================================
+
+    #[test]
+    fn test_sanitize_terminal_neutralizes_not_descendant_error_display() {
+        // 攻撃者が `\x1b[2J`（画面消去）を含む名前で起動したプロセスを kill しようとして
+        // 拒否されると、`SafeKillError::NotDescendant(pid, name)` の Display 結果に
+        // そのまま制御文字が含まれる。`sanitize_terminal` がそれを安全な表記に置き換える。
+        let err = SafeKillError::NotDescendant(42, "evil\x1b[2Jname".to_string());
+        let rendered = sanitize_terminal(&err.to_string());
+        assert!(
+            !rendered.contains('\x1b'),
+            "エラー表示の ESC 文字はサニタイズで除去されるべき: {rendered}"
+        );
+        assert!(
+            rendered.contains("\\x1B[2J"),
+            "ESC は `\\x1B` 形式へエスケープされて表示されるべき: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_terminal_neutralizes_denylisted_error_display() {
+        // `Denylisted(name)` 経路でも同様にプロセス名が含まれる。
+        let err = SafeKillError::Denylisted("rogue\nproc".to_string());
+        let rendered = sanitize_terminal(&err.to_string());
+        assert!(
+            !rendered.contains('\n'),
+            "エラー表示の改行はサニタイズで除去されるべき: {rendered}"
+        );
+        assert!(
+            rendered.contains("\\n"),
+            "改行は `\\n` リテラル表記に置き換わるべき: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_print_kill_result_sanitizes_message_field() {
+        // `KillResult::failure` は `message: error.to_string()` でエラー文を保持するため、
+        // 表示経路の `message` 引数にも制御文字が混入し得る。`sanitize_terminal` を通す
+        // ことで、攻撃者が拒否される側でも端末状態改ざんを防ぐ。
+        let err = SafeKillError::NotDescendant(7, "boom\x1b[31m".to_string());
+        let result = KillResult::failure(7, "boom\x1b[31m", &err);
+        let sanitized_message = sanitize_terminal(&result.message);
+        assert!(
+            !sanitized_message.contains('\x1b'),
+            "message 経由でも ESC 文字は表示されないべき: {sanitized_message}"
+        );
     }
 }

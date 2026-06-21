@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 391 + bin 31 + E2E 85 + integration 78)
+make test               # 全テスト実行 (lib 396 + bin 34 + E2E 85 + integration 78)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -48,7 +48,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 8. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、kill 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証する。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` として fail-closed する。`start_time` は秒精度のため、同一秒内の同名プロセスへの再利用は検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要だが、現状は窓を大幅に狭めている
 9. **kill 直前の ancestry 再評価**: PID/名前指定で `KillPermission::Allowed`（ancestry 経由）で許可されたプロセスは、kill 直前に新しい `ProcessInfoProvider` snapshot で root identity と子孫判定をやり直す（`is_descendant_fresh`）。判定～kill 間に対象プロセスが再ペアレントされて信頼ルート外に出たケースを `NotDescendant` として fail-closed する。`AllowedByAllowlist`（allowlist は ancestry をバイパスする設計）と `--port` kill では設計上 ancestry を適用しないため再評価をバイパスする。`FinalAncestryCheck::try_from_permission` で `Required` / `Bypassed` の区別を型レベルで表現し、拒否系の permission が紛れ込んだ場合は `Err(SystemError)` で fail-loud にする（呼び出し漏れの早期検出）
 10. **ポート保持の再検証**: `--port` 指定 kill では、判定～kill の間に対象 PID が当該ポートを離していないかを再取得した保持者集合と照合する。離していれば `NoProcessOnPort` として fail-closed する（既に意図したサービスは停止しているため余計な kill を抑止する）
-11. **表示時の端末制御文字サニタイズ**: `--list` や kill 結果表示で、OS から取得したプロセス名・コマンドライン引数に含まれる ANSI escape（画面消去・OSC 等）・改行・タブ・その他制御文字をすべて `\xHH` 等のエスケープ表記に置き換えてから出力する（`main.rs::sanitize_terminal`）。攻撃者が任意の引数でプロセスを起動して表示行を上書きする偽装や、端末状態の改ざんを防ぐ。サニタイズは `truncate` より前に行い、escape sequence の途中で切られて端末状態が残ることも防ぐ
+11. **表示時の端末制御文字サニタイズ**: `--list` / kill 結果表示 / エラー出力（stderr の `safe-kill: ...`）のすべての経路で、OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文に含まれる ANSI escape（画面消去・OSC 等）・改行・タブ・その他制御文字を `\xHH` 等のエスケープ表記に置き換えてから出力する（`main.rs::sanitize_terminal`）。`KillResult::failure` の `message` には `NotDescendant(pid, name)` や `Denylisted(name)` のようにプロセス名を含むエラー文字列が保持されるため、`name` だけでなく `message` 側もサニタイズする。stderr へ流れる `SafeKillError` の Display 結果（プロセス名を含むことがある）も `e.to_string()` を介して同様にサニタイズしてから表示する。攻撃者が任意の引数でプロセスを起動して表示行を上書きする偽装や、端末状態の改ざんを防ぐ。サニタイズは `truncate` より前に行い、escape sequence の途中で切られて端末状態が残ることも防ぐ
 
 ### Port-based killing の特殊性
 
@@ -68,7 +68,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は新しい `System` を作って指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
 | `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
-| `main.rs` | CLI のエントリポイント。実行モードごとの分岐、終了コード変換、表示出力を担う。`sanitize_terminal` で OS から取得したプロセス名・コマンドライン引数の端末制御文字（ANSI escape / 改行 / 制御文字）を `\xHH` 表記にエスケープしてから `truncate` するため、悪意ある起動引数を持つプロセスでも `--list` / kill 結果表示で偽装や端末状態改ざんが起きない |
+| `main.rs` | CLI のエントリポイント。実行モードごとの分岐、終了コード変換、表示出力を担う。`sanitize_terminal` で OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文の端末制御文字（ANSI escape / 改行 / 制御文字）を `\xHH` 表記にエスケープしてから `truncate` する。`--list` 出力、kill 結果表示（`print_kill_result` の `name` と `message` の両方）、`main()` での stderr エラー出力（`eprintln!("safe-kill: {}", sanitize_terminal(&e.to_string()))`）のすべてでサニタイズ済みの文字列のみが端末へ流れるため、悪意ある起動引数を持つプロセスでも偽装や端末状態改ざんが起きない |
 
 ## Versioning
 

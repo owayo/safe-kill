@@ -538,4 +538,38 @@ mod tests {
         assert_eq!(socket_matches_port(&udp, 5353), Some(PortProtocol::Udp));
         assert_eq!(socket_matches_port(&udp, 5354), None);
     }
+
+    // =========================================================================
+    // pid_holds_port の境界値・無効値テスト
+    //
+    // policy 層が呼び出す前に通常 fail-closed されるが、公開 API として直接
+    // 呼ばれても誤って true を返さないことを回帰として固定する。
+    // =========================================================================
+
+    #[test]
+    fn test_pid_holds_port_rejects_pid_zero() {
+        // PID=0 は実プロセスに対応しない。OS のソケット一覧に紐づく PID として
+        // 現れないことを期待し、保持なし（false）を返す。
+        let detector = PortDetector::new();
+        assert!(!detector.pid_holds_port(0, 8080, PortProtocol::Tcp));
+        assert!(!detector.pid_holds_port(0, 8080, PortProtocol::Udp));
+    }
+
+    #[test]
+    fn test_pid_holds_port_rejects_u32_max_pid() {
+        // 巨大 PID（u32::MAX 付近）は実プロセスに対応しない。
+        let detector = PortDetector::new();
+        assert!(!detector.pid_holds_port(u32::MAX, 8080, PortProtocol::Tcp));
+        assert!(!detector.pid_holds_port(u32::MAX, 8080, PortProtocol::Udp));
+    }
+
+    #[test]
+    fn test_pid_holds_port_returns_false_for_unused_port_even_with_real_pid() {
+        // 存在する PID（自プロセス）でも、保持していないポート/プロトコルでは false。
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+        // 高位ポートで TCP/UDP を保持していないことを前提に false を期待する。
+        assert!(!detector.pid_holds_port(current_pid, 59997, PortProtocol::Tcp));
+        assert!(!detector.pid_holds_port(current_pid, 59997, PortProtocol::Udp));
+    }
 }

@@ -585,6 +585,29 @@ mod tests {
     }
 
     #[test]
+    fn test_fetch_fresh_rejects_pid_zero() {
+        // PID 0 はプロセスグループを表す特殊値で、実プロセスとしては存在しない。
+        // sysinfo もこれを有効として扱わないため、fetch_fresh は None を返すべき。
+        // policy 層は事前に PID=0 を拒否しているが、TOCTOU 検証経路で誤って
+        // Some(...) を返さないことを公開 API の境界として固定する。
+        assert!(
+            ProcessInfoProvider::fetch_fresh(0).is_none(),
+            "PID 0 は fetch_fresh で None を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_fetch_fresh_rejects_u32_max_pid() {
+        // u32::MAX は i32::MAX を超えており、実プロセスに割り当てられない。
+        // sysinfo が Some を返してしまうと PID 再利用検証の同一性チェックを
+        // 通過させてしまう可能性があるため、None を返すことを回帰として固定する。
+        assert!(
+            ProcessInfoProvider::fetch_fresh(u32::MAX).is_none(),
+            "u32::MAX は fetch_fresh で None を返すべき"
+        );
+    }
+
+    #[test]
     fn test_is_same_process_ignores_parent_and_cmd() {
         // parent_pid と cmd は同一性判定に使わない（プロセスの状態として変動し得るため）
         let a = ProcessInfo {
