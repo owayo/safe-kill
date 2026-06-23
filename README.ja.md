@@ -35,7 +35,7 @@
 - **PID検証**: 危険なPID値（`0` と `i32::MAX` 超過）を拒否
 - **PID再利用検出**: シグナル送信直前に対象の同一性 (`pid + start_time + name`) を再検証し、ポリシー判定と `kill(2)` の間に発生する PID 再利用 (TOCTOU) を緩和
 - **ポート保持の再検証**: `--port` 指定 kill では、シグナル送信直前に対象ポートを保持しているプロセス集合を再取得し、対象 PID/プロトコルが含まれない場合は `NoProcessOnPort` として fail-closed
-- **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文に含まれる ANSI escape・改行・制御文字を `\xHH` 等にエスケープしてから出力する。`--list` / kill 結果（`name` と `message` の両方）に加え、stderr のエラー出力（`safe-kill: ...`）でも適用するため、kill が拒否される側（`NotDescendant` / `Denylisted` 等で攻撃者プロセス名がエラー文に含まれるケース）でも表示行の上書きや端末状態の改ざんを防ぐ
+- **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape・改行・C0/C1 制御文字・Unicode format 制御文字を `\xHH` または `\u{HHHH}` にエスケープしてから出力する。`--list` / kill 結果（`name` と `message` の両方）/ stderr のエラー出力（`safe-kill: ...`）/ `safe-kill init` のパス表示 / 設定読み込み警告に適用し、表示行の上書き、端末状態の改ざん、双方向制御文字による表示順偽装を防ぐ
 - **設定可能なリスト**: 許可リスト・拒否リストによる細かな制御
 - **複数シグナル対応**: SIGTERM、SIGKILL、SIGHUPなど
 - **ドライランモード**: 実際に終了せずにプレビュー
@@ -209,7 +209,7 @@ flowchart TB
 8. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、`kill(2)` 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` で fail-closed する。`start_time` は秒精度のため、同一秒内に同名プロセスへ再利用されたケースは検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要
 9. **kill 直前の親子関係再評価**: PID/名前指定で `KillPermission::Allowed`（親子関係経由）で許可されたプロセスは、`kill(2)` 直前に新しい `ProcessInfoProvider` snapshot で子孫判定をやり直す。判定～kill の間に対象が再ペアレントされて信頼ルート外に出ていた場合は `NotDescendant` として fail-closed する。`AllowedByAllowlist`（許可リストは設計上親子関係をバイパス）と `--port` 指定は再評価をバイパスする
 10. **ポート保持の再検証 (`--port` 指定時)**: `kill(2)` 直前に対象ポートの保持者集合を再取得し、判定時の対象 PID/プロトコルが含まれなければ `NoProcessOnPort` で fail-closed する。判定～kill の間に対象がポートを離した場合、ユーザーの「ポートを解放したい」意図は既に達成されているため、余計なシグナル送信を抑止する
-11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文に含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、その他制御文字を `\xHH` 等のエスケープ表記に置き換えてから出力する（`main.rs::sanitize_terminal`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力（`eprintln!("safe-kill: {}", sanitize_terminal(&e.to_string()))`）のすべてでサニタイズ済みの文字列のみが端末へ流れるため、kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない
+11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、C0/C1 制御文字、Unicode format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力、`safe-kill init` の作成/スキップ/上書き確認パス、設定読み込み警告のすべてでサニタイズ済みの文字列のみが端末へ流れる。kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぎ、双方向制御文字による表示順偽装も防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない
 
 ### プロセスツリーと終了可能範囲
 
@@ -346,7 +346,7 @@ cargo build --release
 
 ### テストカバレッジ
 
-- **ライブラリユニットテスト**: 全モジュールを網羅する396テスト
+- **ライブラリユニットテスト**: 全モジュールを網羅する403テスト
 - **バイナリユニットテスト**: CLI出力ユーティリティ・エラーサニタイズ・バージョン検証の34テスト
 - **統合テスト**: 実際のプロセスツリーを使用した78テスト
 - **E2Eテスト**: CLI動作を検証する85テスト

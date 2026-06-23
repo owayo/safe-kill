@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::SafeKillError;
+use crate::terminal::sanitize_path;
 
 /// `safe-kill init` の実行結果
 ///
@@ -104,7 +105,7 @@ ports = ["1420", "3000-3010", "5173", "8080"]
     fn confirm_overwrite(path: &Path) -> Result<bool, SafeKillError> {
         eprint!(
             "Config file already exists at {}. Overwrite? [y/N]: ",
-            path.display()
+            sanitize_path(path)
         );
         io::stderr().flush().map_err(|e| {
             SafeKillError::ConfigCreationError(format!("Failed to flush stderr: {}", e))

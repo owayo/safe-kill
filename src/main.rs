@@ -11,6 +11,7 @@ use safe_kill::init::{InitCommand, InitOutcome};
 use safe_kill::killer::{BatchKillResult, KillResult};
 use safe_kill::policy::PolicyEngine;
 use safe_kill::process_info;
+use safe_kill::terminal::{sanitize_path, sanitize_terminal};
 
 fn main() -> ExitCode {
     match run() {
@@ -83,7 +84,7 @@ fn run() -> Result<(), SafeKillError> {
         ExecutionMode::InitConfig { force } => {
             match InitCommand::execute(force)? {
                 InitOutcome::Created(path) => {
-                    println!("Created: {}", path.display());
+                    println!("Created: {}", sanitize_path(&path));
                     println!();
                     println!(
                         "Hint: Edit the config file to customize allowed ports and process lists."
@@ -94,7 +95,7 @@ fn run() -> Result<(), SafeKillError> {
                     // ユーザーが上書きを拒否した場合は正常な no-op として扱う（終了コード 0）。
                     eprintln!(
                         "Skipped. Existing config left unchanged: {}",
-                        path.display()
+                        sanitize_path(&path)
                     );
                 }
             }
@@ -205,29 +206,6 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
         let name_display = truncate(&sanitize_terminal(&p.name), 20);
         println!("{:>8}  {:<20}  {}", p.pid, name_display, cmd_display);
     }
-}
-
-/// 端末制御文字をエスケープ表記に置き換える
-///
-/// OS から取得したプロセス名やコマンドライン引数には、改行や ANSI escape
-/// （`\x1b[2J` で画面消去等）が含まれ得る。それらを無加工で表示すると、
-/// `--list` の出力行を上書き／消去する偽装表示や、端末状態の改ざんが可能。
-/// 表示の安全性のため、印字可能文字以外は `\xHH` 形式にエスケープする。
-fn sanitize_terminal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\x{:02X}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// 文字数上限で文字列を切り詰める

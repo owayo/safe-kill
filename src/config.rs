@@ -3,6 +3,7 @@
 //! ~/.config/safe-kill/config.toml 設定ファイルの読み込みと解析を行う。
 
 use crate::error::SafeKillError;
+use crate::terminal::{sanitize_path, sanitize_terminal};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -120,13 +121,14 @@ impl Config {
             Err(e) => {
                 if let Some(path) = path {
                     eprintln!(
-                        "Warning: Failed to load config file {:?}: {}. Using defaults.",
-                        path, e
+                        "Warning: Failed to load config file {}: {}. Using defaults.",
+                        sanitize_path(&path),
+                        sanitize_terminal(&e.to_string())
                     );
                 } else {
                     eprintln!(
                         "Warning: Failed to load config file: {}. Using defaults.",
-                        e
+                        sanitize_terminal(&e.to_string())
                     );
                 }
                 Self::with_defaults()
