@@ -417,5 +417,12 @@ mod tests {
             SafeKillError::SystemError("x".to_string()).exit_code(),
             SafeKillExitCode::GeneralError
         );
+        // InvalidUsage は CLI 排他チェックで多用される実運用エラーだが、
+        // 専用の終了コードを持たず GeneralError(255) にフォールバックする。
+        // スクリプト連携で参照される値なので、将来の意図しない変更を固定する。
+        assert_eq!(
+            SafeKillError::InvalidUsage("x".to_string()).exit_code(),
+            SafeKillExitCode::GeneralError
+        );
     }
 }

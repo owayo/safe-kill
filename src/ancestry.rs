@@ -572,6 +572,26 @@ mod tests {
     }
 
     #[test]
+    fn test_is_descendant_of_rejects_huge_nonexistent_ancestor() {
+        // is_valid_root_pid は pid > 1 のみで弾くため、u32::MAX や i32::MAX+1 の
+        // ような巨大で実在しない PID を ancestor に渡しても 0/1 ガードは通過する。
+        // しかし木探索は現在プロセスの親チェーンにその PID を見つけられないため
+        // false を返すべき。公開 API が巨大な偽 ancestor を「子孫」と誤判定しない
+        // ことを安全境界として固定する。
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::new(provider);
+        let current_pid = ProcessInfoProvider::current_pid();
+        assert!(
+            !checker.is_descendant_of(current_pid, u32::MAX),
+            "巨大で実在しない ancestor は子孫判定を false にすべき"
+        );
+        assert!(
+            !checker.is_descendant_of(current_pid, (i32::MAX as u32) + 1),
+            "i32::MAX を超える ancestor も子孫判定を false にすべき"
+        );
+    }
+
+    #[test]
     fn test_max_depth_protection() {
         let provider = ProcessInfoProvider::new();
         let current_pid = ProcessInfoProvider::current_pid();

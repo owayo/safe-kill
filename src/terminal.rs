@@ -37,6 +37,7 @@ fn is_format_control(c: char) -> bool {
             | '\u{061C}'
             | '\u{06DD}'
             | '\u{070F}'
+            | '\u{0890}'..='\u{0891}'
             | '\u{08E2}'
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
@@ -116,6 +117,46 @@ mod tests {
         assert_eq!(sanitized, "safe\\u{202E}txt\\u{2066}end");
         assert!(!sanitized.contains('\u{202E}'));
         assert!(!sanitized.contains('\u{2066}'));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_c1_control_introducer() {
+        // U+009B は C1 制御の CSI（Control Sequence Introducer）で、ESC+'[' と
+        // 等価の単独バイト制御シーケンス導入子。char::is_control() の C1 範囲
+        // （0x7F..=0x9F）で捕捉され \x9B にエスケープされることを固定する。
+        // 既存テストは C0（\x00/\x07）と DEL（\x7F）のみで C1 を検証していない。
+        let input = "evil\u{009B}2Jprocess";
+        let sanitized = sanitize_terminal(input);
+
+        assert_eq!(sanitized, "evil\\x9B2Jprocess");
+        assert!(!sanitized.contains('\u{009B}'));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_soft_hyphen_as_byte_escape() {
+        // U+00AD SOFT HYPHEN は Cf（Format）だが、符号位置 0xAD は
+        // char::is_control() の C1 範囲（0x7F..=0x9F）の外なので false になる。
+        // is_format_control 側で捕捉され、かつ 0xFF 以下なので \xHH 形式で
+        // エスケープされる（push_escaped_char の <=0xFF 分岐）ことを固定する。
+        let input = "soft\u{00AD}hyphen";
+        let sanitized = sanitize_terminal(input);
+
+        assert_eq!(sanitized, "soft\\xADhyphen");
+        assert!(!sanitized.contains('\u{00AD}'));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_arabic_prepended_concealment_marks() {
+        // U+0890 / U+0891 は Unicode 14.0 で追加された Cf（Format）文字で、
+        // U+0600..U+0605 や U+06DD と同じく後続文字を視覚的に隠す
+        // prepended-concealment 系。char::is_control() では捕捉できないため、
+        // is_format_control 側で確実にエスケープされることを固定する。
+        let input = "amount\u{0890}1234\u{0891}end";
+        let sanitized = sanitize_terminal(input);
+
+        assert_eq!(sanitized, "amount\\u{0890}1234\\u{0891}end");
+        assert!(!sanitized.contains('\u{0890}'));
+        assert!(!sanitized.contains('\u{0891}'));
     }
 
     #[test]
