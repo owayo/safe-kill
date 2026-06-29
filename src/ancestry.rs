@@ -237,6 +237,12 @@ impl AncestryChecker {
         target_pid: u32,
         ancestor_pid: u32,
     ) -> bool {
+        // 存在しない PID を「自分自身の子孫」と誤判定しないよう、同一 PID 判定より
+        // 前に対象プロセスが snapshot 内に存在することを確認する。
+        if provider.get(target_pid).is_none() {
+            return false;
+        }
+
         // 同一 PID の場合は子孫とみなす
         if target_pid == ancestor_pid {
             return true;
@@ -460,6 +466,18 @@ mod tests {
 
         // プロセスは自分自身の子孫とみなす
         assert!(checker.is_descendant_of(current_pid, current_pid));
+    }
+
+    #[test]
+    fn test_is_descendant_of_nonexistent_self_fails_closed() {
+        let provider = ProcessInfoProvider::new();
+        let checker = AncestryChecker::new(provider);
+        let nonexistent_pid = u32::MAX;
+
+        assert!(
+            !checker.is_descendant_of(nonexistent_pid, nonexistent_pid),
+            "存在しない PID は同一 PID 指定でも子孫として扱わない"
+        );
     }
 
     #[test]
