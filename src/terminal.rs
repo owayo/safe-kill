@@ -160,6 +160,23 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_terminal_escapes_supplementary_plane_format_controls() {
+        // 0xFFFF を超える面（supplementary plane）の Cf 文字も確実にエスケープする。
+        // - U+E0061: TAG LATIN SMALL LETTER A（U+E0020..=E007F の TAG 文字）。
+        //   不可視のまま後続テキストへ紛れ込ませる表示偽装に悪用され得る。
+        // - U+1D173: MUSICAL SYMBOL BEGIN BEAM（U+1D173..=1D17A）。
+        // 符号位置が 0xFFFF を超えるため push_escaped_char の `\u{HHHH}` 分岐（5 桁）を通る。
+        // 既存テストは U+202E / U+2066 / U+0890 など 4 桁以下しか検証しておらず、
+        // supplementary plane の 5 桁エスケープ出力が固定されていなかった。
+        let input = "tag\u{E0061}mid\u{1D173}end";
+        let sanitized = sanitize_terminal(input);
+
+        assert_eq!(sanitized, "tag\\u{E0061}mid\\u{1D173}end");
+        assert!(!sanitized.contains('\u{E0061}'));
+        assert!(!sanitized.contains('\u{1D173}'));
+    }
+
+    #[test]
     fn test_sanitize_path_escapes_control_chars() {
         let path = PathBuf::from("/tmp/safe-kill\x1b[2J\nconfig.toml");
         let sanitized = sanitize_path(&path);
