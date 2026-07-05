@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 409 + bin 34 + E2E 85 + integration 78)
+make test               # 全テスト実行 (lib 410 + bin 34 + E2E 85 + integration 78)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -39,7 +39,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 ### Safety Layers（優先順）
 
 1. **自殺防止**: 自プロセス・親プロセスの kill 禁止。ポリシー判定時の早期拒否（構築時スナップショット）に加え、kill 直前に最新の親 PID を OS から再取得して再検証する（`verify_not_suicide_before_kill`）。判定～kill 間の再ペアレント（親の入れ替わり）に対して fail-closed であり、親 PID が不明な場合も安全側に倒して拒否する
-2. **PID検証**: `0` や `i32::MAX` を超える PID は拒否
+2. **PID検証**: `0` や `i32::MAX` を超える PID は拒否。kill 直前の fresh なプロセス情報取得 (`ProcessInfoProvider::fetch_fresh`) でも同じ境界を公開 API 側で拒否し、OS や `sysinfo` の特殊 PID 解釈に依存しない
 3. **Denylist**: システムプロセスは常に保護
 4. **PID 1 保護**: PID 1（init/launchd 相当）自体は常に kill 拒否する。コンテナ環境では PID 1 が `node` / `python` など非標準プロセスとして既定 denylist 外になることがあり、allowlist 一致やポート kill 経路で巻き添えで終了させるとコンテナ全体が落ちるため、ancestry / allowlist 判定より手前で fail-closed する（`can_kill` と `can_kill_for_port` の両方）
 5. **Root PID保護**: `SAFE_KILL_ROOT_PID` または自動検出された信頼ルート自体は kill 禁止
@@ -65,7 +65,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流。フォールバック読み込み時の警告は設定パスとエラー本文をサニタイズしてから表示する |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
-| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は新しい `System` を作って指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
+| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は PID 0 と `i32::MAX` 超過を拒否した上で新しい `System` を作り、指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
 | `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う。確認プロンプトの設定パスはサニタイズ済みで表示する |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 | `terminal.rs` | 端末表示用サニタイズ。ANSI escape・改行・タブ・C0/C1 制御文字・Unicode format 制御文字を表示用エスケープへ置換し、プロセス情報・エラー本文・設定パスの表示偽装を防ぐ |

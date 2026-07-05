@@ -32,7 +32,7 @@
 - **Ancestry Verification**: Only kill processes spawned by your session
 - **Suicide Prevention**: Cannot kill self or parent processes; the current parent PID is re-resolved from the OS immediately before signaling, failing closed even if the process was re-parented between the policy decision and the kill
 - **PID 1 Protection**: PID 1 (init/launchd, or a custom container entrypoint) is never killable — even via allowlist match or `--port` bypass — so containerized agents cannot accidentally take down the whole container
-- **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`)
+- **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`), including in the fresh process lookup used immediately before signaling
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
 - **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and Unicode format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, and config-load warnings.
@@ -200,7 +200,7 @@ flowchart TB
 ### Safety Layers
 
 1. **Suicide Prevention**: Cannot kill own process or parent. Beyond the early policy-time check, the current parent PID is re-resolved from the OS immediately before `kill(2)`, failing closed against re-parenting between the policy decision and signal dispatch (and also when the parent PID is unknown)
-2. **PID Validation**: Reject unsafe PID values (`0`, out-of-range) before signal dispatch
+2. **PID Validation**: Reject unsafe PID values (`0`, out-of-range) before signal dispatch. The fresh process lookup used for pre-kill TOCTOU checks also rejects PID `0` and values beyond `i32::MAX` before consulting the OS process snapshot.
 3. **Denylist Check**: System processes are always protected
 4. **PID 1 Protection**: PID 1 (init/launchd, or a custom container entrypoint) is always refused as a kill target, ahead of ancestry / allowlist evaluation, in both `can_kill` and `can_kill_for_port`. Containers often run a non-standard PID 1 (e.g. `node`, `python`) that is not on the default denylist — without this guard an allowlist match or `--port` kill would take down the whole container.
 5. **Root PID Protection**: The trust root itself is not killable, even if allowlisted

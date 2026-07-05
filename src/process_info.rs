@@ -81,6 +81,13 @@ impl ProcessInfoProvider {
     /// プロセスの `start_time` が返るため、判定時の `start_time` と比較
     /// することで再利用を検出できる。
     pub fn fetch_fresh(pid: u32) -> Option<ProcessInfo> {
+        // PID 0 は Unix ではシグナル送信時にプロセスグループを表す特殊値。
+        // i32::MAX を超える値も kill(2) へ渡せないため、OS や sysinfo の
+        // 解釈に委ねず公開 API の境界で拒否する。
+        if pid == 0 || pid > i32::MAX as u32 {
+            return None;
+        }
+
         let mut sys = System::new();
         let sysinfo_pid = Pid::from_u32(pid);
         sys.refresh_processes(ProcessesToUpdate::Some(&[sysinfo_pid]), true);
@@ -604,6 +611,16 @@ mod tests {
         assert!(
             ProcessInfoProvider::fetch_fresh(u32::MAX).is_none(),
             "u32::MAX は fetch_fresh で None を返すべき"
+        );
+    }
+
+    #[test]
+    fn test_fetch_fresh_rejects_i32_max_plus_one_pid() {
+        let pid = i32::MAX as u32 + 1;
+
+        assert!(
+            ProcessInfoProvider::fetch_fresh(pid).is_none(),
+            "i32::MAX を超える PID は fetch_fresh で None を返すべき"
         );
     }
 
