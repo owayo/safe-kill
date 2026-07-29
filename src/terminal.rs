@@ -27,7 +27,7 @@ pub fn sanitize_terminal(s: &str) -> String {
 /// 端末表示を偽装できる非印字の Unicode format 文字か判定する。
 ///
 /// Rust 標準ライブラリには Unicode general category の `Cf` 判定 API がないため、
-/// 表示順や文字結合に影響する代表的な format/control code point を明示的に扱う。
+/// Unicode 17.0 で `Cf` に分類される format/control code point を明示的に扱う。
 fn is_format_control(c: char) -> bool {
     matches!(
         c,
@@ -174,6 +174,57 @@ mod tests {
         assert_eq!(sanitized, "tag\\u{E0061}mid\\u{1D173}end");
         assert!(!sanitized.contains('\u{E0061}'));
         assert!(!sanitized.contains('\u{1D173}'));
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_all_unicode_17_format_controls() {
+        // Unicode 17.0 の DerivedGeneralCategory.txt に定義された Cf 全範囲。
+        // 代表値だけでなく全 170 コードポイントを検証し、範囲端や単独値の
+        // 取りこぼしで不可視文字が端末出力へ残る回帰を防ぐ。
+        const FORMAT_CONTROL_RANGES: &[(u32, u32)] = &[
+            (0x00AD, 0x00AD),
+            (0x0600, 0x0605),
+            (0x061C, 0x061C),
+            (0x06DD, 0x06DD),
+            (0x070F, 0x070F),
+            (0x0890, 0x0891),
+            (0x08E2, 0x08E2),
+            (0x180E, 0x180E),
+            (0x200B, 0x200F),
+            (0x202A, 0x202E),
+            (0x2060, 0x2064),
+            (0x2066, 0x206F),
+            (0xFEFF, 0xFEFF),
+            (0xFFF9, 0xFFFB),
+            (0x110BD, 0x110BD),
+            (0x110CD, 0x110CD),
+            (0x13430, 0x1343F),
+            (0x1BCA0, 0x1BCA3),
+            (0x1D173, 0x1D17A),
+            (0xE0001, 0xE0001),
+            (0xE0020, 0xE007F),
+        ];
+
+        let mut tested = 0;
+        for &(start, end) in FORMAT_CONTROL_RANGES {
+            for code in start..=end {
+                let ch = char::from_u32(code).expect("Cf のコードポイントは有効な文字であるべき");
+                let expected = if code <= 0xFF {
+                    format!("\\x{code:02X}")
+                } else {
+                    format!("\\u{{{code:04X}}}")
+                };
+
+                assert_eq!(
+                    sanitize_terminal(&ch.to_string()),
+                    expected,
+                    "U+{code:04X} がエスケープされていない"
+                );
+                tested += 1;
+            }
+        }
+
+        assert_eq!(tested, 170);
     }
 
     #[test]
