@@ -180,6 +180,21 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_usage_error_message() {
+        // InvalidUsage だけは `#[error("{0}")]` の透過表示で、他の variant のような
+        // 固定プレフィックスを持たない。cli.rs が組み立てた排他エラー文がそのまま
+        // stderr へ出るため、prefix が付く実装へ変わると利用者向け文言が壊れる。
+        // 他の variant にはすべてメッセージ検証があるのに、ここだけ抜けていた。
+        let err = SafeKillError::InvalidUsage(
+            "--list cannot be combined with PID, --name, or --port".to_string(),
+        );
+        assert_eq!(
+            err.to_string(),
+            "--list cannot be combined with PID, --name, or --port"
+        );
+    }
+
+    #[test]
     fn test_not_descendant_error_message() {
         let err = SafeKillError::NotDescendant(1234, "nginx".to_string());
         assert_eq!(

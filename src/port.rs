@@ -403,6 +403,51 @@ mod tests {
     }
 
     #[test]
+    fn test_find_by_port_detects_ipv6_tcp_listener() {
+        // find_by_port / pid_holds_port は AddressFamilyFlags::IPV4 | IPV6 を指定するが、
+        // 既存テストは 127.0.0.1 (IPv4) 束縛しか検証しておらず、IPv6 のみで待ち受ける
+        // 開発サーバー（Node.js が既定で [::] に bind する構成など）を検出できるかが
+        // 固定されていなかった。IPv6 が落ちると --port kill が黙って対象なしになるため、
+        // AddressFamilyFlags から IPV6 が外れる回帰を検出できるようにする。
+        let Ok(listener) = TcpListener::bind("[::1]:0") else {
+            // IPv6 ループバックが無効な環境（一部のコンテナ）ではスキップする。
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        // OS のソケット一覧へ反映されるまで短く待つ。通常は初回で成功する。
+        let detected = (0..10).any(|_| {
+            let matched = detector
+                .find_by_port(port)
+                .map(|processes| {
+                    processes
+                        .into_iter()
+                        .any(|p| p.pid == current_pid && p.protocol == PortProtocol::Tcp)
+                })
+                .unwrap_or(false);
+            if !matched {
+                thread::sleep(Duration::from_millis(50));
+            }
+            matched
+        });
+
+        assert!(
+            detected,
+            "IPv6 で待ち受ける TCP ポート {} を find_by_port が検出できるべき",
+            port
+        );
+
+        assert!(
+            detector.pid_holds_port(current_pid, port, PortProtocol::Tcp),
+            "IPv6 リスナーでも kill 直前のポート保持再検証を通過できるべき"
+        );
+
+        drop(listener);
+    }
+
+    #[test]
     fn test_pid_holds_port_rejects_released_tcp_listener() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
         let port = listener.local_addr().unwrap().port();

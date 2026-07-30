@@ -290,6 +290,31 @@ mod tests {
     }
 
     #[test]
+    fn test_truncate_after_sanitize_never_emits_raw_escape() {
+        // `print_killable_list` は `truncate(&sanitize_terminal(&cmd), 30)` の順で処理する。
+        // 逆順（truncate → sanitize）だと escape sequence の途中で切られた断片が
+        // そのまま端末へ流れ、端末状態が壊れたまま残る。長い argv を持つプロセスでも
+        // ESC が生で残らないこと、切り詰め後も文字数上限を守ることを固定する。
+        // 既存テストは truncate と sanitize_terminal を個別にしか検証していなかった。
+        let hostile_cmd = format!("node {}--inspect", "\x1b[2J\u{202E}".repeat(10));
+        let displayed = truncate(&sanitize_terminal(&hostile_cmd), 30);
+
+        assert!(
+            !displayed.contains('\x1b'),
+            "切り詰め後も生の ESC が残ってはいけない: {displayed}"
+        );
+        assert!(
+            !displayed.contains('\u{202E}'),
+            "切り詰め後も双方向制御文字が残ってはいけない: {displayed}"
+        );
+        assert!(
+            displayed.chars().count() <= 30,
+            "表示幅の上限を超えてはいけない: {}",
+            displayed.chars().count()
+        );
+    }
+
+    #[test]
     fn test_truncate_small_limit_without_ellipsis() {
         let result = truncate("abcdef", 2);
         assert_eq!(result, "ab");
