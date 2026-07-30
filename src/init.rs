@@ -17,9 +17,19 @@ use crate::terminal::sanitize_path;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitOutcome {
     /// 設定ファイルを新規生成（または `--force` で上書き）した
-    Created(PathBuf),
+    Created {
+        /// 設定ファイルの論理パス（`~/.config/safe-kill/config.toml`）
+        config_path: PathBuf,
+        /// 実際に書き込んだパス。`config_path` が symlink の場合はその実体
+        written_path: PathBuf,
+    },
     /// 既存ファイルがあり、ユーザーが上書きを拒否したため変更しなかった
-    SkippedExisting(PathBuf),
+    SkippedExisting {
+        /// 設定ファイルの論理パス
+        config_path: PathBuf,
+        /// 上書きしていたら書き込まれていたパス（symlink なら実体）
+        target_path: PathBuf,
+    },
 }
 
 /// 設定ファイル生成のための init コマンド
@@ -44,11 +54,43 @@ impl InitCommand {
             SafeKillError::ConfigCreationError("Unable to determine config path".to_string())
         })?;
 
+        // 既存エントリの有無は `symlink_metadata` で判定する。
+        // `Path::exists()` は symlink を追従するため、リンク先が存在しない「壊れた
+        // symlink」を「存在しない」と誤判定し、上書き確認を一切出さないままリンク先の
+        // パスへ新規ファイルを作ってしまう。
+        let existing = fs::symlink_metadata(&config_path);
+        let is_symlink = existing
+            .as_ref()
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+
+        // 実際に書き込むパスを決める。
+        // `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml` のように
+        // dotfiles 管理で symlink にする運用は正当なので追従自体は許すが、
+        // 「config.toml を作成した」と表示しながら別ファイルを破壊するのを避けるため、
+        // 実体パスを解決して利用者へ開示する。解決できない（リンク先が存在しない）
+        // 場合は、意図しないパスへファイルを新規作成してしまうため fail-closed で拒否する。
+        let write_target = if is_symlink {
+            fs::canonicalize(&config_path).map_err(|e| {
+                SafeKillError::ConfigCreationError(format!(
+                    "Config path {} is a symlink whose target cannot be resolved ({}). \
+                     Fix or remove the symlink and retry.",
+                    config_path.display(),
+                    e
+                ))
+            })?
+        } else {
+            config_path.clone()
+        };
+
         // 既存ファイルがあり force でない場合は上書き確認する。
         // ユーザーが拒否した場合は作成失敗ではなく「正常なスキップ」（no-op）として扱い、
         // 終了コード 0 で正常終了させる。
-        if config_path.exists() && !force && !Self::confirm_overwrite(&config_path)? {
-            return Ok(InitOutcome::SkippedExisting(config_path));
+        if existing.is_ok() && !force && !Self::confirm_overwrite(&config_path, &write_target)? {
+            return Ok(InitOutcome::SkippedExisting {
+                config_path,
+                target_path: write_target,
+            });
         }
 
         // ディレクトリが存在しない場合は作成
@@ -62,15 +104,18 @@ impl InitCommand {
 
         // 設定ファイルを書き込み
         let content = Self::default_config_content();
-        fs::write(&config_path, content).map_err(|e| {
+        fs::write(&write_target, content).map_err(|e| {
             SafeKillError::ConfigCreationError(format!(
                 "Failed to write config file {}: {}",
-                config_path.display(),
+                write_target.display(),
                 e
             ))
         })?;
 
-        Ok(InitOutcome::Created(config_path))
+        Ok(InitOutcome::Created {
+            config_path,
+            written_path: write_target,
+        })
     }
 
     /// コメント付きのデフォルト設定内容を生成
@@ -102,11 +147,23 @@ ports = ["1420", "3000-3010", "5173", "8080"]
     }
 
     /// 既存ファイルの上書き確認をユーザーに求める
-    fn confirm_overwrite(path: &Path) -> Result<bool, SafeKillError> {
-        eprint!(
-            "Config file already exists at {}. Overwrite? [y/N]: ",
-            sanitize_path(path)
-        );
+    ///
+    /// `path` が symlink で `write_target` がその実体のとき、両方を提示する。
+    /// symlink のパスだけを見せて同意を取ると、利用者は「config.toml が上書きされる」と
+    /// 理解したまま、実際にはまったく別のファイルが破壊される。
+    fn confirm_overwrite(path: &Path, write_target: &Path) -> Result<bool, SafeKillError> {
+        if write_target != path {
+            eprint!(
+                "Config file already exists at {} (symlink to {}). Overwrite the symlink target? [y/N]: ",
+                sanitize_path(path),
+                sanitize_path(write_target)
+            );
+        } else {
+            eprint!(
+                "Config file already exists at {}. Overwrite? [y/N]: ",
+                sanitize_path(path)
+            );
+        }
         io::stderr().flush().map_err(|e| {
             SafeKillError::ConfigCreationError(format!("Failed to flush stderr: {}", e))
         })?;

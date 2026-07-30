@@ -908,6 +908,83 @@ fn test_init_cancel_preserves_existing_config() {
 }
 
 #[test]
+#[cfg(unix)]
+fn test_init_force_through_symlink_reports_the_real_written_path() {
+    use std::fs;
+
+    // `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml` は dotfiles 管理の
+    // 正当な運用なので追従自体は許す。ただし以前は `Created: .../config.toml` と表示
+    // しながら実際にはリンク先を破壊しており、どのファイルを書き換えたのか利用者に
+    // 伝わらなかった。実体パスを開示することを固定する。
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    let dotfiles = temp.path().join("dotfiles");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::create_dir_all(&dotfiles).unwrap();
+
+    let real_config = dotfiles.join("safe-kill.toml");
+    fs::write(&real_config, "# managed by dotfiles\n").unwrap();
+    let config_path = config_dir.join("config.toml");
+    std::os::unix::fs::symlink(&real_config, &config_path).unwrap();
+
+    Command::cargo_bin("safe-kill")
+        .unwrap()
+        .env("HOME", temp.path())
+        .args(["init", "--force"])
+        .assert()
+        .code(0)
+        .stdout(predicate::str::contains("via symlink"))
+        .stdout(predicate::str::contains("safe-kill.toml"));
+
+    // リンク先が実際に更新され、symlink 自体は symlink のまま残っていること。
+    let written = fs::read_to_string(&real_config).unwrap();
+    assert!(
+        written.contains("[allowed_ports]"),
+        "symlink のリンク先が設定内容で更新されるべき"
+    );
+    assert!(
+        fs::symlink_metadata(&config_path)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "config.toml は symlink のまま維持されるべき"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn test_init_rejects_dangling_symlink_instead_of_creating_target() {
+    use std::fs;
+
+    // 壊れた symlink では `Path::exists()` が false を返すため、以前は上書き確認を
+    // 一切出さないままリンク先のパスへファイルを新規作成していた（--force でも同様）。
+    // 意図しないパスへの書き込みなので fail-closed で拒否することを固定する。
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let missing_target = temp.path().join("nonexistent-target.toml");
+    let config_path = config_dir.join("config.toml");
+    std::os::unix::fs::symlink(&missing_target, &config_path).unwrap();
+
+    for extra in [vec!["init"], vec!["init", "--force"]] {
+        Command::cargo_bin("safe-kill")
+            .unwrap()
+            .env("HOME", temp.path())
+            .args(&extra)
+            .write_stdin("y\n")
+            .assert()
+            .code(3) // ConfigError
+            .stderr(predicate::str::contains("symlink"));
+
+        assert!(
+            !missing_target.exists(),
+            "壊れた symlink のリンク先を勝手に作ってはいけない ({extra:?})"
+        );
+    }
+}
+
+#[test]
 fn test_init_overwrite_yes() {
     use std::fs;
 

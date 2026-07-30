@@ -83,20 +83,45 @@ fn run() -> Result<(), SafeKillError> {
         }
         ExecutionMode::InitConfig { force } => {
             match InitCommand::execute(force)? {
-                InitOutcome::Created(path) => {
-                    println!("Created: {}", sanitize_path(&path));
+                InitOutcome::Created {
+                    config_path,
+                    written_path,
+                } => {
+                    // config.toml が symlink のときは実際に書き込んだ実体パスも示す。
+                    // 「Created: .../config.toml」とだけ表示すると、dotfiles 等の
+                    // リンク先ファイルを上書きした事実が利用者に伝わらない。
+                    if written_path == config_path {
+                        println!("Created: {}", sanitize_path(&written_path));
+                    } else {
+                        println!(
+                            "Created: {} (written via symlink {})",
+                            sanitize_path(&written_path),
+                            sanitize_path(&config_path)
+                        );
+                    }
                     println!();
                     println!(
                         "Hint: Edit the config file to customize allowed ports and process lists."
                     );
                     println!("      Then use `safe-kill --port <PORT>` to kill processes by port.");
                 }
-                InitOutcome::SkippedExisting(path) => {
+                InitOutcome::SkippedExisting {
+                    config_path,
+                    target_path,
+                } => {
                     // ユーザーが上書きを拒否した場合は正常な no-op として扱う（終了コード 0）。
-                    eprintln!(
-                        "Skipped. Existing config left unchanged: {}",
-                        sanitize_path(&path)
-                    );
+                    if target_path == config_path {
+                        eprintln!(
+                            "Skipped. Existing config left unchanged: {}",
+                            sanitize_path(&config_path)
+                        );
+                    } else {
+                        eprintln!(
+                            "Skipped. Existing config left unchanged: {} (symlink to {})",
+                            sanitize_path(&config_path),
+                            sanitize_path(&target_path)
+                        );
+                    }
                 }
             }
             Ok(())

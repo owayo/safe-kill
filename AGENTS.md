@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 411 + bin 34 + E2E 85 + integration 78)
+make test               # 全テスト実行 (lib 415 + bin 35 + E2E 89 + integration 78)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -50,6 +50,8 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 10. **ポート保持の再検証**: `--port` 指定 kill では、判定～kill の間に対象 PID が当該ポートを離していないかを再取得した保持者集合と照合する。離していれば `NoProcessOnPort` として fail-closed する（既に意図したサービスは停止しているため余計な kill を抑止する）
 11. **表示時の端末制御文字サニタイズ**: `--list` / kill 結果表示 / エラー出力（stderr の `safe-kill: ...`）/ `safe-kill init` のパス表示 / 設定読み込み警告の各経路で、OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）・改行・タブ・その他制御文字・Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`KillResult::failure` の `message` には `NotDescendant(pid, name)` や `Denylisted(name)` のようにプロセス名を含むエラー文字列が保持されるため、`name` だけでなく `message` 側もサニタイズする。stderr へ流れる `SafeKillError` の Display 結果（プロセス名を含むことがある）も `e.to_string()` を介して同様にサニタイズしてから表示する。攻撃者が任意の引数やパスで表示行を上書きする偽装、双方向制御文字による表示順偽装、端末状態の改ざんを防ぐ。サニタイズは `truncate` より前に行い、escape sequence の途中で切られて端末状態が残ることも防ぐ。エスケープ導入文字である `\` 自身も `\\` に置き換える（これを省くと変換が非単射になり、実際に ESC を含むプロセス名と、リテラルで `\x1B[2J` という名前を持つ別プロセスの表示が完全に一致してしまい、どちらが本当に制御文字を含むのか読み手が判別できなくなる）
 
+12. **スレッド（TID）除外による denylist バイパス防止**: `sysinfo` の `refresh_processes` は既定で `with_tasks()` を含み、Linux では `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る（sysinfo 側のコメントも "tasks are considered processes on their own in linux"）。スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の `comm` を自由に変更でき、しかも TID への `kill(2)` はスレッドグループ全体へ配送される。そのため放置すると、denylist に載せたプロセスでも「そのスレッド名」を `--name` に指定すれば名前一致を回避して本体を落とせてしまう。`ProcessInfoProvider` は `without_tasks()` を明示した refresh のみを行い、さらに `ProcessesToUpdate::Some` 指定では tasks 設定に関わらず TID が返るため、参照側でも `thread_kind().is_none()` で一律に弾く（macOS の `proc_listallpids` はプロセスのみ返すため影響なし）
+
 ### Port-based killing の特殊性
 
 `--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。ポート `0` は OS の自動割り当て用の特殊値なので、設定に含まれていても常に拒否する。信頼ルート PID 自体はポート指定でも保護する。TCP は LISTEN 状態のソケットのみ対象にし、ESTABLISHED などの接続済みクライアントソケットは対象外。UDP は状態を持たないためローカルポート一致で対象にする。プロセス名解決に失敗した PID は `pid:<pid>` 形式のプレースホルダ名でフォールバックされるが、この名前はあくまで表示用であり、ポリシー判定は fresh なプロセス情報が取れない時点で `ProcessNotFound` として fail-closed する（denylist のバイパス防止）。さらに kill 直前に対象ポートの保持者集合を再取得し、判定時の PID/プロトコルが含まれなければ `NoProcessOnPort` として fail-closed する（判定～kill 間にポートを離した場合の追加防御）。
@@ -65,8 +67,8 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流。フォールバック読み込み時の警告は設定パスとエラー本文をサニタイズしてから表示する |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
-| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は PID 0 と `i32::MAX` 超過を拒否した上で新しい `System` を作り、指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化 |
-| `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う。確認プロンプトの設定パスはサニタイズ済みで表示する |
+| `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は PID 0 と `i32::MAX` 超過を拒否した上で新しい `System` を作り、指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化。refresh は `refresh_kind()`（`without_tasks()` 指定）で行い、Linux のスレッド（TID）を一覧に入れない（下記「スレッド経由の denylist バイパス防止」参照）。参照側（`get` / `find_by_name` / `all` / `fetch_fresh`）でも `thread_kind().is_none()` で二重に弾く |
+| `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う。確認プロンプトの設定パスはサニタイズ済みで表示する。既存判定は `Path::exists()` ではなく `fs::symlink_metadata()` で行い、symlink の場合は `canonicalize()` で実体を解決してプロンプトと結果表示の両方に開示する。壊れた symlink（リンク先が存在しない）は意図しないパスへの新規作成になるため fail-closed で拒否する（`--force` でも同様） |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 | `terminal.rs` | 端末表示用サニタイズ。ANSI escape・改行・タブ・C0/C1 制御文字・Unicode 17.0 の `Cf` 全 170 文字を表示用エスケープへ置換し、プロセス情報・エラー本文・設定パスの表示偽装を防ぐ。エスケープ導入文字 `\` 自身も `\\` へ置換して変換の単射性を保つ |
 | `main.rs` | CLI のエントリポイント。実行モードごとの分岐、終了コード変換、表示出力を担う。`terminal.rs` のサニタイズを使い、`--list` 出力、kill 結果表示（`print_kill_result` の `name` と `message` の両方）、`main()` での stderr エラー出力、`safe-kill init` の生成/スキップパス表示にサニタイズ済み文字列のみを流す |

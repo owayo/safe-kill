@@ -2,7 +2,7 @@
 //!
 //! クロスプラットフォームなプロセス情報取得を提供する。
 
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 /// 単一プロセスの情報
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,16 +38,50 @@ pub struct ProcessInfoProvider {
 }
 
 impl ProcessInfoProvider {
+    /// safe-kill が必要とする情報だけを取得する refresh 指定
+    ///
+    /// `System::refresh_processes` の既定値は `with_tasks()` を含むため、Linux では
+    /// `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る
+    /// （sysinfo 側のコメントも "tasks are considered processes on their own in linux"）。
+    /// スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の comm を自由に
+    /// 変更できるので、これを許すと denylist に載せたプロセスでも「スレッド名」を
+    /// 指定すれば名前一致を回避でき、しかも TID への `kill(2)` はスレッドグループ全体へ
+    /// 配送されるため、denylist を迂回して本体を落とせてしまう。
+    /// `without_tasks()` を明示してスレッドを一覧から除外する。
+    ///
+    /// あわせて memory / cpu / disk_usage は取得しない（safe-kill はどれも参照しない）。
+    /// `cmd` は `--list` の COMMAND 列で使うため明示的に取得する。
+    fn refresh_kind() -> ProcessRefreshKind {
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .without_tasks()
+    }
+
     /// プロセスリストを更新済みの新しい ProcessInfoProvider を作成
     pub fn new() -> Self {
-        let mut system = System::new_all();
-        system.refresh_processes(ProcessesToUpdate::All, true);
+        // `System::new_all()` は内部で tasks 付きの refresh を行うため使わない。
+        // 空の System から `without_tasks()` の refresh だけを行い、スレッドを
+        // 一度もスナップショットへ入れない。
+        let mut system = System::new();
+        system.refresh_processes_specifics(ProcessesToUpdate::All, true, Self::refresh_kind());
         Self { system }
     }
 
     /// プロセスリストを更新
     pub fn refresh(&mut self) {
-        self.system.refresh_processes(ProcessesToUpdate::All, true);
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, Self::refresh_kind());
+    }
+
+    /// スレッド（Linux の TID エントリ）でない実プロセスかを判定する
+    ///
+    /// `thread_kind()` は実プロセスなら `None`、スレッドなら `Some(_)` を返す。
+    /// `refresh_kind()` の `without_tasks()` で一覧には入らないはずだが、
+    /// `ProcessesToUpdate::Some` 指定の取得経路（`fetch_fresh`）は tasks 指定に
+    /// 関わらず TID を返すため、参照側でも一律に fail-closed で弾く。
+    fn is_real_process(proc: &sysinfo::Process) -> bool {
+        proc.thread_kind().is_none()
     }
 
     /// `sysinfo::Process` から `ProcessInfo` を構築する内部ヘルパー
@@ -70,6 +104,7 @@ impl ProcessInfoProvider {
         let sysinfo_pid = Pid::from_u32(pid);
         self.system
             .process(sysinfo_pid)
+            .filter(|proc| Self::is_real_process(proc))
             .map(|proc| Self::build_info(pid, proc))
     }
 
@@ -90,8 +125,15 @@ impl ProcessInfoProvider {
 
         let mut sys = System::new();
         let sysinfo_pid = Pid::from_u32(pid);
-        sys.refresh_processes(ProcessesToUpdate::Some(&[sysinfo_pid]), true);
+        sys.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[sysinfo_pid]),
+            true,
+            Self::refresh_kind(),
+        );
+        // `ProcessesToUpdate::Some` は tasks 指定に関わらず TID を返すため、
+        // ここでスレッドを弾かないと kill 直前の同一性検証をスレッドが通過してしまう。
         sys.process(sysinfo_pid)
+            .filter(|proc| Self::is_real_process(proc))
             .map(|proc| Self::build_info(pid, proc))
     }
 
@@ -101,6 +143,7 @@ impl ProcessInfoProvider {
             .system
             .processes()
             .iter()
+            .filter(|(_, proc)| Self::is_real_process(proc))
             .filter(|(_, proc)| proc.name().to_string_lossy() == name)
             .map(|(pid, proc)| Self::build_info(pid.as_u32(), proc))
             .collect();
@@ -116,6 +159,7 @@ impl ProcessInfoProvider {
             .system
             .processes()
             .iter()
+            .filter(|(_, proc)| Self::is_real_process(proc))
             .map(|(pid, proc)| Self::build_info(pid.as_u32(), proc))
             .collect();
 
@@ -644,6 +688,66 @@ mod tests {
         assert!(
             a.is_same_process(&b),
             "parent_pid と cmd の差異は同一性判定に影響しないべき"
+        );
+    }
+
+    #[test]
+    fn test_all_excludes_threads_of_current_process() {
+        // sysinfo の既定 refresh は `with_tasks()` を含み、Linux では
+        // `/proc/<pid>/task/<tid>` のスレッドが「親 = 自 PID の別プロセス」として
+        // 一覧に現れる。スレッドは自分の comm を自由に変えられるうえ、TID への
+        // kill(2) はスレッドグループ全体へ配送されるため、これを一覧に含めると
+        // denylist をスレッド名で迂回できてしまう。
+        //
+        // テストプロセス自身は子プロセスを生成しないので、「親が自 PID のエントリ」が
+        // 存在すればそれはスレッドの混入を意味する。複数スレッドを生存させたまま
+        // 検証することで、Linux CI で tasks 混入の回帰を検出する
+        // （macOS ではスレッドがそもそも列挙されないため常に空になる）。
+        use std::sync::mpsc;
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (stop_tx, stop_rx) = mpsc::channel::<()>();
+        let stop_rx = std::sync::Arc::new(std::sync::Mutex::new(stop_rx));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let ready_tx = ready_tx.clone();
+                let stop_rx = std::sync::Arc::clone(&stop_rx);
+                std::thread::spawn(move || {
+                    ready_tx.send(()).ok();
+                    // 検証が終わるまでスレッドを生かしておく。
+                    let _ = stop_rx.lock().unwrap().recv();
+                })
+            })
+            .collect();
+        drop(ready_tx);
+        for _ in 0..4 {
+            ready_rx.recv().expect("スレッドの起動を待てるべき");
+        }
+
+        let current = ProcessInfoProvider::current_pid();
+        let provider = ProcessInfoProvider::new();
+        let leaked_threads: Vec<_> = provider
+            .all()
+            .into_iter()
+            .filter(|p| p.parent_pid == Some(current) && p.pid != current)
+            .collect();
+
+        // スレッドを解放してから assert する（失敗時もハングしないように）。
+        drop(stop_tx);
+        for handle in handles {
+            handle.join().ok();
+        }
+
+        assert!(
+            leaked_threads.is_empty(),
+            "自プロセスのスレッドが独立したプロセスとして一覧に混入している: {leaked_threads:?}"
+        );
+
+        // 自プロセス自身は当然一覧に載る（フィルタが効きすぎていないことの確認）。
+        assert!(
+            provider.all().iter().any(|p| p.pid == current),
+            "自プロセスは一覧に含まれるべき"
         );
     }
 }

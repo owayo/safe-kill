@@ -90,6 +90,8 @@ safe-kill init [--force]
 
 If the config file already exists, `init` prompts for confirmation before overwriting (use `--force` to skip the prompt). Declining the prompt leaves the existing file unchanged and exits successfully (code 0); only an actual write failure is reported as a configuration error (code 3).
 
+Symlinked config files (the common dotfiles pattern, `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml`) keep working: `init` follows the link and updates the real file, leaving the symlink intact. Because the file it rewrites is *not* the path you typed, both the confirmation prompt and the success line disclose the resolved target. A **dangling** symlink is refused outright (code 3, even with `--force`) rather than silently creating a file at the link target.
+
 ### Options
 
 | Option | Short | Description |
@@ -210,6 +212,8 @@ flowchart TB
 9. **Pre-kill Ancestry Re-check**: For PID/name kills authorized via ancestry (`KillPermission::Allowed`), the descendant check is re-run with a fresh `ProcessInfoProvider` snapshot right before `kill(2)`. This catches a target that was re-parented out of the trust root between the policy decision and signal dispatch, failing closed with `NotDescendant`. Allowlist (`AllowedByAllowlist`) and `--port` kills intentionally bypass ancestry by design, so the re-check is skipped for them.
 10. **Port Hold Re-check (port mode only)**: For `--port` kills, the set of current holders of the target port is re-queried just before signaling. If the candidate PID/protocol is no longer present in that set (the target released the port between policy decision and `kill(2)`), the kill fails closed with `NoProcessOnPort`. This avoids killing a now-unrelated workload that happens to share the same PID after the user's intent (releasing the port) has already been satisfied.
 11. **Terminal Output Sanitization**: Process names, command-line arguments, error message bodies, and config paths are escaped (`\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`) before they reach the terminal, including all 170 Unicode 17.0 general-category `Cf` format controls. This applies to `--list`, kill result lines (both the `name` column and the `message` column, since `KillResult::failure` stores `error.to_string()` which can embed the offending process name via `NotDescendant(pid, name)` / `Denylisted(name)`), the stderr error line emitted by `main()` (`safe-kill: ...`), `safe-kill init` created/skipped path output, overwrite prompts, and config-load warnings. Crafted argv or paths containing ANSI escape sequences, OSC sequences, newlines, or bidirectional Unicode controls cannot rewrite, hide, or visually reorder rows of output, and escape sequences cannot be cut mid-byte by the column-width truncation logic. The escape introducer `\` is itself escaped to `\\`, which keeps the transformation injective — without it, a process genuinely containing an ESC byte and a process literally named `\x1B[2J` would render identically, so a reader could not tell which one actually carries a control character.
+
+12. **Thread (TID) Exclusion**: `sysinfo` enumerates process tasks by default, so on Linux every `/proc/<pid>/task/<tid>` thread would show up as a process in its own right. Threads can rename themselves freely via `prctl(PR_SET_NAME)` / `pthread_setname_np`, and `kill(2)` on a TID is delivered to the whole thread group — so without this guard, a denylisted process could be taken down by passing one of *its threads'* names to `--name`, sidestepping the denylist entirely. The process snapshot is refreshed with `without_tasks()`, and because `ProcessesToUpdate::Some` returns a TID regardless of that setting, every read path additionally rejects entries with `thread_kind().is_some()`. macOS is unaffected (`proc_listallpids` returns processes only).
 
 ### Process Tree and Killable Scope
 
@@ -351,10 +355,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 409 tests covering all modules
-- **Binary Unit Tests**: 34 tests for CLI output utilities, error sanitization, and version checks
+- **Library Unit Tests**: 415 tests covering all modules
+- **Binary Unit Tests**: 35 tests for CLI output utilities, error sanitization, and version checks
 - **Integration Tests**: 78 tests with real process trees
-- **E2E Tests**: 85 tests for CLI behavior
+- **E2E Tests**: 89 tests for CLI behavior
 
 ## Contributing
 
