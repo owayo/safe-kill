@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 
-use crate::error::SafeKillError;
+use crate::error::{SafeKillError, SafeKillExitCode};
 use crate::signal::{Signal, SignalSender};
 
 /// CLI 引数から決定される実行モード
@@ -76,8 +76,32 @@ pub struct CliArgs {
 
 impl CliArgs {
     /// コマンドラインから CLI 引数を解析
+    ///
+    /// clap 既定の `parse()` は使用方法エラーで自前に `exit(2)` する。しかし終了コード 2 は
+    /// `SafeKillExitCode::PermissionDenied` に割り当て済みで、README の終了コード表でも
+    /// 「権限不足」として公開している。そのままだと `safe-kill --bogus` のような単なる
+    /// typo が権限エラーと同じコードになり、終了コードで分岐する呼び出し側（AI エージェント
+    /// のスクリプト等）が誤判定する。
+    ///
+    /// 同じ「使用方法エラー」でも `validate()` 側が返す `InvalidUsage` は 255 になるため、
+    /// 内部的にも不整合だった（例: `safe-kill 0` は 255、`safe-kill 99999999999` は 2）。
+    /// clap 由来のエラーも `GeneralError`(255) に揃える。`--help` / `--version` は
+    /// エラーではないので従来どおり 0 で終了する。
     pub fn parse_args() -> Self {
-        Self::parse()
+        match Self::try_parse() {
+            Ok(args) => args,
+            Err(e) => {
+                // clap の `Error::print()` は use_stderr() に従って出力先を選ぶ
+                // （エラーは stderr、--help / --version は stdout）。
+                let _ = e.print();
+                let code = if e.use_stderr() {
+                    SafeKillExitCode::GeneralError as u8
+                } else {
+                    SafeKillExitCode::Success as u8
+                };
+                std::process::exit(i32::from(code));
+            }
+        }
     }
 
     /// 引数を検証し、実行モードを決定する

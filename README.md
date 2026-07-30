@@ -209,7 +209,7 @@ flowchart TB
 8. **PID Reuse Detection (TOCTOU mitigation)**: Re-validates `pid + start_time + name` immediately before `kill(2)`. If the OS has reused the PID for another process between policy decision and signal dispatch, the kill fails closed with `ProcessNotFound`. The `start_time` granularity is seconds, so reuse to a same-named process within the same second cannot be detected (extremely rare in practice). Full coverage would require Linux `pidfd_open` + `pidfd_send_signal`.
 9. **Pre-kill Ancestry Re-check**: For PID/name kills authorized via ancestry (`KillPermission::Allowed`), the descendant check is re-run with a fresh `ProcessInfoProvider` snapshot right before `kill(2)`. This catches a target that was re-parented out of the trust root between the policy decision and signal dispatch, failing closed with `NotDescendant`. Allowlist (`AllowedByAllowlist`) and `--port` kills intentionally bypass ancestry by design, so the re-check is skipped for them.
 10. **Port Hold Re-check (port mode only)**: For `--port` kills, the set of current holders of the target port is re-queried just before signaling. If the candidate PID/protocol is no longer present in that set (the target released the port between policy decision and `kill(2)`), the kill fails closed with `NoProcessOnPort`. This avoids killing a now-unrelated workload that happens to share the same PID after the user's intent (releasing the port) has already been satisfied.
-11. **Terminal Output Sanitization**: Process names, command-line arguments, error message bodies, and config paths are escaped (`\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`) before they reach the terminal, including all 170 Unicode 17.0 general-category `Cf` format controls. This applies to `--list`, kill result lines (both the `name` column and the `message` column, since `KillResult::failure` stores `error.to_string()` which can embed the offending process name via `NotDescendant(pid, name)` / `Denylisted(name)`), the stderr error line emitted by `main()` (`safe-kill: ...`), `safe-kill init` created/skipped path output, overwrite prompts, and config-load warnings. Crafted argv or paths containing ANSI escape sequences, OSC sequences, newlines, or bidirectional Unicode controls cannot rewrite, hide, or visually reorder rows of output, and escape sequences cannot be cut mid-byte by the column-width truncation logic.
+11. **Terminal Output Sanitization**: Process names, command-line arguments, error message bodies, and config paths are escaped (`\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`) before they reach the terminal, including all 170 Unicode 17.0 general-category `Cf` format controls. This applies to `--list`, kill result lines (both the `name` column and the `message` column, since `KillResult::failure` stores `error.to_string()` which can embed the offending process name via `NotDescendant(pid, name)` / `Denylisted(name)`), the stderr error line emitted by `main()` (`safe-kill: ...`), `safe-kill init` created/skipped path output, overwrite prompts, and config-load warnings. Crafted argv or paths containing ANSI escape sequences, OSC sequences, newlines, or bidirectional Unicode controls cannot rewrite, hide, or visually reorder rows of output, and escape sequences cannot be cut mid-byte by the column-width truncation logic. The escape introducer `\` is itself escaped to `\\`, which keeps the transformation injective — without it, a process genuinely containing an ESC byte and a process literally named `\x1B[2J` would render identically, so a reader could not tell which one actually carries a control character.
 
 ### Process Tree and Killable Scope
 
@@ -276,7 +276,12 @@ flowchart TB
 | 2 | Permission denied |
 | 3 | Configuration error |
 | 4 | Port not allowed |
-| 255 | General error (invalid signal/port, suicide attempt, etc.) |
+| 255 | General error (invalid signal/port, suicide attempt, and all CLI usage errors) |
+
+CLI usage errors — unknown flags, malformed option values, an out-of-range PID, and conflicting
+targets such as `--list --port 3000` — all exit with **255**, never 2. Exit code 2 means *only*
+"permission denied", so a caller can branch on it without mistaking a typo for a real permission
+failure. `--help` and `--version` exit 0.
 
 ## Environment Variables
 

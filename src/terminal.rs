@@ -14,6 +14,11 @@ pub fn sanitize_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
+            // バックスラッシュ自身をエスケープしないと、エスケープ表記が非単射になる。
+            // 例: 実 ESC を含む "worker\x1b[2J" と、リテラル 6 文字 "\x1B[2J" を
+            // 名前に持つ別プロセスの表示が完全に一致してしまい、どちらが本当に
+            // 制御文字を含むのか読み手が判別できない（表示の偽造が成立する）。
+            '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -225,6 +230,27 @@ mod tests {
         }
 
         assert_eq!(tested, 170);
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_backslash_to_stay_injective() {
+        // エスケープ導入文字である `\` 自身をエスケープしないと変換が非単射になり、
+        // 「実際に制御文字を含むプロセス名」と「リテラルのエスケープ文字列を名前に
+        // 持つプロセス名」の表示が区別できなくなる（表示の偽造）。
+        assert_eq!(sanitize_terminal(r"C:\tmp"), r"C:\\tmp");
+
+        // 実 ESC を含む入力と、その表示表記をリテラルで持つ入力が衝突しないこと。
+        let real_escape = sanitize_terminal("worker\u{1b}[2Jgone");
+        let literal_text = sanitize_terminal(r"worker\x1B[2Jgone");
+        assert_eq!(real_escape, r"worker\x1B[2Jgone");
+        assert_eq!(literal_text, r"worker\\x1B[2Jgone");
+        assert_ne!(
+            real_escape, literal_text,
+            "実制御文字とリテラル表記の表示が衝突してはいけない"
+        );
+
+        // 改行についても同様に衝突しないこと。
+        assert_ne!(sanitize_terminal("a\nb"), sanitize_terminal(r"a\nb"));
     }
 
     #[test]

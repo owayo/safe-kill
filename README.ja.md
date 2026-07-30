@@ -209,7 +209,7 @@ flowchart TB
 8. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、`kill(2)` 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` で fail-closed する。`start_time` は秒精度のため、同一秒内に同名プロセスへ再利用されたケースは検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要
 9. **kill 直前の親子関係再評価**: PID/名前指定で `KillPermission::Allowed`（親子関係経由）で許可されたプロセスは、`kill(2)` 直前に新しい `ProcessInfoProvider` snapshot で子孫判定をやり直す。判定～kill の間に対象が再ペアレントされて信頼ルート外に出ていた場合は `NotDescendant` として fail-closed する。`AllowedByAllowlist`（許可リストは設計上親子関係をバイパス）と `--port` 指定は再評価をバイパスする
 10. **ポート保持の再検証 (`--port` 指定時)**: `kill(2)` 直前に対象ポートの保持者集合を再取得し、判定時の対象 PID/プロトコルが含まれなければ `NoProcessOnPort` で fail-closed する。判定～kill の間に対象がポートを離した場合、ユーザーの「ポートを解放したい」意図は既に達成されているため、余計なシグナル送信を抑止する
-11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、C0/C1 制御文字、Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力、`safe-kill init` の作成/スキップ/上書き確認パス、設定読み込み警告のすべてでサニタイズ済みの文字列のみが端末へ流れる。kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぎ、双方向制御文字による表示順偽装も防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない
+11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、C0/C1 制御文字、Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力、`safe-kill init` の作成/スキップ/上書き確認パス、設定読み込み警告のすべてでサニタイズ済みの文字列のみが端末へ流れる。kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぎ、双方向制御文字による表示順偽装も防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない。エスケープ導入文字 `\` 自身も `\\` に置換して変換の単射性を保つ（これを省くと、実際に ESC を含むプロセスと、リテラルで `\x1B[2J` という名前を持つプロセスの表示が一致してしまい、どちらが本当に制御文字を含むのか判別できなくなる）
 
 ### プロセスツリーと終了可能範囲
 
@@ -276,7 +276,12 @@ flowchart TB
 | 2 | 権限エラー |
 | 3 | 設定エラー |
 | 4 | ポート不許可 |
-| 255 | 一般エラー（無効なシグナル・ポート、自己破壊試行など） |
+| 255 | 一般エラー（無効なシグナル・ポート、自己破壊試行、および CLI 使用方法エラー全般） |
+
+CLI の使用方法エラー（未知のフラグ、オプション値の形式エラー、範囲外の PID、
+`--list --port 3000` のようなターゲット指定の競合）はすべて **255** で終了し、2 にはならない。
+終了コード 2 は「権限エラー」専用のため、呼び出し側は typo を権限エラーと取り違えずに分岐できる。
+`--help` / `--version` は 0 で終了する。
 
 ## 環境変数
 

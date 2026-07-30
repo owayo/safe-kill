@@ -188,6 +188,39 @@ fn test_exit_code_invalid_signal() {
 }
 
 #[test]
+fn test_exit_code_clap_usage_errors_are_general_error_not_permission_denied() {
+    // 終了コード 2 は SafeKillExitCode::PermissionDenied（README の終了コード表でも
+    // 「権限不足」）に割り当て済み。clap 既定の exit(2) をそのまま使うと、単なる typo や
+    // 値の形式エラーが権限エラーと同じコードになり、終了コードで分岐する呼び出し側が
+    // 誤判定する。validate() 側の InvalidUsage と同じ 255 に揃っていることを固定する。
+    for args in [
+        vec!["--bogus"],       // 未知のフラグ
+        vec!["--port", "abc"], // 値の形式エラー
+        vec!["99999999999"],   // PID が u32 の範囲外（clap のレンジ検査）
+        vec!["--name"],        // 値が欠落
+    ] {
+        let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+        cmd.args(&args)
+            .assert()
+            .code(255)
+            .stderr(predicate::str::contains("error:"));
+    }
+}
+
+#[test]
+fn test_exit_code_help_and_version_stay_success() {
+    // clap のエラー経路を自前で処理するようにしたため、--help / --version が
+    // エラー扱い（255）へ回帰していないことを固定する。どちらも stdout へ出す。
+    for arg in ["--help", "--version"] {
+        let mut cmd = Command::cargo_bin("safe-kill").unwrap();
+        cmd.arg(arg)
+            .assert()
+            .code(0)
+            .stdout(predicate::str::contains("safe-kill"));
+    }
+}
+
+#[test]
 fn test_exit_code_suicide_prevention() {
     let current_pid = std::process::id();
     let mut cmd = Command::cargo_bin("safe-kill").unwrap();
