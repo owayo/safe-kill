@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 415 + bin 35 + E2E 89 + integration 78)
+make test               # 全テスト実行 (lib 419 + bin 35 + E2E 89 + integration 78)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -52,6 +52,8 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 
 12. **スレッド（TID）除外による denylist バイパス防止**: `sysinfo` の `refresh_processes` は既定で `with_tasks()` を含み、Linux では `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る（sysinfo 側のコメントも "tasks are considered processes on their own in linux"）。スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の `comm` を自由に変更でき、しかも TID への `kill(2)` はスレッドグループ全体へ配送される。そのため放置すると、denylist に載せたプロセスでも「そのスレッド名」を `--name` に指定すれば名前一致を回避して本体を落とせてしまう。`ProcessInfoProvider` は `without_tasks()` を明示した refresh のみを行い、さらに `ProcessesToUpdate::Some` 指定では tasks 設定に関わらず TID が返るため、参照側でも `thread_kind().is_none()` で一律に弾く（macOS の `proc_listallpids` はプロセスのみ返すため影響なし）
 
+13. **設定ファイル種別の fail-closed 検証**: CLI の厳格読み込みは、設定パス自体が本当に存在しない場合だけ既定値を使用する。通常ファイルと通常ファイルへ解決できる symlink は許可するが、壊れた symlink は「未作成」と誤認せず設定エラーにする。ディレクトリ・FIFO・デバイス等の特殊ファイルも読み込み前に拒否し、管理対象設定の消失によるカスタム denylist の暗黙解除、FIFO での無期限待機、デバイスからの無制限読み込みを防ぐ
+
 ### Port-based killing の特殊性
 
 `--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。ポート `0` は OS の自動割り当て用の特殊値なので、設定に含まれていても常に拒否する。信頼ルート PID 自体はポート指定でも保護する。TCP は LISTEN 状態のソケットのみ対象にし、ESTABLISHED などの接続済みクライアントソケットは対象外。UDP は状態を持たないためローカルポート一致で対象にする。プロセス名解決に失敗した PID は `pid:<pid>` 形式のプレースホルダ名でフォールバックされるが、この名前はあくまで表示用であり、ポリシー判定は fresh なプロセス情報が取れない時点で `ProcessNotFound` として fail-closed する（denylist のバイパス防止）。さらに kill 直前に対象ポートの保持者集合を再取得し、判定時の PID/プロトコルが含まれなければ `NoProcessOnPort` として fail-closed する（判定～kill 間にポートを離した場合の追加防御）。
@@ -64,7 +66,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `policy.rs` | Kill 許可判定のオーケストレーション。root PID 自体の保護、PID 1 自体の保護（コンテナ環境での巻き添え防止、`can_kill` / `can_kill_for_port` の両経路で fail-closed）、既定 denylist の強制合流、`KillPermission` enum の返却（拒否判定→`SafeKillError` 変換は `KillPermission::to_error` に集約）、kill 直前の最終安全検証 (`verify_final_safety_before_kill` = 自殺防止の再確認 `verify_not_suicide_before_kill` + ancestry の fresh 再評価 (Required 時) + PID 再利用検証 `verify_identity_before_kill`) も担う。`FinalAncestryCheck` enum で再評価の Required/Bypassed を型レベルに固定し、`try_from_permission` で拒否系を fail-loud に拒絶する |
 | `ancestry.rs` | プロセスツリー検証。`SAFE_KILL_ROOT_PID`（0/1/無効値は無視）または祖父プロセスをルートとする。PID 1（init/launchd）は信頼ルートにできず、祖父が PID 1 等で不適格なら親→現在プロセスへフォールバックする（fail-closed）。構築時に信頼ルートの初期 identity を `root_identity: Option<ProcessInfo>` で保持し、`root_identity_matches_in_provider` で同一 snapshot 内に identity 検証を組み込む。`is_descendant` / `is_descendant_of`（ancestor が root_pid 時）/ `is_descendant_fresh` の各経路で identity 整合性を fail-closed 検証する。`is_descendant_fresh` は新規 snapshot で identity と ancestry を同時検証して TOCTOU 窓を最小化。`refresh()` は identity を更新せず、不一致時に `root_identity = None` にして以後 fail-closed に倒す（PID 再利用後のプロセスを信頼ルートにしない）。木探索本体は `is_descendant_of_with_provider` に分離し、任意 provider snapshot に対して再利用可能。同一 PID 指定でも対象 PID が snapshot に存在しなければ子孫扱いしない |
 | `killer.rs` | シグナル送信と結果追跡。dry-run 対応。`KillResult` に元の `SafeKillError` を保持する |
-| `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールドを設定エラーとして fail-closed にし、OS別デフォルト denylist とユーザー denylist を合流。フォールバック読み込み時の警告は設定パスとエラー本文をサニタイズしてから表示する |
+| `config.rs` | `~/.config/safe-kill/config.toml` の読み込み。CLI 実行ではアクセス不可・解析不能・未知フィールド・壊れた symlink・特殊ファイルを設定エラーとして fail-closed にし、通常ファイルへの symlink は許可する。OS別デフォルト denylist とユーザー denylist を合流。フォールバック読み込み時の警告は設定パスとエラー本文をサニタイズしてから表示する |
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は PID 0 と `i32::MAX` 超過を拒否した上で新しい `System` を作り、指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化。refresh は `refresh_kind()`（`without_tasks()` 指定）で行い、Linux のスレッド（TID）を一覧に入れない（下記「スレッド経由の denylist バイパス防止」参照）。参照側（`get` / `find_by_name` / `all` / `fetch_fresh`）でも `thread_kind().is_none()` で二重に弾く |

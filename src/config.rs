@@ -5,8 +5,39 @@
 use crate::error::SafeKillError;
 use crate::terminal::{sanitize_path, sanitize_terminal};
 use serde::Deserialize;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, OpenOptions};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+fn ensure_no_dangling_symlink_ancestor(path: &Path) -> Result<(), SafeKillError> {
+    for ancestor in path.ancestors().skip(1) {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                fs::metadata(ancestor).map_err(|e| {
+                    SafeKillError::ConfigError(format!(
+                        "Failed to resolve symlink ancestor {} for {}: {}",
+                        ancestor.display(),
+                        path.display(),
+                        e
+                    ))
+                })?;
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(SafeKillError::ConfigError(format!(
+                    "Failed to access ancestor {} for {}: {}",
+                    ancestor.display(),
+                    path.display(),
+                    e
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// メイン設定構造体
 #[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
@@ -142,9 +173,17 @@ impl Config {
             return Ok(Self::with_defaults());
         };
 
-        match path.try_exists() {
-            Ok(false) => return Ok(Self::with_defaults()),
-            Ok(true) => {}
+        // `try_exists()` は dangling symlink でも `Ok(false)` を返すため使わない。
+        // パス自体が存在しない場合だけ既定値を許可し、symlink のリンク先消失は
+        // 後続の metadata エラーとして扱うことで、設定消失時に fail-closed に倒す。
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 親階層の dangling symlink も NotFound になるため、単純な未作成と
+                // 区別してから既定値へフォールバックする。
+                ensure_no_dangling_symlink_ancestor(&path)?;
+                return Ok(Self::with_defaults());
+            }
+            Ok(_) => {}
             Err(e) => {
                 return Err(SafeKillError::ConfigError(format!(
                     "Failed to access {}: {}",
@@ -154,7 +193,27 @@ impl Config {
             }
         }
 
-        let content = fs::read_to_string(&path).map_err(|e| {
+        // FIFO へ差し替えられても open が待機しないようにし、開いたファイル記述子
+        // 自体の種類を検証することで、検証と読み込みの間のパス差し替えも防ぐ。
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NONBLOCK)
+            .open(&path)
+            .map_err(|e| {
+                SafeKillError::ConfigError(format!("Failed to access {}: {}", path.display(), e))
+            })?;
+        let metadata = file.metadata().map_err(|e| {
+            SafeKillError::ConfigError(format!("Failed to access {}: {}", path.display(), e))
+        })?;
+        if !metadata.is_file() {
+            return Err(SafeKillError::ConfigError(format!(
+                "Config path {} is not a regular file",
+                path.display()
+            )));
+        }
+
+        let mut content = String::new();
+        file.read_to_string(&mut content).map_err(|e| {
             SafeKillError::ConfigError(format!("Failed to read {}: {}", path.display(), e))
         })?;
         let mut config = toml::from_str::<Config>(&content).map_err(|e| {
@@ -449,6 +508,66 @@ mod tests {
         // 厳格読み込みでも、設定ファイル未作成はエラーにせずデフォルトを使う。
         assert!(config.denylist.is_some());
         assert!(config.allowed_ports.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_load_config_dangling_symlink_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let missing_target = dir.path().join("missing.toml");
+        std::os::unix::fs::symlink(&missing_target, &config_path).unwrap();
+
+        let result = Config::try_load_from_path(Some(config_path));
+
+        // 設定への symlink が壊れた状態を「未作成」と誤認してはならない。
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_load_config_dangling_parent_symlink_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_parent = dir.path().join("managed-config");
+        let missing_target = dir.path().join("missing-directory");
+        std::os::unix::fs::symlink(&missing_target, &config_parent).unwrap();
+        let config_path = config_parent.join("config.toml");
+
+        let result = Config::try_load_from_path(Some(config_path));
+
+        // 親階層の symlink が壊れていても、設定未作成として扱ってはならない。
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_load_config_symlink_to_special_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::os::unix::fs::symlink("/dev/null", &config_path).unwrap();
+
+        let result = Config::try_load_from_path(Some(config_path));
+
+        // 特殊ファイルを空の TOML として受け入れ、既定設定へ移行してはならない。
+        assert!(matches!(result, Err(SafeKillError::ConfigError(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_try_load_config_symlink_to_regular_file_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_path = dir.path().join("managed-config.toml");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &target_path,
+            "[denylist]\nprocesses = [\"managed-process\"]\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target_path, &config_path).unwrap();
+
+        let config = Config::try_load_from_path(Some(config_path)).unwrap();
+
+        assert!(config.is_denied("managed-process"));
     }
 
     #[test]

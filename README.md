@@ -36,6 +36,7 @@
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
 - **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, and config-load warnings.
+- **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
@@ -185,7 +186,7 @@ The following system processes are protected by default:
 
 User-defined `[denylist]` entries are appended to this built-in protection set. Customizing the list does not remove system safeguards.
 
-If `config.toml` exists but cannot be accessed, read, or parsed, or if it contains unknown fields, kill/list commands fail with a configuration error instead of falling back to partial defaults. This prevents a malformed custom denylist from being ignored during process termination.
+If `config.toml` exists but cannot be accessed, read, or parsed, or if it contains unknown fields, kill/list commands fail with a configuration error instead of falling back to partial defaults. Regular files and symlinks that resolve to regular files are accepted. Dangling symlinks and paths that resolve to directories, FIFOs, or devices are rejected before reading; this prevents a missing managed config from silently disabling custom protections and avoids blocking or unbounded reads from special files.
 
 ## Architecture
 
@@ -355,7 +356,7 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 415 tests covering all modules
+- **Library Unit Tests**: 419 tests covering all modules
 - **Binary Unit Tests**: 35 tests for CLI output utilities, error sanitization, and version checks
 - **Integration Tests**: 78 tests with real process trees
 - **E2E Tests**: 89 tests for CLI behavior
