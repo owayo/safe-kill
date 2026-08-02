@@ -2,9 +2,15 @@
 //!
 //! サンプル設定を含む設定ファイルを生成する。
 
-use std::fs;
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::os::fd::AsFd;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
 
 use crate::config::Config;
 use crate::error::SafeKillError;
@@ -35,6 +41,30 @@ pub enum InitOutcome {
 /// 設定ファイル生成のための init コマンド
 pub struct InitCommand;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedWriteTarget {
+    path: PathBuf,
+    parent: PathBuf,
+    file_name: OsString,
+    expected_parent: FileIdentity,
+    expected_file: Option<FileIdentity>,
+}
+
 impl InitCommand {
     /// init コマンドを実行して設定ファイルを生成する
     ///
@@ -58,11 +88,29 @@ impl InitCommand {
         // `Path::exists()` は symlink を追従するため、リンク先が存在しない「壊れた
         // symlink」を「存在しない」と誤判定し、上書き確認を一切出さないままリンク先の
         // パスへ新規ファイルを作ってしまう。
-        let existing = fs::symlink_metadata(&config_path);
-        let is_symlink = existing
-            .as_ref()
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false);
+        let existing = match fs::symlink_metadata(&config_path) {
+            Ok(metadata) => Some(metadata),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(SafeKillError::ConfigCreationError(format!(
+                    "Failed to access config path {}: {}",
+                    config_path.display(),
+                    e
+                )));
+            }
+        };
+
+        // 新規作成時は、書き込み先を解決する前に親ディレクトリを用意する。
+        // 既存エントリがある場合は親も存在するため、不要な変更を加えない。
+        if existing.is_none() {
+            fs::create_dir_all(&config_dir).map_err(|e| {
+                SafeKillError::ConfigCreationError(format!(
+                    "Failed to create directory {}: {}",
+                    config_dir.display(),
+                    e
+                ))
+            })?;
+        }
 
         // 実際に書き込むパスを決める。
         // `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml` のように
@@ -70,51 +118,209 @@ impl InitCommand {
         // 「config.toml を作成した」と表示しながら別ファイルを破壊するのを避けるため、
         // 実体パスを解決して利用者へ開示する。解決できない（リンク先が存在しない）
         // 場合は、意図しないパスへファイルを新規作成してしまうため fail-closed で拒否する。
-        let write_target = if is_symlink {
-            fs::canonicalize(&config_path).map_err(|e| {
-                SafeKillError::ConfigCreationError(format!(
-                    "Config path {} is a symlink whose target cannot be resolved ({}). \
-                     Fix or remove the symlink and retry.",
-                    config_path.display(),
-                    e
-                ))
-            })?
-        } else {
-            config_path.clone()
-        };
+        let write_target = Self::resolve_write_target(&config_path, existing.as_ref())?;
 
         // 既存ファイルがあり force でない場合は上書き確認する。
         // ユーザーが拒否した場合は作成失敗ではなく「正常なスキップ」（no-op）として扱い、
         // 終了コード 0 で正常終了させる。
-        if existing.is_ok() && !force && !Self::confirm_overwrite(&config_path, &write_target)? {
+        if existing.is_some()
+            && !force
+            && !Self::confirm_overwrite(&config_path, &write_target.path)?
+        {
             return Ok(InitOutcome::SkippedExisting {
                 config_path,
-                target_path: write_target,
+                target_path: write_target.path,
             });
         }
 
-        // ディレクトリが存在しない場合は作成
-        fs::create_dir_all(&config_dir).map_err(|e| {
-            SafeKillError::ConfigCreationError(format!(
-                "Failed to create directory {}: {}",
-                config_dir.display(),
-                e
-            ))
-        })?;
-
         // 設定ファイルを書き込み
         let content = Self::default_config_content();
-        fs::write(&write_target, content).map_err(|e| {
-            SafeKillError::ConfigCreationError(format!(
-                "Failed to write config file {}: {}",
-                write_target.display(),
-                e
-            ))
-        })?;
+        Self::write_config_file(&write_target, &content)?;
 
         Ok(InitOutcome::Created {
             config_path,
-            written_path: write_target,
+            written_path: write_target.path,
+        })
+    }
+
+    /// 既存設定の実体を解決し、通常ファイル以外を上書き対象から除外する。
+    fn resolve_write_target(
+        config_path: &Path,
+        existing: Option<&fs::Metadata>,
+    ) -> Result<ResolvedWriteTarget, SafeKillError> {
+        let (write_path, expected_file) = match existing {
+            None => (config_path.to_path_buf(), None),
+            Some(metadata) if !metadata.file_type().is_symlink() => {
+                if !metadata.is_file() {
+                    return Err(SafeKillError::ConfigCreationError(format!(
+                        "Config path {} is not a regular file",
+                        config_path.display()
+                    )));
+                }
+                (
+                    config_path.to_path_buf(),
+                    Some(FileIdentity::from_metadata(metadata)),
+                )
+            }
+            Some(_) => {
+                // Path::exists() は壊れた symlink に false を返すため使わない。実体を開示した上で、
+                // 解決不能なリンクや特殊ファイルへのリンクは fail-closed で拒否する。
+                let target = fs::canonicalize(config_path).map_err(|e| {
+                    SafeKillError::ConfigCreationError(format!(
+                        "Config path {} is a symlink whose target cannot be resolved ({}). \
+                         Fix or remove the symlink and retry.",
+                        config_path.display(),
+                        e
+                    ))
+                })?;
+                let target_metadata = fs::metadata(&target).map_err(|e| {
+                    SafeKillError::ConfigCreationError(format!(
+                        "Failed to inspect config target {}: {}",
+                        target.display(),
+                        e
+                    ))
+                })?;
+                if !target_metadata.is_file() {
+                    return Err(SafeKillError::ConfigCreationError(format!(
+                        "Config target {} is not a regular file",
+                        target.display()
+                    )));
+                }
+                (target, Some(FileIdentity::from_metadata(&target_metadata)))
+            }
+        };
+
+        let file_name = write_path.file_name().ok_or_else(|| {
+            SafeKillError::ConfigCreationError(format!(
+                "Config path {} has no file name",
+                write_path.display()
+            ))
+        })?;
+        let parent = write_path.parent().ok_or_else(|| {
+            SafeKillError::ConfigCreationError(format!(
+                "Config path {} has no parent directory",
+                write_path.display()
+            ))
+        })?;
+        let parent = fs::canonicalize(parent).map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to resolve config directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        let parent_metadata = fs::metadata(&parent).map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to inspect config directory {}: {}",
+                parent.display(),
+                e
+            ))
+        })?;
+        if !parent_metadata.is_dir() {
+            return Err(SafeKillError::ConfigCreationError(format!(
+                "Config parent {} is not a directory",
+                parent.display()
+            )));
+        }
+
+        Ok(ResolvedWriteTarget {
+            path: parent.join(file_name),
+            parent,
+            file_name: file_name.to_os_string(),
+            expected_parent: FileIdentity::from_metadata(&parent_metadata),
+            expected_file,
+        })
+    }
+
+    /// 検証した親ディレクトリを固定し、パス差し替えに対して fail-closed に書き込む。
+    fn write_config_file(
+        write_target: &ResolvedWriteTarget,
+        content: &str,
+    ) -> Result<(), SafeKillError> {
+        let parent_dir = OpenOptions::new()
+            .read(true)
+            // 親自体が直前に symlink へ差し替えられても追従しない。
+            .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW)
+            .open(&write_target.parent)
+            .map_err(|e| {
+                SafeKillError::ConfigCreationError(format!(
+                    "Failed to open config directory {}: {}",
+                    write_target.parent.display(),
+                    e
+                ))
+            })?;
+        let parent_metadata = parent_dir.metadata().map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to inspect opened config directory {}: {}",
+                write_target.parent.display(),
+                e
+            ))
+        })?;
+        if !parent_metadata.is_dir()
+            || FileIdentity::from_metadata(&parent_metadata) != write_target.expected_parent
+        {
+            return Err(SafeKillError::ConfigCreationError(format!(
+                "Config directory {} changed before writing",
+                write_target.parent.display()
+            )));
+        }
+
+        let mut flags = OFlag::O_WRONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        if write_target.expected_file.is_none() {
+            // 存在確認後に別ファイルが作られた場合は、上書きせず失敗させる。
+            flags |= OFlag::O_CREAT | OFlag::O_EXCL;
+        }
+        let fd = openat(
+            parent_dir.as_fd(),
+            write_target.file_name.as_os_str(),
+            flags,
+            Mode::from_bits_truncate(0o666),
+        )
+        .map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to open config file {}: {}",
+                write_target.path.display(),
+                e
+            ))
+        })?;
+        let mut file = File::from(fd);
+        let metadata = file.metadata().map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to inspect opened config file {}: {}",
+                write_target.path.display(),
+                e
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(SafeKillError::ConfigCreationError(format!(
+                "Config target {} is not a regular file",
+                write_target.path.display()
+            )));
+        }
+        if let Some(expected_file) = write_target.expected_file
+            && FileIdentity::from_metadata(&metadata) != expected_file
+        {
+            return Err(SafeKillError::ConfigCreationError(format!(
+                "Config file {} changed before writing",
+                write_target.path.display()
+            )));
+        }
+
+        if write_target.expected_file.is_some() {
+            file.set_len(0).map_err(|e| {
+                SafeKillError::ConfigCreationError(format!(
+                    "Failed to truncate config file {}: {}",
+                    write_target.path.display(),
+                    e
+                ))
+            })?;
+        }
+        file.write_all(content.as_bytes()).map_err(|e| {
+            SafeKillError::ConfigCreationError(format!(
+                "Failed to write config file {}: {}",
+                write_target.path.display(),
+                e
+            ))
         })
     }
 
@@ -303,5 +509,124 @@ mod tests {
             "Config should have at least 10 lines, got {}",
             lines.len()
         );
+    }
+
+    #[test]
+    fn test_resolve_write_target_rejects_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let fifo_path = temp.path().join("config.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let metadata = fs::symlink_metadata(&fifo_path).unwrap();
+        let result = InitCommand::resolve_write_target(&fifo_path, Some(&metadata));
+
+        assert!(matches!(
+            result,
+            Err(SafeKillError::ConfigCreationError(message))
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn test_resolve_write_target_rejects_symlink_to_fifo() {
+        let temp = tempfile::tempdir().unwrap();
+        let fifo_path = temp.path().join("actual-config");
+        let config_path = temp.path().join("config.toml");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo_path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::os::unix::fs::symlink(&fifo_path, &config_path).unwrap();
+
+        let metadata = fs::symlink_metadata(&config_path).unwrap();
+        let result = InitCommand::resolve_write_target(&config_path, Some(&metadata));
+
+        assert!(matches!(
+            result,
+            Err(SafeKillError::ConfigCreationError(message))
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn test_write_config_file_rejects_symlink_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let original_path = temp.path().join("original-config.toml");
+        let attacker_path = temp.path().join("attacker-config.toml");
+        fs::write(&config_path, "original").unwrap();
+        let metadata = fs::symlink_metadata(&config_path).unwrap();
+        let write_target =
+            InitCommand::resolve_write_target(&config_path, Some(&metadata)).unwrap();
+
+        fs::rename(&config_path, &original_path).unwrap();
+        fs::write(&attacker_path, "attacker content").unwrap();
+        std::os::unix::fs::symlink(&attacker_path, &config_path).unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert_eq!(fs::read_to_string(original_path).unwrap(), "original");
+        assert_eq!(
+            fs::read_to_string(attacker_path).unwrap(),
+            "attacker content"
+        );
+    }
+
+    #[test]
+    fn test_write_config_file_create_new_does_not_overwrite_raced_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let write_target = InitCommand::resolve_write_target(&config_path, None).unwrap();
+        fs::write(&config_path, "raced content").unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), "raced content");
+    }
+
+    #[test]
+    fn test_write_config_file_rejects_regular_file_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let original_path = temp.path().join("original-config.toml");
+        fs::write(&config_path, "original").unwrap();
+        let metadata = fs::symlink_metadata(&config_path).unwrap();
+        let write_target =
+            InitCommand::resolve_write_target(&config_path, Some(&metadata)).unwrap();
+
+        fs::rename(&config_path, &original_path).unwrap();
+        fs::write(&config_path, "raced content").unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), "raced content");
+        assert_eq!(fs::read_to_string(original_path).unwrap(), "original");
+    }
+
+    #[test]
+    fn test_write_config_file_rejects_parent_directory_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("safe-kill");
+        let original_dir = temp.path().join("original-safe-kill");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        let write_target = InitCommand::resolve_write_target(&config_path, None).unwrap();
+
+        fs::rename(&config_dir, &original_dir).unwrap();
+        fs::create_dir(&config_dir).unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert!(!config_path.exists());
+        assert!(!original_dir.join("config.toml").exists());
     }
 }

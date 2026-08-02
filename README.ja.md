@@ -93,6 +93,8 @@ safe-kill init [--force]
 
 設定ファイルが symlink の場合（`~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml` のような dotfiles 管理の一般的な運用）もそのまま使えます。`init` はリンクを追従して実体ファイルを更新し、symlink 自体は維持します。ただし書き換わるのは指定したパスそのものではないため、確認プロンプトと成功メッセージの両方で解決後の実体パスを開示します。**壊れた** symlink（リンク先が存在しない）は、リンク先へ黙ってファイルを新規作成せず拒否します（`--force` を付けても終了コード 3）。
 
+`init` が受け入れるのは通常ファイル、または通常ファイルへ解決できる symlink だけです。ディレクトリ・FIFO・デバイスと、それらへ解決される symlink は open 前に拒否するため、`--force` でも FIFO で待ち続けたりデバイスへ書き込んだりしません。検証済みの親ディレクトリは device/inode を確認してファイルディスクリプタで固定し、そこから non-blocking・symlink 非追従で書き込み先を開きます。取得したファイルの device/inode も truncate 前に再検証します。open 前のパス置換は fail-closed で停止し、open 後にパスが変わっても固定済みのファイルディスクリプタから別ファイルへ書き込みを誘導されません。
+
 ### オプション
 
 | オプション | 短縮形 | 説明 |
@@ -215,6 +217,8 @@ flowchart TB
 11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、C0/C1 制御文字、Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力、`safe-kill init` の作成/スキップ/上書き確認パス、設定読み込み警告のすべてでサニタイズ済みの文字列のみが端末へ流れる。kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぎ、双方向制御文字による表示順偽装も防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない。エスケープ導入文字 `\` 自身も `\\` に置換して変換の単射性を保つ（これを省くと、実際に ESC を含むプロセスと、リテラルで `\x1B[2J` という名前を持つプロセスの表示が一致してしまい、どちらが本当に制御文字を含むのか判別できなくなる）
 
 12. **スレッド（TID）除外**: `sysinfo` は既定でタスク（スレッド）も列挙するため、Linux では `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る。スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の名前を自由に変更でき、TID への `kill(2)` はスレッドグループ全体へ配送される。そのため防御しないと、denylist に載せたプロセスでも「そのスレッド名」を `--name` に渡せば名前一致を回避して本体を落とせてしまう。プロセス一覧の refresh は `without_tasks()` を明示し、`ProcessesToUpdate::Some` はこの設定に関わらず TID を返すため、参照側でも `thread_kind()` が `Some` のエントリを一律に拒否する。macOS は `proc_listallpids` がプロセスのみ返すため影響を受けない。
+
+13. **設定ファイル種別と書き込みの検証**: 厳格設定読み込みと `safe-kill init` は、通常ファイルまたは通常ファイルへ解決できる symlink だけを受け入れる。壊れた symlink と特殊ファイルは I/O 前に拒否する。初期化時は検証済みの親ディレクトリを device/inode 照合後のFDで固定し、そこから `openat(O_NONBLOCK | O_NOFOLLOW)` で書き込み先を開く。取得した通常ファイルの device/inode は truncate 前に再検証し、検証時に存在しなかったパスは `O_CREAT | O_EXCL` による原子的な新規作成に限定する。FIFO での無期限待機とデバイスへの書き込みを拒否し、open 前の symlink・通常ファイル・親ディレクトリ置換は fail-closed、open 後の置換は固定済みFDへの書き込みでリダイレクトを防ぐ。
 
 ### プロセスツリーと終了可能範囲
 
