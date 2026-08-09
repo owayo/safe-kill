@@ -17,12 +17,18 @@ use tempfile::NamedTempFile;
 
 static UNIQUE_SLEEP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+fn unique_sleep_process_name(process_id: u32, sequence: usize) -> String {
+    // 並行する別の cargo test プロセスでも名前が衝突しないよう PID を含める。
+    // Linux の comm は 15 バイト上限なので、連番を 16 ビットに収めて全体を 14 バイトにする。
+    format!("sk{process_id:08x}{:04x}", sequence & 0xffff)
+}
+
 fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
     use std::process::Command;
 
     let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
     let id = UNIQUE_SLEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let process_name = format!("skslp{:05}", id);
+    let process_name = unique_sleep_process_name(std::process::id(), id);
     let executable = temp.path().join(&process_name);
 
     // macOS のシステムバイナリは別パスへコピーして実行すると即時終了する環境がある。
@@ -36,6 +42,25 @@ fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
         .expect("一意名の sleep プロセスを起動できるべき");
 
     (temp, child, process_name)
+}
+
+#[test]
+fn test_unique_sleep_process_name_isolated_by_process_and_sequence() {
+    let first = unique_sleep_process_name(1, 0);
+    let other_process = unique_sleep_process_name(2, 0);
+    let next_sequence = unique_sleep_process_name(1, 1);
+
+    assert_ne!(
+        first, other_process,
+        "テストプロセスが違えば名前も異なるべき"
+    );
+    assert_ne!(
+        first, next_sequence,
+        "同一プロセス内の連番でも名前は異なるべき"
+    );
+
+    let boundary = unique_sleep_process_name(u32::MAX, usize::MAX);
+    assert_eq!(boundary.len(), 14, "Linux の comm 上限を超えるべきではない");
 }
 
 #[test]

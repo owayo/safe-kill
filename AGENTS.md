@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 425 + bin 35 + E2E 90 + integration 78)
+make test               # 全テスト実行 (lib 425 + bin 35 + E2E 90 + integration 79)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -85,4 +85,5 @@ YY.M.COUNTER 形式（例: 26.1.105）。リリースは GitHub Actions の work
 
 - E2E テストは `assert_cmd` を使用し、実際のバイナリを実行する
 - 統合テストは実プロセスツリーを使ったテスト
+- 統合テストの一意なプロセス名はテストランナーの PID と連番から生成し、Linux の `comm` 15 バイト上限内に収める。これにより複数の `cargo test` を並行実行しても名前が衝突しない
 - ancestry テストでは `SAFE_KILL_ROOT_PID` 環境変数でルート PID を制御可能（`0`・`1` や無効値は無視、root PID 自体は kill 不可）

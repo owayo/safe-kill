@@ -360,10 +360,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 419 tests covering all modules
+- **Library Unit Tests**: 425 tests covering all modules
 - **Binary Unit Tests**: 35 tests for CLI output utilities, error sanitization, and version checks
-- **Integration Tests**: 78 tests with real process trees
-- **E2E Tests**: 89 tests for CLI behavior
+- **Integration Tests**: 79 tests with real process trees. Temporary process names include the test runner PID and a sequence number, so concurrent `cargo test` invocations cannot collide while staying within Linux's 15-byte `comm` limit.
+- **E2E Tests**: 90 tests for CLI behavior
 
 ## Contributing
 
