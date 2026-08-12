@@ -37,6 +37,7 @@
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
 - **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, and config-load warnings.
 - **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing
+- **Private Config Creation**: `safe-kill init` creates its configuration directory with mode `0700` and a new config file with mode `0600`, even under a permissive `umask`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
 - **Dry-run Mode**: Preview what would be killed without taking action
@@ -94,6 +95,8 @@ If the config file already exists, `init` prompts for confirmation before overwr
 Symlinked config files (the common dotfiles pattern, `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml`) keep working: `init` follows the link and updates the real file, leaving the symlink intact. Because the file it rewrites is *not* the path you typed, both the confirmation prompt and the success line disclose the resolved target. A **dangling** symlink is refused outright (code 3, even with `--force`) rather than silently creating a file at the link target.
 
 `init` accepts only regular files (or symlinks that resolve to regular files). Directories, FIFOs, devices, and symlinks to those special files are rejected before opening, so `--force` cannot block on a FIFO or write to a device. The validated parent directory is pinned by file descriptor after checking its device/inode, and the destination is opened relative to that descriptor with non-blocking, no-symlink-following flags. The opened file's device/inode is also checked before truncation. A replacement before open therefore fails closed; after open, the pinned descriptor prevents a later path change from redirecting the write to another file.
+
+For a new configuration, `init` creates `~/.config/safe-kill` with mode `0700` and `config.toml` with mode `0600`. These are explicit upper bounds, so a permissive caller `umask` cannot make the authorization settings writable by another user; a stricter `umask` remains effective.
 
 ### Options
 
@@ -219,6 +222,8 @@ flowchart TB
 12. **Thread (TID) Exclusion**: `sysinfo` enumerates process tasks by default, so on Linux every `/proc/<pid>/task/<tid>` thread would show up as a process in its own right. Threads can rename themselves freely via `prctl(PR_SET_NAME)` / `pthread_setname_np`, and `kill(2)` on a TID is delivered to the whole thread group — so without this guard, a denylisted process could be taken down by passing one of *its threads'* names to `--name`, sidestepping the denylist entirely. The process snapshot is refreshed with `without_tasks()`, and because `ProcessesToUpdate::Some` returns a TID regardless of that setting, every read path additionally rejects entries with `thread_kind().is_some()`. macOS is unaffected (`proc_listallpids` returns processes only).
 
 13. **Configuration File Type and Write Validation**: Strict configuration loading and `safe-kill init` accept only regular files or symlinks resolving to regular files. Dangling symlinks and special files are rejected before I/O. During initialization, the validated parent directory is pinned after a device/inode check, and the destination is opened relative to that directory descriptor with `openat(O_NONBLOCK | O_NOFOLLOW)`. The opened regular file's device/inode is checked before truncation, while a path absent during validation is limited to atomic `O_CREAT | O_EXCL` creation. FIFO hangs and device writes are rejected; symlink, regular-file, or parent-directory replacement before open fails closed, and replacement after open cannot redirect the pinned file descriptor.
+
+14. **Private Configuration Permissions**: A newly created configuration directory is limited to mode `0700`, and a new `config.toml` to mode `0600`. The modes are supplied at creation time, so even `umask 000` cannot expose allowlist, denylist, or allowed-port policy to modification by other users.
 
 ### Process Tree and Killable Scope
 
@@ -363,7 +368,7 @@ cargo build --release
 - **Library Unit Tests**: 425 tests covering all modules
 - **Binary Unit Tests**: 35 tests for CLI output utilities, error sanitization, and version checks
 - **Integration Tests**: 79 tests with real process trees. Temporary process names include the test runner PID and a sequence number, so concurrent `cargo test` invocations cannot collide while staying within Linux's 15-byte `comm` limit.
-- **E2E Tests**: 90 tests for CLI behavior
+- **E2E Tests**: 91 tests for CLI behavior, including private config permissions under a permissive `umask`
 
 ## Contributing
 

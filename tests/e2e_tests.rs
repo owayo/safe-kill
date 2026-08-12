@@ -1294,6 +1294,33 @@ fn test_init_creates_config_dir() {
     assert!(parsed.is_ok());
 }
 
+#[test]
+fn test_init_uses_private_permissions_even_with_permissive_umask() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    let config_path = config_dir.join("config.toml");
+    let binary = assert_cmd::cargo::cargo_bin!("safe-kill");
+
+    // 呼び出し元の umask が無防備でも、認可設定を他ユーザーが変更できる
+    // ディレクトリ／ファイル権限で作成してはならない。
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg("umask 000; exec \"$1\" init --force")
+        .arg("safe-kill-init-test")
+        .arg(binary)
+        .env("HOME", temp.path())
+        .assert()
+        .success();
+
+    let dir_mode = fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777;
+    let file_mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(dir_mode, 0o700);
+    assert_eq!(file_mode, 0o600);
+}
+
 // =============================================================================
 // --port での実 kill テスト
 // =============================================================================

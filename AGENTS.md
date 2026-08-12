@@ -15,7 +15,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール
 
 # テスト
-make test               # 全テスト実行 (lib 425 + bin 35 + E2E 90 + integration 79)
+make test               # 全テスト実行 (lib 425 + bin 35 + E2E 91 + integration 79)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 cargo test ancestry     # 特定モジュールのテスト
@@ -56,6 +56,8 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 
 14. **設定初期化時の特殊ファイル・パス置換競合対策**: `safe-kill init` は通常ファイルと通常ファイルへ解決できる symlink だけを許可し、ディレクトリ・FIFO・デバイスおよびそれらへの symlink を open 前に拒否する。検証済みの親ディレクトリは device/inode を照合してファイルディスクリプタで固定し、そこから `openat(O_NONBLOCK | O_NOFOLLOW)` で書き込み先を開く。取得したファイルハンドルも通常ファイルかつ検証時と同じ device/inode であることを確認する。検証時に存在しなかったパスは `O_CREAT | O_EXCL` による原子的な新規作成に限定するため、`--force` でも FIFO で無期限に待機したりデバイスへ書き込んだりしない。open 前の symlink・通常ファイル・親ディレクトリ置換は fail-closed で拒否し、open 後の置換でも固定済みFDへの書き込みにより別ファイルへの誘導を防ぐ
 
+15. **設定初期化時の非公開権限**: 新規設定ディレクトリは `DirBuilderExt::mode(0o700)`、新規 `config.toml` は `openat` の mode `0o600` を指定して作成する。作成後の chmod ではなく作成時から権限を制限することで、呼び出し元が `umask 000` でも allowlist・denylist・許可ポートの認可設定を他ユーザーが書き換えられる時間窓を作らない。より厳しい `umask` は維持される
+
 ### Port-based killing の特殊性
 
 `--port` は ancestry チェックをバイパスする（孤立した開発サーバー終了用途）。ただし `config.toml` の `[allowed_ports]` で明示的に許可されたポートのみ。未設定時は `--port` オプション自体が無効。ポート `0` は OS の自動割り当て用の特殊値なので、設定に含まれていても常に拒否する。信頼ルート PID 自体はポート指定でも保護する。TCP は LISTEN 状態のソケットのみ対象にし、ESTABLISHED などの接続済みクライアントソケットは対象外。UDP は状態を持たないためローカルポート一致で対象にする。プロセス名解決に失敗した PID は `pid:<pid>` 形式のプレースホルダ名でフォールバックされるが、この名前はあくまで表示用であり、ポリシー判定は fresh なプロセス情報が取れない時点で `ProcessNotFound` として fail-closed する（denylist のバイパス防止）。さらに kill 直前に対象ポートの保持者集合を再取得し、判定時の PID/プロトコルが含まれなければ `NoProcessOnPort` として fail-closed する（判定～kill 間にポートを離した場合の追加防御）。
@@ -72,7 +74,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 | `signal.rs` | Unix シグナル解析と送信。名前/番号両対応、macOS/Linux のプラットフォーム固有番号のみ受付、危険 PID 値の拒否 |
 | `port.rs` | netstat2 による port→PID 解決。TCP は LISTEN のみ、UDP はローカルポート一致 |
 | `process_info.rs` | sysinfo ベースのプロセス一覧取得とプロセス名の完全一致検索。`ProcessInfo.start_time` で PID 再利用を検出可能。`fetch_fresh(pid)` は PID 0 と `i32::MAX` 超過を拒否した上で新しい `System` を作り、指定 PID のみ refresh する TOCTOU 検証専用関数。結果は PID 昇順で安定化。refresh は `refresh_kind()`（`without_tasks()` 指定）で行い、Linux のスレッド（TID）を一覧に入れない（下記「スレッド経由の denylist バイパス防止」参照）。参照側（`get` / `find_by_name` / `all` / `fetch_fresh`）でも `thread_kind().is_none()` で二重に弾く |
-| `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う。確認プロンプトの設定パスはサニタイズ済みで表示する。既存判定は `Path::exists()` ではなく `fs::symlink_metadata()` で行い、symlink の場合は `canonicalize()` で実体を解決してプロンプトと結果表示の両方に開示する。壊れた symlink、特殊ファイル、特殊ファイルへ解決される symlink は fail-closed で拒否する（`--force` でも同様）。親ディレクトリを device/inode 検証済みのFDで固定して `openat(O_NONBLOCK | O_NOFOLLOW)` を行い、既存ファイルの device/inode も再検証する。未作成パスは `O_CREAT | O_EXCL` に限定し、検証～書き込み間のパス置換競合を拒否する |
+| `init.rs` | `safe-kill init` で config.toml を生成。既存ファイルの上書き確認を行い、ユーザーが拒否した場合は作成失敗（終了コード3）ではなく正常な no-op（終了コード0、`InitOutcome::SkippedExisting`）として扱う。確認プロンプトの設定パスはサニタイズ済みで表示する。既存判定は `Path::exists()` ではなく `fs::symlink_metadata()` で行い、symlink の場合は `canonicalize()` で実体を解決してプロンプトと結果表示の両方に開示する。壊れた symlink、特殊ファイル、特殊ファイルへ解決される symlink は fail-closed で拒否する（`--force` でも同様）。親ディレクトリを device/inode 検証済みのFDで固定して `openat(O_NONBLOCK | O_NOFOLLOW)` を行い、既存ファイルの device/inode も再検証する。未作成パスは `O_CREAT | O_EXCL` に限定し、検証～書き込み間のパス置換競合を拒否する。新規ディレクトリは `0700`、新規設定ファイルは `0600` の権限上限を作成時に指定し、緩い umask でも認可設定を他ユーザーへ公開しない |
 | `error.rs` | thiserror ベースのエラー型と終了コード (0/1/2/3/4/255) |
 | `terminal.rs` | 端末表示用サニタイズ。ANSI escape・改行・タブ・C0/C1 制御文字・Unicode 17.0 の `Cf` 全 170 文字を表示用エスケープへ置換し、プロセス情報・エラー本文・設定パスの表示偽装を防ぐ。エスケープ導入文字 `\` 自身も `\\` へ置換して変換の単射性を保つ |
 | `main.rs` | CLI のエントリポイント。実行モードごとの分岐、終了コード変換、表示出力を担う。`terminal.rs` のサニタイズを使い、`--list` 出力、kill 結果表示（`print_kill_result` の `name` と `message` の両方）、`main()` での stderr エラー出力、`safe-kill init` の生成/スキップパス表示にサニタイズ済み文字列のみを流す |

@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{OFlag, openat};
@@ -103,7 +103,11 @@ impl InitCommand {
         // 新規作成時は、書き込み先を解決する前に親ディレクトリを用意する。
         // 既存エントリがある場合は親も存在するため、不要な変更を加えない。
         if existing.is_none() {
-            fs::create_dir_all(&config_dir).map_err(|e| {
+            // 認可設定を保持するディレクトリなので、呼び出し元の umask が 000 でも
+            // 他ユーザーが設定ファイルを作成・差し替えできない権限で生成する。
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(&config_dir).map_err(|e| {
                 SafeKillError::ConfigCreationError(format!(
                     "Failed to create directory {}: {}",
                     config_dir.display(),
@@ -274,7 +278,9 @@ impl InitCommand {
             parent_dir.as_fd(),
             write_target.file_name.as_os_str(),
             flags,
-            Mode::from_bits_truncate(0o666),
+            // allowlist 等の認可設定を含むため、umask に依存せず所有者だけが
+            // 読み書きできる権限を上限として新規作成する。
+            Mode::from_bits_truncate(0o600),
         )
         .map_err(|e| {
             SafeKillError::ConfigCreationError(format!(
