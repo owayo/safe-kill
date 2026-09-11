@@ -52,9 +52,19 @@ impl ProcessInfoProvider {
     /// あわせて memory / cpu / disk_usage は取得しない（safe-kill はどれも参照しない）。
     /// `cmd` は `--list` の COMMAND 列で使うため明示的に取得する。
     fn refresh_kind() -> ProcessRefreshKind {
+        // `exe` は要求しない。`ProcessInfo` は parent / name / cmd / start_time しか
+        // 持たず実行ファイルパスを使わない一方、Linux ではこれを要求すると sysinfo が
+        // プロセスごとに `realpath("/proc/<pid>/exe")` を実行する。1 回の kill で
+        // スナップショットを複数作るため、その分だけ無駄が積み上がる。
+        //
+        // `name` の解決には影響しない。Linux の `name` は `/proc/<pid>/stat` の comm 由来、
+        // macOS は `KERN_PROCARGS2`（失敗時は `proc_pidpath`）から basename を取り、
+        // どちらも `exe` の要求有無と独立している（`Process::exe` フィールドを保持するか
+        // だけが変わる）。`name` は `--name` 検索と denylist 判定に使うため、
+        // ここが壊れていないことは `test_refresh_kind_does_not_request_exe` 以下の
+        // テストで固定する。
         ProcessRefreshKind::nothing()
             .with_cmd(UpdateKind::OnlyIfNotSet)
-            .with_exe(UpdateKind::OnlyIfNotSet)
             .without_tasks()
     }
 
@@ -188,6 +198,45 @@ impl Default for ProcessInfoProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_refresh_kind_does_not_request_exe() {
+        // exe を要求すると Linux では sysinfo がプロセスごとに
+        // `realpath("/proc/<pid>/exe")` を実行する。`ProcessInfo` は exe を持たないので
+        // 不要な負荷であり、うっかり戻すと 1 実行あたり複数スナップショット分の
+        // 無駄が復活する。設定そのものをテストで固定する。
+        let kind = ProcessInfoProvider::refresh_kind();
+        assert_eq!(kind.exe(), UpdateKind::Never);
+        assert_eq!(kind.cmd(), UpdateKind::OnlyIfNotSet);
+        assert!(!kind.tasks(), "スレッド（TID）を一覧に入れてはいけない");
+    }
+
+    #[test]
+    fn test_name_resolves_without_exe_refresh() {
+        // `name` は `--name` 検索と denylist 判定の入力なので、空になると
+        // 「denylist に載せたプロセスが名前一致しない」形で安全性が壊れる。
+        // exe を要求しない設定でも name が解決できることを固定する。
+        let provider = ProcessInfoProvider::new();
+        let info = provider
+            .get(ProcessInfoProvider::current_pid())
+            .expect("自プロセスは一覧に含まれるはず");
+        assert!(
+            !info.name.is_empty(),
+            "exe を要求しない設定でプロセス名が解決できていない"
+        );
+    }
+
+    #[test]
+    fn test_fetch_fresh_resolves_name_without_exe_refresh() {
+        // TOCTOU 検証で使う `fetch_fresh` は `pid + start_time + name` を突き合わせる。
+        // name が空になると同一性検証が常に失敗し、正当な kill まで拒否される。
+        let info = ProcessInfoProvider::fetch_fresh(ProcessInfoProvider::current_pid())
+            .expect("自プロセスを取得できるはず");
+        assert!(
+            !info.name.is_empty(),
+            "exe を要求しない設定で fetch_fresh のプロセス名が解決できていない"
+        );
+    }
 
     #[test]
     fn test_process_info_struct() {

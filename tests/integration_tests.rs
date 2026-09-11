@@ -44,6 +44,62 @@ fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
     (temp, child, process_name)
 }
 
+/// 同名の「子孫」と「孤児」を 1 つずつ起動する
+///
+/// `--name` は完全一致で対象を集めるため、同名プロセスの一部だけを拒否させるには
+/// ancestry の差を作るしかない（denylist / allowlist は名前でしか判定できないので、
+/// 同名の片方だけを対象にできない）。
+///
+/// 孤児側は `sh` が `&` でバックグラウンド起動した直後に終了することで、親が
+/// PID 1 へ付け替えられてテストプロセスの子孫から外れる。`Child` ハンドルを
+/// 持てないため、後始末は呼び出し側が名前で検索して行う。
+///
+/// 戻り値は（一時ディレクトリ, 子プロセスのハンドル, プロセス名）。
+fn spawn_unique_sleep_with_orphan_twin() -> (tempfile::TempDir, std::process::Child, String) {
+    use std::process::Command;
+
+    let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
+    let id = UNIQUE_SLEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let process_name = unique_sleep_process_name(std::process::id(), id);
+    let executable = temp.path().join(&process_name);
+
+    std::os::unix::fs::symlink("/bin/sleep", &executable)
+        .expect("/bin/sleep への symlink を作成できるべき");
+
+    // ancestry 判定で許可される側（テストプロセスの直接の子）
+    let child = Command::new(&executable)
+        .arg("60")
+        .spawn()
+        .expect("一意名の sleep プロセスを起動できるべき");
+
+    // ancestry 判定で拒否される側（親が PID 1 の孤児）
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!("'{}' 60 &", executable.display()))
+        .status()
+        .expect("孤児プロセスを起動できるべき");
+    assert!(status.success(), "孤児起動用の sh が失敗した");
+
+    (temp, child, process_name)
+}
+
+/// 指定名のプロセスが `expected` 件見つかるまで短く待って PID を返す
+fn wait_for_processes_by_name(name: &str, expected: usize) -> Vec<u32> {
+    for _ in 0..40 {
+        let provider = ProcessInfoProvider::new();
+        let pids: Vec<u32> = provider
+            .find_by_name(name)
+            .into_iter()
+            .map(|p| p.pid)
+            .collect();
+        if pids.len() >= expected {
+            return pids;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("プロセス {name} が {expected} 件見つからなかった");
+}
+
 #[test]
 fn test_unique_sleep_process_name_isolated_by_process_and_sequence() {
     let first = unique_sleep_process_name(1, 0);
@@ -934,9 +990,13 @@ fn test_policy_engine_kill_by_name_dry_run_success() {
     let _ = child.wait();
 }
 
-/// kill_by_name で混合結果（一部許可・一部拒否）のテスト
+/// kill_by_name で全件が denylist 拒否になるバッチのテスト
+///
+/// 名前は「mixed」だったが検証内容は全件拒否（`total_killed == 0`）だったため、
+/// 実態に合わせて改名した。一部成功・一部拒否の混在は
+/// `test_policy_engine_kill_by_name_partial_success_batch` で検証する。
 #[test]
-fn test_policy_engine_kill_by_name_mixed_batch() {
+fn test_policy_engine_kill_by_name_all_denied_batch() {
     use safe_kill::config::ProcessList;
 
     // PID 1 のプロセス名を取得
@@ -969,6 +1029,78 @@ fn test_policy_engine_kill_by_name_mixed_batch() {
         assert!(!r.success);
         assert!(r.error.is_some());
     }
+}
+
+/// kill_by_name で一部成功・一部拒否が混在するバッチのテスト
+///
+/// `--name node` のように同名プロセスが複数並ぶのは `--name` の最も現実的な
+/// 使い方だが、その一部だけが kill 可能なケースが検証されていなかった。
+/// `main.rs` はこの状態を `any_success()` で成功（終了コード 0）と判定するため、
+/// 呼び出し側（終了コードで分岐する AI エージェント）が依存する契約として固定する。
+#[test]
+fn test_policy_engine_kill_by_name_partial_success_batch() {
+    let (_temp, mut child, process_name) = spawn_unique_sleep_with_orphan_twin();
+    let child_pid = child.id();
+
+    // 子孫側と孤児側の 2 件が名前一致することを待つ
+    let pids = wait_for_processes_by_name(&process_name, 2);
+    assert!(
+        pids.contains(&child_pid),
+        "自分の子が名前一致に含まれていない: {pids:?}"
+    );
+
+    let engine = PolicyEngine::new(Config::default());
+    // dry_run でも can_kill と kill 直前の最終ガードは通るため、許可/拒否の
+    // 判定結果はそのまま結果へ反映される（シグナル送信だけが省かれる）。
+    let batch = engine
+        .kill_by_name(&process_name, Signal::SIGTERM, true)
+        .expect("名前一致があるので Ok になるべき");
+
+    assert!(
+        batch.total_matched >= 2,
+        "同名の 2 プロセスが対象になるべき: {batch:?}"
+    );
+    assert!(
+        batch.any_success(),
+        "子孫側は許可されるべき（終了コード 0 の根拠）: {batch:?}"
+    );
+    assert!(
+        !batch.all_success(),
+        "孤児側は ancestry で拒否されるべき: {batch:?}"
+    );
+
+    // 子孫側は成功、孤児側は NotDescendant で失敗していること
+    let child_result = batch
+        .results
+        .iter()
+        .find(|r| r.pid == child_pid)
+        .expect("子プロセスの結果が含まれるべき");
+    assert!(child_result.success, "子孫の kill が拒否された: {batch:?}");
+
+    let orphan_results: Vec<_> = batch
+        .results
+        .iter()
+        .filter(|r| r.pid != child_pid)
+        .collect();
+    assert!(
+        !orphan_results.is_empty(),
+        "孤児側の結果が含まれていない: {batch:?}"
+    );
+    for r in &orphan_results {
+        assert!(!r.success, "孤児が許可された: {r:?}");
+        assert!(
+            matches!(r.error, Some(SafeKillError::NotDescendant(_, _))),
+            "孤児の拒否理由が ancestry でない: {:?}",
+            r.error
+        );
+    }
+
+    // 後始末: dry_run なので両方生きている。孤児はハンドルを持てないため
+    // 名前一致した PID すべてへシグナルを送る。
+    for pid in pids {
+        let _ = SignalSender::send(pid, Signal::SIGKILL);
+    }
+    let _ = child.wait();
 }
 
 // =============================================================================

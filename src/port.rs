@@ -2,6 +2,8 @@
 //!
 //! netstat2 を使用して特定ポートを使用するプロセスを検出する。
 
+use std::cell::OnceCell;
+
 use crate::error::SafeKillError;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState, get_sockets_info};
@@ -35,17 +37,52 @@ impl std::fmt::Display for PortProtocol {
     }
 }
 
+/// netstat2 が参照するソケット情報源が読める状態かを確認する
+///
+/// netstat2 の Linux 実装は `/proc` を `read_dir("/proc/").expect("Can't read /proc/")` で
+/// 読むため、`/proc` が未マウント・読み取り不可の環境ではライブラリ内部で panic する。
+/// panic の終了コード 101 は公開している終了コード契約（0/1/2/3/4/255）に存在せず、
+/// panic メッセージは `terminal.rs` のサニタイズも通らない。呼び出す前に可読性を
+/// 確認して、通常の `PortDetectionError` へ落とす。
+///
+/// macOS の実装は `proc_listallpids` を使い `/proc` を参照しないため確認は不要。
+#[cfg(target_os = "linux")]
+fn ensure_socket_source_readable(port: u16) -> Result<(), SafeKillError> {
+    std::fs::read_dir("/proc")
+        .map(|_| ())
+        .map_err(|e| SafeKillError::PortDetectionError {
+            port,
+            reason: format!("Cannot read /proc: {}", e),
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_socket_source_readable(_port: u16) -> Result<(), SafeKillError> {
+    Ok(())
+}
+
 /// 特定ポートを使用するプロセスを検出するポート検出器
 pub struct PortDetector {
-    provider: ProcessInfoProvider,
+    /// 表示名の解決に使うプロセス一覧（初回参照時に構築する）
+    ///
+    /// `PolicyEngine` は実行モードに関わらず `PortDetector` を持つが、この provider が
+    /// 要るのは `--port` 経路だけである。構築は全プロセスの列挙（Linux なら `/proc` の
+    /// 全走査）を伴うため、`safe-kill <PID>` / `--name` / `--list` では丸ごと無駄になる。
+    /// 遅延生成にして、ポート検索で実際に名前を引くときだけ払うようにする。
+    provider: OnceCell<ProcessInfoProvider>,
 }
 
 impl PortDetector {
     /// 新しい PortDetector を作成
     pub fn new() -> Self {
         Self {
-            provider: ProcessInfoProvider::new(),
+            provider: OnceCell::new(),
         }
+    }
+
+    /// 表示名解決用のプロセス一覧を取得する（初回のみ構築）
+    fn provider(&self) -> &ProcessInfoProvider {
+        self.provider.get_or_init(ProcessInfoProvider::new)
     }
 
     /// 指定ポートを使用するすべてのプロセスを検索
@@ -56,6 +93,8 @@ impl PortDetector {
         if port == 0 {
             return Err(SafeKillError::InvalidPort(port.to_string()));
         }
+
+        ensure_socket_source_readable(port)?;
 
         let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
         let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
@@ -80,7 +119,7 @@ impl PortDetector {
                 // この名前はあくまで UI 出力用であり、denylist 等のポリシー判定には
                 // 使ってはならない（呼び出し側で fresh なプロセス情報を再取得すること）。
                 let name = self
-                    .provider
+                    .provider()
                     .get(pid)
                     .map(|p| p.name)
                     .unwrap_or_else(|| format!("pid:{}", pid));
@@ -103,10 +142,22 @@ impl PortDetector {
 
     /// 指定 PID が指定ポート/プロトコルをいま保持しているかを再確認する
     ///
-    /// kill 直前の TOCTOU 緩和用。`find_by_port` と同様の OS 問い合わせを行うが、
-    /// 1 PID あたりの軽量チェックとして使うことを想定する。
+    /// kill 直前の TOCTOU 緩和用。判定〜kill の窓を最小化するため、対象 PID ごとに
+    /// その都度 OS へ問い合わせ直す。
+    ///
+    /// 呼び出しコストは軽くない。`get_sockets_info` は 1 回ごとにシステム全体の
+    /// ソケット表を走査する（macOS は全 PID × 全 FD に `proc_pidfdinfo`、Linux は
+    /// netlink dump に加えて `/proc/*/fd` 全体の `read_link`）。同一ポートを N 個の
+    /// プロセスが保持していれば、その N 回ぶん全体走査が走る。窓を狭めるために
+    /// この重さを受け入れている、というのが意図した設計上のトレードオフである。
+    ///
     /// 取得に失敗した場合は安全側に倒して `false` を返す（fail-closed）。
     pub fn pid_holds_port(&self, pid: u32, port: u16, protocol: PortProtocol) -> bool {
+        // 情報源が読めない場合は「保持していない」と断定できないので fail-closed。
+        if ensure_socket_source_readable(port).is_err() {
+            return false;
+        }
+
         let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
         let proto_flags = match protocol {
             PortProtocol::Tcp => ProtocolFlags::TCP,
@@ -138,7 +189,7 @@ impl PortDetector {
 
         let mut process_infos = Vec::new();
         for pp in port_processes {
-            if let Some(info) = self.provider.get(pp.pid) {
+            if let Some(info) = self.provider().get(pp.pid) {
                 process_infos.push(info);
             }
         }
@@ -147,8 +198,12 @@ impl PortDetector {
     }
 
     /// 内部のプロセス情報を更新
+    ///
+    /// まだ一度も名前解決していなければ何もしない（遅延生成を維持する）。
     pub fn refresh(&mut self) {
-        self.provider.refresh();
+        if let Some(provider) = self.provider.get_mut() {
+            provider.refresh();
+        }
     }
 }
 
@@ -187,6 +242,55 @@ mod tests {
         let detector = PortDetector::new();
         // パニックしないことを確認
         let _ = detector;
+    }
+
+    #[test]
+    fn test_new_does_not_build_process_snapshot() {
+        // `PolicyEngine` は実行モードに関わらず `PortDetector` を持つ。ここで
+        // 全プロセス列挙を走らせると `--port` を使わない実行でも毎回無駄になる。
+        let detector = PortDetector::new();
+        assert!(detector.provider.get().is_none());
+    }
+
+    #[test]
+    fn test_refresh_before_first_use_keeps_provider_uninitialized() {
+        // refresh は「まだ作っていないものを作る」きっかけにしてはいけない。
+        let mut detector = PortDetector::new();
+        detector.refresh();
+        assert!(detector.provider.get().is_none());
+    }
+
+    #[test]
+    fn test_pid_holds_port_does_not_build_process_snapshot() {
+        // kill 直前の再検証はソケット表しか見ない。表示名の解決は不要。
+        let detector = PortDetector::new();
+        let _ =
+            detector.pid_holds_port(ProcessInfoProvider::current_pid(), 65535, PortProtocol::Tcp);
+        assert!(detector.provider.get().is_none());
+    }
+
+    #[test]
+    fn test_find_by_port_builds_process_snapshot_on_demand() {
+        // 表示名が要るのはこの経路だけ。ここでは実際に構築されることを確認する。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let detector = PortDetector::new();
+        assert!(detector.provider.get().is_none());
+
+        // OS のソケット一覧へ反映されるまで短く待つ。通常は初回で成功する。
+        let found = (0..10).any(|_| {
+            let detected = detector
+                .find_by_port(port)
+                .map(|processes| !processes.is_empty())
+                .unwrap_or(false);
+            if !detected {
+                thread::sleep(Duration::from_millis(50));
+            }
+            detected
+        });
+
+        assert!(found, "自プロセスの TCP リスナーを検出できなかった");
+        assert!(detector.provider.get().is_some());
     }
 
     #[test]
@@ -361,21 +465,88 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_find_by_port_deduplicates_by_pid() {
-        let detector = PortDetector::new();
-        // 使用されていないポートでは重複が発生しないが、
-        // 重複排除ロジック自体が正しく動作することを確認
-        let result = detector.find_by_port(59993).unwrap();
-        // PIDがソートされていること
-        let pids: Vec<u32> = result.iter().map(|p| p.pid).collect();
-        let mut sorted_pids = pids.clone();
-        sorted_pids.sort();
-        assert_eq!(pids, sorted_pids);
-        // PIDの重複がないこと
-        sorted_pids.dedup();
-        assert_eq!(pids.len(), sorted_pids.len());
+    /// 同一ポート番号を TCP と UDP の両方で確保する
+    ///
+    /// TCP の自動割り当てポートが UDP 側で使用中の場合があるため、確保できるまで
+    /// ポートを取り直す。両ソケットは呼び出し側で保持し続ける必要がある
+    /// （drop するとソケット表から消えて検証にならない）。
+    fn bind_same_port_tcp_and_udp() -> (TcpListener, UdpSocket, u16) {
+        for _ in 0..20 {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+            let port = listener.local_addr().unwrap().port();
+            if let Ok(udp) = UdpSocket::bind(("127.0.0.1", port)) {
+                return (listener, udp, port);
+            }
+        }
+        panic!("同一ポート番号で TCP と UDP を確保できなかった");
     }
+
+    /// 重複排除する前の、OS のソケット表に載っているエントリ数を数える
+    ///
+    /// `find_by_port` は排除後の結果しか返さないため、これを併せて確認しないと
+    /// 「そもそも重複が発生していないので assert が素通りしている」状態に
+    /// 気付けない（この関数を足す前のテストがまさにその状態だった）。
+    fn count_raw_socket_entries(pid: u32, port: u16) -> usize {
+        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
+        let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
+        get_sockets_info(af_flags, proto_flags)
+            .expect("ソケット一覧の取得に失敗")
+            .iter()
+            .filter(|si| {
+                socket_matches_port(&si.protocol_socket_info, port).is_some()
+                    && si.associated_pids.contains(&pid)
+            })
+            .count()
+    }
+
+    /// 指定ポートの検出結果が得られるまで短く待って取得する
+    fn find_by_port_with_retry(detector: &PortDetector, port: u16) -> Vec<PortProcess> {
+        for _ in 0..10 {
+            let found = detector.find_by_port(port).expect("ポート検索に失敗");
+            if !found.is_empty() {
+                return found;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("自プロセスのソケットを検出できなかった (port {port})");
+    }
+
+    #[test]
+    fn test_find_by_port_deduplicates_pid_holding_tcp_and_udp() {
+        // 同一 PID が同じポート番号で TCP と UDP を持つと、OS のソケット表には
+        // 2 エントリ載る。重複排除が効いていないと同じ PID へ 2 回シグナルを送り、
+        // 2 回目が ProcessNotFound になって「成功したのに失敗が混ざった」結果に
+        // なる。実際に重複が発生する状況を作って検証する
+        // （未使用ポートを検索すると結果が空で、何も検証しないテストになる）。
+        let (_listener, _udp, port) = bind_same_port_tcp_and_udp();
+        let detector = PortDetector::new();
+        let processes = find_by_port_with_retry(&detector, port);
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        // 排除前に重複していたことを先に確認する。ここが 1 件なら、後続の
+        // assert は「元から重複が無い」だけで通ってしまい検証にならない。
+        let raw_entries = count_raw_socket_entries(current_pid, port);
+        assert!(
+            raw_entries >= 2,
+            "TCP/UDP の両方を確保したのにソケット表のエントリが {raw_entries} 件しかなく、\
+             重複排除を検証できていない (port {port})"
+        );
+
+        let own_entries: Vec<&PortProcess> =
+            processes.iter().filter(|p| p.pid == current_pid).collect();
+        assert_eq!(
+            own_entries.len(),
+            1,
+            "同一 PID が TCP/UDP で重複して列挙されている: {processes:?}"
+        );
+    }
+
+    // 補足: PID 昇順を直接検証するテストは置いていない。TCP と UDP を保持するのは
+    // どちらも同じテストプロセスなので、重複排除後は 1 件しか残らず、ソートを削除
+    // しても降順へ変えても assert が通ってしまう（検証にならない）。意味のある検証には
+    // 同一ポートを別プロセスで保持させる必要があり、テストの複雑さに見合わない。
+    // ソート自体は `dedup_by_key` が隣接要素しか見ないことで間接的に要求されており、
+    // 上の重複排除テストが壊れれば気付ける。
 
     #[test]
     fn test_pid_holds_port_detects_current_tcp_listener() {

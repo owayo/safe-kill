@@ -34,7 +34,9 @@ jobs:
         run: cargo test --verbose
 
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets でテストコードも対象にする。safe-kill の安全性はテストで
+        # 固定しているため、テスト側の lint 漏れを見逃さないようにする。
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Check formatting
         run: cargo fmt -- --check

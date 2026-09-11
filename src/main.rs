@@ -3,32 +3,118 @@
 //! ancestry ベースのアクセス制御で、現在セッションの子孫プロセスのみを
 //! 安全に終了できるようにする。
 
+use std::fmt;
+use std::io::{self, Write};
+use std::path::Path;
 use std::process::ExitCode;
 
 use safe_kill::cli::{CliArgs, ExecutionMode};
-use safe_kill::error::SafeKillError;
+use safe_kill::error::{SafeKillError, SafeKillExitCode};
 use safe_kill::init::{InitCommand, InitOutcome};
 use safe_kill::killer::{BatchKillResult, KillResult};
 use safe_kill::policy::PolicyEngine;
 use safe_kill::process_info;
 use safe_kill::terminal::{sanitize_path, sanitize_terminal};
 
-fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            // エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
-            // OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
-            // ANSI escape を含む引数でプロセスを起動した場合に、エラー経路でも表示偽装や
-            // 端末状態改ざんが起きないよう、表示前に必ずサニタイズする。
-            eprintln!("safe-kill: {}", sanitize_terminal(&e.to_string()));
-            e.exit_code().into()
+/// 表示の書き込み先
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl fmt::Display for OutputStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OutputStream::Stdout => write!(f, "stdout"),
+            OutputStream::Stderr => write!(f, "stderr"),
         }
     }
 }
 
+/// `run()` の失敗理由
+///
+/// 「操作そのものの失敗（ドメインエラー）」と「操作結果を表示できなかった失敗」を
+/// 分けて扱う。両者を混ぜると、表示の失敗が kill の成否を上書きしてしまう。
+#[derive(Debug)]
+enum RunError {
+    /// kill 判定・設定読み込みなど、操作自体の失敗
+    Domain(SafeKillError),
+    /// 操作は確定したが、その結果を書き出せなかった
+    Output {
+        stream: OutputStream,
+        source: io::Error,
+    },
+}
+
+impl From<SafeKillError> for RunError {
+    fn from(e: SafeKillError) -> Self {
+        RunError::Domain(e)
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(RunError::Domain(e)) => {
+            // エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
+            // OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
+            // ANSI escape を含む引数でプロセスを起動した場合に、エラー経路でも表示偽装や
+            // 端末状態改ざんが起きないよう、表示前に必ずサニタイズする。
+            //
+            // 診断の書き込み失敗で終了コードを変えてはいけない。呼び出し側が分岐に使う
+            // のは「なぜ失敗したか」であって「その説明が届いたか」ではないため、
+            // ここでは書き込み結果を捨てて元の終了コードを維持する。
+            let _ = writeln!(
+                io::stderr(),
+                "safe-kill: {}",
+                sanitize_terminal(&e.to_string())
+            );
+            e.exit_code().into()
+        }
+        Err(RunError::Output { stream, source }) => {
+            // BrokenPipe は `finish_output` が成功として処理済みなので、ここへ来るのは
+            // ディスク満杯（ENOSPC）や I/O エラーなど「出力が本当に失われた」場合だけ。
+            let _ = writeln!(
+                io::stderr(),
+                "safe-kill: failed to write to {}: {}",
+                stream,
+                sanitize_terminal(&source.to_string())
+            );
+            SafeKillExitCode::GeneralError.into()
+        }
+    }
+}
+
+/// 操作結果と表示結果を突き合わせて最終的な実行結果を決める
+///
+/// 優先順位は「操作の結果 > 表示の結果」。
+///
+/// * ドメインエラーが出ていれば、表示が成功していようと失敗していようとそれを返す
+///   （終了コードは操作の意味を表すという契約を守る）
+/// * 表示が `BrokenPipe` で失敗した場合は、読み手がパイプを閉じただけであり操作は
+///   完了しているので成功として扱う。`safe-kill --list | head -1` のような通常の
+///   シェル利用で、Rust の `println!` が panic して終了コード 101 になるのを防ぐ
+///   （Rust ランタイムは起動時に SIGPIPE を無視するため、EPIPE が panic に化ける）
+/// * それ以外の I/O エラーは出力が本当に失われているので `Output` として報告する
+fn finish_output(
+    outcome: Result<(), SafeKillError>,
+    printed: io::Result<()>,
+    stream: OutputStream,
+) -> Result<(), RunError> {
+    if let Err(e) = outcome {
+        return Err(RunError::Domain(e));
+    }
+
+    match printed {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        Err(source) => Err(RunError::Output { stream, source }),
+    }
+}
+
 /// メインの実行ロジック
-fn run() -> Result<(), SafeKillError> {
+fn run() -> Result<(), RunError> {
     // CLI 引数を解析する
     let args = CliArgs::parse_args();
 
@@ -41,91 +127,119 @@ fn run() -> Result<(), SafeKillError> {
             let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let result = engine.kill_by_pid(pid, signal, args.dry_run)?;
-            print_kill_result(&result.name, result.pid, result.success, &result.message);
-            if result.success {
+            let printed =
+                print_kill_result(&result.name, result.pid, result.success, &result.message);
+            let outcome = if result.success {
                 Ok(())
             } else {
                 Err(single_result_error(&result))
-            }
+            };
+            finish_output(outcome, printed, OutputStream::Stdout)
         }
         ExecutionMode::KillByName(name) => {
             let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let batch_result = engine.kill_by_name(&name, signal, args.dry_run)?;
-            print_batch_result(&batch_result, args.dry_run);
-            if batch_result.any_success() {
+            let printed = print_batch_result(&batch_result, args.dry_run);
+            let outcome = if batch_result.any_success() {
                 Ok(())
             } else {
                 Err(batch_result_error(
                     format!("name '{}'", name),
                     &batch_result,
                 ))
-            }
+            };
+            finish_output(outcome, printed, OutputStream::Stdout)
         }
         ExecutionMode::ListKillable => {
             let engine = PolicyEngine::try_with_defaults()?;
             let processes = engine.list_killable();
-            print_killable_list(&processes);
-            Ok(())
+            let printed = print_killable_list(&processes);
+            finish_output(Ok(()), printed, OutputStream::Stdout)
         }
         ExecutionMode::KillByPort(port) => {
             let engine = PolicyEngine::try_with_defaults()?;
             let signal = args.parse_signal()?;
             let batch_result = engine.kill_by_port(port, signal, args.dry_run)?;
-            print_port_kill_result(port, &batch_result, args.dry_run);
-            if batch_result.any_success() {
+            let printed = print_port_kill_result(port, &batch_result, args.dry_run);
+            let outcome = if batch_result.any_success() {
                 Ok(())
             } else if batch_result.results.is_empty() {
                 Err(SafeKillError::NoProcessOnPort(port))
             } else {
                 Err(batch_result_error(format!("port {}", port), &batch_result))
-            }
+            };
+            finish_output(outcome, printed, OutputStream::Stdout)
         }
-        ExecutionMode::InitConfig { force } => {
-            match InitCommand::execute(force)? {
-                InitOutcome::Created {
-                    config_path,
-                    written_path,
-                } => {
-                    // config.toml が symlink のときは実際に書き込んだ実体パスも示す。
-                    // 「Created: .../config.toml」とだけ表示すると、dotfiles 等の
-                    // リンク先ファイルを上書きした事実が利用者に伝わらない。
-                    if written_path == config_path {
-                        println!("Created: {}", sanitize_path(&written_path));
-                    } else {
-                        println!(
-                            "Created: {} (written via symlink {})",
-                            sanitize_path(&written_path),
-                            sanitize_path(&config_path)
-                        );
-                    }
-                    println!();
-                    println!(
-                        "Hint: Edit the config file to customize allowed ports and process lists."
-                    );
-                    println!("      Then use `safe-kill --port <PORT>` to kill processes by port.");
-                }
-                InitOutcome::SkippedExisting {
-                    config_path,
-                    target_path,
-                } => {
-                    // ユーザーが上書きを拒否した場合は正常な no-op として扱う（終了コード 0）。
-                    if target_path == config_path {
-                        eprintln!(
-                            "Skipped. Existing config left unchanged: {}",
-                            sanitize_path(&config_path)
-                        );
-                    } else {
-                        eprintln!(
-                            "Skipped. Existing config left unchanged: {} (symlink to {})",
-                            sanitize_path(&config_path),
-                            sanitize_path(&target_path)
-                        );
-                    }
-                }
+        ExecutionMode::InitConfig { force } => match InitCommand::execute(force)? {
+            InitOutcome::Created {
+                config_path,
+                written_path,
+                via_symlink,
+            } => {
+                let printed = print_init_created(&config_path, &written_path, via_symlink);
+                finish_output(Ok(()), printed, OutputStream::Stdout)
             }
-            Ok(())
-        }
+            InitOutcome::SkippedExisting {
+                config_path,
+                target_path,
+                via_symlink,
+            } => {
+                let printed = print_init_skipped(&config_path, &target_path, via_symlink);
+                finish_output(Ok(()), printed, OutputStream::Stderr)
+            }
+        },
+    }
+}
+
+/// `safe-kill init` の生成結果を表示する
+fn print_init_created(
+    config_path: &Path,
+    written_path: &Path,
+    via_symlink: bool,
+) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    // config.toml が symlink のときは実際に書き込んだ実体パスも示す。
+    // 「Created: .../config.toml」とだけ表示すると、dotfiles 等の
+    // リンク先ファイルを上書きした事実が利用者に伝わらない。
+    if !via_symlink {
+        writeln!(out, "Created: {}", sanitize_path(config_path))?;
+    } else {
+        writeln!(
+            out,
+            "Created: {} (written via symlink {})",
+            sanitize_path(written_path),
+            sanitize_path(config_path)
+        )?;
+    }
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Hint: Edit the config file to customize allowed ports and process lists."
+    )?;
+    writeln!(
+        out,
+        "      Then use `safe-kill --port <PORT>` to kill processes by port."
+    )
+}
+
+/// `safe-kill init` で既存設定を残した結果を表示する
+fn print_init_skipped(config_path: &Path, target_path: &Path, via_symlink: bool) -> io::Result<()> {
+    let mut out = io::stderr().lock();
+    // ユーザーが上書きを拒否した場合は正常な no-op として扱う（終了コード 0）。
+    if !via_symlink {
+        writeln!(
+            out,
+            "Skipped. Existing config left unchanged: {}",
+            sanitize_path(config_path)
+        )
+    } else {
+        writeln!(
+            out,
+            "Skipped. Existing config left unchanged: {} (symlink to {})",
+            sanitize_path(config_path),
+            sanitize_path(target_path)
+        )
     }
 }
 
@@ -146,19 +260,31 @@ fn batch_result_error(target: String, result: &BatchKillResult) -> SafeKillError
 }
 
 /// 1 件の結果を表示する
-fn print_kill_result(name: &str, pid: u32, success: bool, message: &str) {
+fn print_kill_result(name: &str, pid: u32, success: bool, message: &str) -> io::Result<()> {
+    write_kill_result(&mut io::stdout().lock(), name, pid, success, message)
+}
+
+/// 1 件の結果を任意の書き込み先へ出力する
+fn write_kill_result(
+    out: &mut impl Write,
+    name: &str,
+    pid: u32,
+    success: bool,
+    message: &str,
+) -> io::Result<()> {
     let status = if success { "✓" } else { "✗" };
     // `message` は失敗時に `SafeKillError::to_string()` を保持しており、エラー型によっては
     // OS から取得したプロセス名がそのまま含まれる（例: `NotDescendant(pid, name)`、
     // `Denylisted(name)`）。攻撃者が ANSI escape を含む引数でプロセスを起動した場合に
     // 表示偽装や端末状態改ざんが起きないよう、`name` と `message` の両方をサニタイズする。
-    println!(
+    writeln!(
+        out,
         "{} {} (PID {}): {}",
         status,
         sanitize_terminal(name),
         pid,
         sanitize_terminal(message)
-    );
+    )
 }
 
 /// 複数件実行時の要約行を組み立てる
@@ -177,11 +303,13 @@ fn batch_result_summary(result: &BatchKillResult, dry_run: bool) -> String {
 }
 
 /// 複数件の結果を表示する
-fn print_batch_result(result: &BatchKillResult, dry_run: bool) {
-    println!("{}", batch_result_summary(result, dry_run));
+fn print_batch_result(result: &BatchKillResult, dry_run: bool) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}", batch_result_summary(result, dry_run))?;
     for r in &result.results {
-        print_kill_result(&r.name, r.pid, r.success, &r.message);
+        write_kill_result(&mut out, &r.name, r.pid, r.success, &r.message)?;
     }
+    Ok(())
 }
 
 /// ポート指定実行時の要約行を組み立てる
@@ -200,23 +328,26 @@ fn port_result_summary(port: u16, result: &BatchKillResult, dry_run: bool) -> St
 }
 
 /// ポート指定の結果を表示する
-fn print_port_kill_result(port: u16, result: &BatchKillResult, dry_run: bool) {
-    println!("{}", port_result_summary(port, result, dry_run));
+fn print_port_kill_result(port: u16, result: &BatchKillResult, dry_run: bool) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    writeln!(out, "{}", port_result_summary(port, result, dry_run))?;
     for r in &result.results {
-        print_kill_result(&r.name, r.pid, r.success, &r.message);
+        write_kill_result(&mut out, &r.name, r.pid, r.success, &r.message)?;
     }
+    Ok(())
 }
 
 /// 終了可能なプロセス一覧を表示する
-fn print_killable_list(processes: &[process_info::ProcessInfo]) {
+fn print_killable_list(processes: &[process_info::ProcessInfo]) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+
     if processes.is_empty() {
-        println!("No killable processes found.");
-        return;
+        return writeln!(out, "No killable processes found.");
     }
 
-    println!("Killable processes ({}):", processes.len());
-    println!("{:>8}  {:<20}  COMMAND", "PID", "NAME");
-    println!("{}", "-".repeat(60));
+    writeln!(out, "Killable processes ({}):", processes.len())?;
+    writeln!(out, "{:>8}  {:<20}  COMMAND", "PID", "NAME")?;
+    writeln!(out, "{}", "-".repeat(60))?;
 
     for p in processes {
         let cmd = if p.cmd.is_empty() {
@@ -229,8 +360,10 @@ fn print_killable_list(processes: &[process_info::ProcessInfo]) {
         // 途中で切られて意図しない端末状態が残る可能性がある。
         let cmd_display = truncate(&sanitize_terminal(&cmd), 30);
         let name_display = truncate(&sanitize_terminal(&p.name), 20);
-        println!("{:>8}  {:<20}  {}", p.pid, name_display, cmd_display);
+        writeln!(out, "{:>8}  {:<20}  {}", p.pid, name_display, cmd_display)?;
     }
+
+    Ok(())
 }
 
 /// 文字数上限で文字列を切り詰める
@@ -636,5 +769,93 @@ mod tests {
             !sanitized_message.contains('\x1b'),
             "message 経由でも ESC 文字は表示されないべき: {sanitized_message}"
         );
+    }
+
+    /// 常に指定した種類の I/O エラーを返す書き込み先
+    struct FailingWriter {
+        kind: io::ErrorKind,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.kind))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(self.kind))
+        }
+    }
+
+    #[test]
+    fn test_finish_output_broken_pipe_keeps_success() {
+        // 読み手がパイプを閉じただけで操作は完了している。
+        // ここを失敗にすると `safe-kill --list | head -1` が異常終了する。
+        let result = finish_output(
+            Ok(()),
+            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            OutputStream::Stdout,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_finish_output_reports_other_io_errors() {
+        // ディスク満杯などは出力が本当に失われているので隠さない。
+        let result = finish_output(
+            Ok(()),
+            Err(io::Error::from(io::ErrorKind::StorageFull)),
+            OutputStream::Stdout,
+        );
+        assert!(matches!(
+            result,
+            Err(RunError::Output {
+                stream: OutputStream::Stdout,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_finish_output_domain_error_takes_precedence() {
+        // 終了コードは「操作の結果」を表す契約なので、表示の失敗で塗り替えない。
+        let result = finish_output(
+            Err(SafeKillError::PermissionDenied(123)),
+            Err(io::Error::from(io::ErrorKind::StorageFull)),
+            OutputStream::Stdout,
+        );
+        assert!(matches!(
+            result,
+            Err(RunError::Domain(SafeKillError::PermissionDenied(123)))
+        ));
+    }
+
+    #[test]
+    fn test_finish_output_domain_error_survives_broken_pipe() {
+        let result = finish_output(
+            Err(SafeKillError::NoProcessOnPort(3000)),
+            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            OutputStream::Stderr,
+        );
+        assert!(matches!(
+            result,
+            Err(RunError::Domain(SafeKillError::NoProcessOnPort(3000)))
+        ));
+    }
+
+    #[test]
+    fn test_write_kill_result_propagates_io_error() {
+        // 表示関数が I/O エラーを握りつぶしていないことを確認する。
+        // 握りつぶすと `finish_output` が判断できず、BrokenPipe の扱いが崩れる。
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::BrokenPipe,
+        };
+        let err = write_kill_result(&mut writer, "node", 42, true, "Sent SIGTERM").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn test_output_stream_display() {
+        assert_eq!(OutputStream::Stdout.to_string(), "stdout");
+        assert_eq!(OutputStream::Stderr.to_string(), "stderr");
     }
 }

@@ -254,6 +254,20 @@ mod tests {
     }
 
     #[test]
+    fn test_sanitize_terminal_folds_multiline_diagnostics_into_one_line() {
+        // clap の使用方法エラーのように元から複数行の文面でも、改行ごとエスケープして
+        // 1 行へ畳む。行構造を残すと、引数に改行を混ぜるだけで独立した `error:` 行を
+        // 偽造でき、診断を読む人間や AI エージェントへ偽の復旧手順を提示できてしまう。
+        let sanitized = sanitize_terminal("error: invalid value 'x\nerror: forged'");
+
+        assert_eq!(sanitized, "error: invalid value 'x\\nerror: forged'");
+        assert!(
+            !sanitized.contains('\n'),
+            "診断が複数行に分かれると行の出自を偽装できる"
+        );
+    }
+
+    #[test]
     fn test_sanitize_path_escapes_control_chars() {
         let path = PathBuf::from("/tmp/safe-kill\x1b[2J\nconfig.toml");
         let sanitized = sanitize_path(&path);

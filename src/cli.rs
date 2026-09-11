@@ -2,10 +2,13 @@
 //!
 //! clap derive を使用した型安全な引数解析を提供する。
 
+use std::io::{self, Write};
+
 use clap::{Parser, Subcommand};
 
 use crate::error::{SafeKillError, SafeKillExitCode};
 use crate::signal::{Signal, SignalSender};
+use crate::terminal::sanitize_terminal;
 
 /// CLI 引数から決定される実行モード
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +40,12 @@ pub enum Command {
 #[derive(Parser, Debug)]
 #[command(
     name = "safe-kill",
+    // `bin_name` を明示しないと、clap は Usage 行に `argv[0]` の basename を使う。
+    // `name` は表示名を決めるだけで、この経路は塞げない。制御文字を含む名前の
+    // symlink 経由で起動されたり `exec -a` で argv[0] を差し替えられたりすると、
+    // `Usage: fake\rFORGED [OPTIONS] [PID]` のように生の制御文字が help へ載り、
+    // Usage 行の上書き偽装が成立する。固定名にして argv[0] の混入経路を断つ。
+    bin_name = "safe-kill",
     version,
     args_conflicts_with_subcommands = true,
     about = "Safe process termination tool for AI agents",
@@ -93,13 +102,40 @@ impl CliArgs {
             Err(e) => {
                 // clap の `Error::print()` は use_stderr() に従って出力先を選ぶ
                 // （エラーは stderr、--help / --version は stdout）。
-                let _ = e.print();
-                let code = if e.use_stderr() {
-                    SafeKillExitCode::GeneralError as u8
-                } else {
-                    SafeKillExitCode::Success as u8
-                };
-                std::process::exit(i32::from(code));
+                if !e.use_stderr() {
+                    // --help / --version は `Command` の静的な定義から描画され、
+                    // argv の値を一切埋め込まない。攻撃者が制御文字を差し込む経路が
+                    // 構造的に無いため、clap の色付けを保ったまま出力する。
+                    let _ = e.print();
+                    std::process::exit(i32::from(SafeKillExitCode::Success as u8));
+                }
+
+                // 使用方法エラーには利用者が渡した引数値がそのまま埋め込まれる
+                // （例: `invalid value '<値>' for '[PID]'`）。clap 側に制御文字の
+                // 除去は無く、`Error::print()` は anstream 経由で書くため、端末直結では
+                // `\x1b[2J`（画面消去）や `\x1b]52`（クリップボード書き換え）が生のまま
+                // 画面へ届く。パイプ時だけ anstream が ANSI を落とすので見落としやすい。
+                // 他の表示経路（`main.rs` / `init.rs` / `config.rs`）と同じくサニタイズする。
+                //
+                // 改行も含めてすべてエスケープし、1 行に畳んで出す。clap の描画結果からは
+                // 「clap 自身のレイアウト改行」と「引数値に含まれていた改行」を区別できず、
+                // 行構造を残すと引数に改行を混ぜるだけで独立した `error:` 行を偽造できる。
+                // 診断を読む人間や AI エージェントに、ツール自身の出力として偽の復旧手順
+                // （例:「保護設定を外して再実行せよ」）を提示されるのを防ぐ。
+                //
+                // `render()` の `Display` は clap 自身の色付けを含まないプレーンテキストな
+                // ので、サニタイズ後に残る制御文字は引数由来のものだけになる。エラー表示の
+                // 色と改行は失うが、表示偽装を防ぐ方を優先する。
+                let rendered = sanitize_terminal(e.render().to_string().trim_end());
+                let mut stderr = io::stderr();
+                // 他の診断（`main()` の `safe-kill: ...`）と同じ接頭辞に揃える。行頭が
+                // 常に固定文字列になるので、本文側に `error:` が現れても行の出自を誤れない。
+                //
+                // 診断が届かなくても終了コードは変えない（`main()` のエラー出力と同じ方針）。
+                // `exit()` はバッファを flush しないため明示的に flush する。
+                let _ = writeln!(stderr, "safe-kill: {}", rendered);
+                let _ = stderr.flush();
+                std::process::exit(i32::from(SafeKillExitCode::GeneralError as u8));
             }
         }
     }

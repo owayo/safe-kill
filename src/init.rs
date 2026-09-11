@@ -28,6 +28,8 @@ pub enum InitOutcome {
         config_path: PathBuf,
         /// 実際に書き込んだパス。`config_path` が symlink の場合はその実体
         written_path: PathBuf,
+        /// `config_path` 自体が symlink で、その実体へ書き込んだか
+        via_symlink: bool,
     },
     /// 既存ファイルがあり、ユーザーが上書きを拒否したため変更しなかった
     SkippedExisting {
@@ -35,6 +37,8 @@ pub enum InitOutcome {
         config_path: PathBuf,
         /// 上書きしていたら書き込まれていたパス（symlink なら実体）
         target_path: PathBuf,
+        /// `config_path` 自体が symlink で、その実体が上書き対象だったか
+        via_symlink: bool,
     },
 }
 
@@ -63,6 +67,14 @@ struct ResolvedWriteTarget {
     file_name: OsString,
     expected_parent: FileIdentity,
     expected_file: Option<FileIdentity>,
+    /// 設定パス自体が symlink で、その実体を書き込み先にしたか
+    ///
+    /// 「symlink 経由か」の判定にパス比較（`path != config_path`）を使ってはいけない。
+    /// `path` は親ディレクトリを `canonicalize` して組み立てるため、`$HOME` の祖先に
+    /// symlink が 1 つでもあれば（macOS の `/var -> private/var` 等）、config.toml が
+    /// 通常ファイルでも必ず不一致になり、偽の symlink 警告が出る。警告が常態化すると
+    /// 利用者は読み飛ばすようになり、本物の symlink 上書き時に開示が機能しなくなる。
+    via_symlink: bool,
 }
 
 impl InitCommand {
@@ -129,11 +141,12 @@ impl InitCommand {
         // 終了コード 0 で正常終了させる。
         if existing.is_some()
             && !force
-            && !Self::confirm_overwrite(&config_path, &write_target.path)?
+            && !Self::confirm_overwrite(&config_path, &write_target.path, write_target.via_symlink)?
         {
             return Ok(InitOutcome::SkippedExisting {
                 config_path,
                 target_path: write_target.path,
+                via_symlink: write_target.via_symlink,
             });
         }
 
@@ -144,6 +157,7 @@ impl InitCommand {
         Ok(InitOutcome::Created {
             config_path,
             written_path: write_target.path,
+            via_symlink: write_target.via_symlink,
         })
     }
 
@@ -152,8 +166,8 @@ impl InitCommand {
         config_path: &Path,
         existing: Option<&fs::Metadata>,
     ) -> Result<ResolvedWriteTarget, SafeKillError> {
-        let (write_path, expected_file) = match existing {
-            None => (config_path.to_path_buf(), None),
+        let (write_path, expected_file, via_symlink) = match existing {
+            None => (config_path.to_path_buf(), None, false),
             Some(metadata) if !metadata.file_type().is_symlink() => {
                 if !metadata.is_file() {
                     return Err(SafeKillError::ConfigCreationError(format!(
@@ -164,6 +178,7 @@ impl InitCommand {
                 (
                     config_path.to_path_buf(),
                     Some(FileIdentity::from_metadata(metadata)),
+                    false,
                 )
             }
             Some(_) => {
@@ -190,7 +205,11 @@ impl InitCommand {
                         target.display()
                     )));
                 }
-                (target, Some(FileIdentity::from_metadata(&target_metadata)))
+                (
+                    target,
+                    Some(FileIdentity::from_metadata(&target_metadata)),
+                    true,
+                )
             }
         };
 
@@ -233,6 +252,7 @@ impl InitCommand {
             file_name: file_name.to_os_string(),
             expected_parent: FileIdentity::from_metadata(&parent_metadata),
             expected_file,
+            via_symlink,
         })
     }
 
@@ -363,21 +383,37 @@ ports = ["1420", "3000-3010", "5173", "8080"]
     /// `path` が symlink で `write_target` がその実体のとき、両方を提示する。
     /// symlink のパスだけを見せて同意を取ると、利用者は「config.toml が上書きされる」と
     /// 理解したまま、実際にはまったく別のファイルが破壊される。
-    fn confirm_overwrite(path: &Path, write_target: &Path) -> Result<bool, SafeKillError> {
-        if write_target != path {
-            eprint!(
+    ///
+    /// 分岐条件にパス比較を使わないのは `ResolvedWriteTarget::via_symlink` のコメント参照。
+    fn confirm_overwrite(
+        path: &Path,
+        write_target: &Path,
+        via_symlink: bool,
+    ) -> Result<bool, SafeKillError> {
+        // `eprint!` は書き込み失敗で panic するため使わない。プロンプトが利用者へ
+        // 届かないまま stdin を読むと、「見えていない質問」への同意として既存設定を
+        // 破壊しかねない。書き込みに失敗したら BrokenPipe も含めて fail-closed で
+        // 中断する（結果表示と違い、これは操作前の確認であり省略できない）。
+        let mut stderr = io::stderr();
+        let written = if via_symlink {
+            write!(
+                stderr,
                 "Config file already exists at {} (symlink to {}). Overwrite the symlink target? [y/N]: ",
                 sanitize_path(path),
                 sanitize_path(write_target)
-            );
+            )
         } else {
-            eprint!(
+            write!(
+                stderr,
                 "Config file already exists at {}. Overwrite? [y/N]: ",
                 sanitize_path(path)
-            );
-        }
-        io::stderr().flush().map_err(|e| {
-            SafeKillError::ConfigCreationError(format!("Failed to flush stderr: {}", e))
+            )
+        };
+        written.and_then(|()| stderr.flush()).map_err(|e| {
+            SafeKillError::SystemError(format!(
+                "Failed to write overwrite confirmation prompt: {}",
+                e
+            ))
         })?;
 
         let mut input = String::new();

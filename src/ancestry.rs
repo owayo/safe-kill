@@ -226,20 +226,34 @@ impl AncestryChecker {
     }
 
     /// 任意の `provider` を使った木探索本体
+    fn is_descendant_of_with_provider(
+        provider: &ProcessInfoProvider,
+        target_pid: u32,
+        ancestor_pid: u32,
+    ) -> bool {
+        Self::is_descendant_of_with_lookup(|pid| provider.get(pid), target_pid, ancestor_pid)
+    }
+
+    /// PID からプロセス情報を引く関数に対する木探索本体
     ///
     /// `target_pid` から親 PID チェーンをたどり、以下の条件で停止する:
     /// - `ancestor_pid` に到達した（`true`）
     /// - PID 1（init/launchd）に到達した（`false`）
     /// - 最大深度を超えた（`false`）
     /// - プロセス情報が取得できない（`false`）
-    fn is_descendant_of_with_provider(
-        provider: &ProcessInfoProvider,
+    ///
+    /// `ProcessInfoProvider` ではなく参照関数を受け取るのは、停止条件そのものを
+    /// 検証できるようにするため。深度上限・親 PID の循環・PID 1 到達はいずれも
+    /// 実プロセスツリーでは意図的に作れず、provider 直結のままだと
+    /// 「ループ条件を壊してもテストが通る」状態になる。
+    fn is_descendant_of_with_lookup(
+        lookup: impl Fn(u32) -> Option<ProcessInfo>,
         target_pid: u32,
         ancestor_pid: u32,
     ) -> bool {
         // 存在しない PID を「自分自身の子孫」と誤判定しないよう、同一 PID 判定より
         // 前に対象プロセスが snapshot 内に存在することを確認する。
-        if provider.get(target_pid).is_none() {
+        if lookup(target_pid).is_none() {
             return false;
         }
 
@@ -253,7 +267,7 @@ impl AncestryChecker {
 
         while depth < MAX_ANCESTRY_DEPTH {
             // 現在 PID のプロセス情報を取得
-            let Some(info) = provider.get(current_pid) else {
+            let Some(info) = lookup(current_pid) else {
                 // プロセスが見つからない
                 return false;
             };
@@ -322,6 +336,7 @@ impl AncestryChecker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     // 基本的な生成テスト
     #[test]
@@ -609,19 +624,113 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // 木探索の停止条件テスト
+    //
+    // 深度上限・親 PID の循環・PID 1 到達は、実プロセスツリーでは意図的に
+    // 作れない。固定ツリーを `is_descendant_of_with_lookup` へ注入して、
+    // 停止条件そのものが効いていることを固定する。
+    // =====================================================================
+
+    /// `(pid, parent_pid)` の組からテスト用のプロセスツリーを組み立てる
+    fn build_tree(entries: &[(u32, Option<u32>)]) -> HashMap<u32, ProcessInfo> {
+        entries
+            .iter()
+            .map(|&(pid, parent_pid)| {
+                (
+                    pid,
+                    ProcessInfo {
+                        pid,
+                        parent_pid,
+                        name: format!("proc{pid}"),
+                        cmd: Vec::new(),
+                        start_time: 0,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 一直線の親子チェーンを構築する
+    ///
+    /// `base` が末端（探索の起点）で、そこから `hops` 段だけ親方向へ連なる。
+    /// 最上位（`base + hops`）の親は `top_parent`。
+    fn linear_chain(base: u32, hops: u32, top_parent: Option<u32>) -> HashMap<u32, ProcessInfo> {
+        let mut entries: Vec<(u32, Option<u32>)> =
+            (0..hops).map(|i| (base + i, Some(base + i + 1))).collect();
+        entries.push((base + hops, top_parent));
+        build_tree(&entries)
+    }
+
     #[test]
-    fn test_max_depth_protection() {
-        let provider = ProcessInfoProvider::new();
-        let current_pid = ProcessInfoProvider::current_pid();
-        let checker = AncestryChecker::new(provider);
-        let root = checker.root_pid();
+    fn test_is_descendant_detects_ancestor_at_max_depth() {
+        // 深度上限ちょうど（末端から MAX_ANCESTRY_DEPTH ホップ上）の祖先は検出できる。
+        // 上限を下げる変更が入れば、正当な子孫が kill できなくなる形で検出される。
+        let tree = linear_chain(1000, MAX_ANCESTRY_DEPTH, None);
+        assert!(AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            1000,
+            1000 + MAX_ANCESTRY_DEPTH
+        ));
+    }
 
-        let _result = checker.is_descendant(current_pid);
+    #[test]
+    fn test_is_descendant_stops_beyond_max_depth() {
+        // 1 ホップ超えたら実在する祖先でも探索を打ち切る（fail-closed）。
+        let hops = MAX_ANCESTRY_DEPTH + 1;
+        let tree = linear_chain(1000, hops, None);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            1000,
+            1000 + hops
+        ));
+    }
 
-        let depth = MAX_ANCESTRY_DEPTH;
-        assert!(depth >= 10);
-        assert!(depth <= 1000);
-        assert!(root > 0);
+    #[test]
+    fn test_is_descendant_terminates_on_parent_cycle() {
+        // 親 PID が循環していても無限ループしない。PID 再利用が起きた直後の
+        // snapshot では、親子関係が循環して見えることがある。
+        let tree = build_tree(&[(10, Some(11)), (11, Some(10))]);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            9999
+        ));
+    }
+
+    #[test]
+    fn test_is_descendant_stops_at_pid_one() {
+        // 親チェーンが PID 1（init/launchd）へ到達したら、その先は追わない。
+        // ここを外すと「init に到達する全プロセス」が子孫扱いになり、
+        // ancestry の安全境界が消える（fail-open）。
+        let tree = build_tree(&[(10, Some(1)), (1, Some(999)), (999, None)]);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            999
+        ));
+    }
+
+    #[test]
+    fn test_is_descendant_false_when_chain_is_broken() {
+        // 途中の親が snapshot から消えていたら子孫扱いしない。
+        let tree = build_tree(&[(10, Some(11))]);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            12
+        ));
+    }
+
+    #[test]
+    fn test_is_descendant_false_when_parent_is_unknown() {
+        // 親 PID が不明なプロセスは、どの祖先の子孫とも判定しない。
+        let tree = build_tree(&[(10, None)]);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            11
+        ));
     }
 
     // 環境変数定数テスト

@@ -35,7 +35,7 @@
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`), including in the fresh process lookup used immediately before signaling
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
-- **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, and config-load warnings.
+- **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, config-load warnings, and clap usage errors (which embed the offending argument verbatim).
 - **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing
 - **Private Config Creation**: `safe-kill init` creates its configuration directory with mode `0700` and a new config file with mode `0600`, even under a permissive `umask`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
@@ -219,6 +219,8 @@ flowchart TB
 10. **Port Hold Re-check (port mode only)**: For `--port` kills, the set of current holders of the target port is re-queried just before signaling. If the candidate PID/protocol is no longer present in that set (the target released the port between policy decision and `kill(2)`), the kill fails closed with `NoProcessOnPort`. This avoids killing a now-unrelated workload that happens to share the same PID after the user's intent (releasing the port) has already been satisfied.
 11. **Terminal Output Sanitization**: Process names, command-line arguments, error message bodies, and config paths are escaped (`\n`, `\r`, `\t`, `\xHH`, `\u{HHHH}`) before they reach the terminal, including all 170 Unicode 17.0 general-category `Cf` format controls. This applies to `--list`, kill result lines (both the `name` column and the `message` column, since `KillResult::failure` stores `error.to_string()` which can embed the offending process name via `NotDescendant(pid, name)` / `Denylisted(name)`), the stderr error line emitted by `main()` (`safe-kill: ...`), `safe-kill init` created/skipped path output, overwrite prompts, and config-load warnings. Crafted argv or paths containing ANSI escape sequences, OSC sequences, newlines, or bidirectional Unicode controls cannot rewrite, hide, or visually reorder rows of output, and escape sequences cannot be cut mid-byte by the column-width truncation logic. The escape introducer `\` is itself escaped to `\\`, which keeps the transformation injective — without it, a process genuinely containing an ESC byte and a process literally named `\x1B[2J` would render identically, so a reader could not tell which one actually carries a control character.
 
+    Clap usage errors are sanitized on the same principle. Clap embeds the offending argument verbatim (`invalid value '<value>' for '[PID]'`), performs no control-character removal of its own, and `Error::print()` writes raw bytes through `anstream` — so on a terminal, `\x1b[2J` (clear screen) or `\r` (carriage return, overwriting the line in place) reaches the screen unchanged. Only when the output is piped does `anstream` strip ANSI, which makes the gap easy to miss. `parse_args` therefore renders the error to plain text via `Error::render()`, passes it through `sanitize_terminal`, and writes it as a single `safe-kill: ...` line. Newlines are escaped along with everything else because a rendered string no longer distinguishes clap's own layout breaks from newlines that came in through an argument — keeping the line structure would let an argument forge a standalone `error:` line and present a fake recovery instruction ("disable the protection and retry") as the tool's own diagnostic. `--help` and `--version` keep clap's coloring, which is only safe because `Command` sets `bin_name = "safe-kill"`: without it clap uses the basename of `argv[0]` in the usage line (`name` does not cover this), so launching through a symlink whose name contains control characters — or via `exec -a` — would print `Usage: fake\rFORGED [OPTIONS] [PID]` with the raw bytes intact.
+
 12. **Thread (TID) Exclusion**: `sysinfo` enumerates process tasks by default, so on Linux every `/proc/<pid>/task/<tid>` thread would show up as a process in its own right. Threads can rename themselves freely via `prctl(PR_SET_NAME)` / `pthread_setname_np`, and `kill(2)` on a TID is delivered to the whole thread group — so without this guard, a denylisted process could be taken down by passing one of *its threads'* names to `--name`, sidestepping the denylist entirely. The process snapshot is refreshed with `without_tasks()`, and because `ProcessesToUpdate::Some` returns a TID regardless of that setting, every read path additionally rejects entries with `thread_kind().is_some()`. macOS is unaffected (`proc_listallpids` returns processes only).
 
 13. **Configuration File Type and Write Validation**: Strict configuration loading and `safe-kill init` accept only regular files or symlinks resolving to regular files. Dangling symlinks and special files are rejected before I/O. During initialization, the validated parent directory is pinned after a device/inode check, and the destination is opened relative to that directory descriptor with `openat(O_NONBLOCK | O_NOFOLLOW)`. The opened regular file's device/inode is checked before truncation, while a path absent during validation is limited to atomic `O_CREAT | O_EXCL` creation. FIFO hangs and device writes are rejected; symlink, regular-file, or parent-directory replacement before open fails closed, and replacement after open cannot redirect the pinned file descriptor.
@@ -297,6 +299,14 @@ targets such as `--list --port 3000` — all exit with **255**, never 2. Exit co
 "permission denied", so a caller can branch on it without mistaking a typo for a real permission
 failure. `--help` and `--version` exit 0.
 
+A reader closing the output stream does not change the exit code: `safe-kill --list | head -1`
+exits 0 because the listing itself completed and only the reader went away. Other write failures
+(a full disk, for example) exit with **255**, since the result was genuinely lost. The exit code
+always describes the operation, never whether its description reached anyone — a kill that
+succeeded reports success even if the result line could not be printed. Rust ignores `SIGPIPE`
+at startup, so without this handling `println!` would panic and yield exit code 101, which is
+outside the documented set.
+
 ## Environment Variables
 
 | Variable | Description |
@@ -365,10 +375,10 @@ cargo build --release
 
 ### Test Coverage
 
-- **Library Unit Tests**: 425 tests covering all modules
-- **Binary Unit Tests**: 35 tests for CLI output utilities, error sanitization, and version checks
-- **Integration Tests**: 79 tests with real process trees. Temporary process names include the test runner PID and a sequence number, so concurrent `cargo test` invocations cannot collide while staying within Linux's 15-byte `comm` limit.
-- **E2E Tests**: 91 tests for CLI behavior, including private config permissions under a permissive `umask`
+- **Library Unit Tests**: 438 tests covering all modules. Ancestry traversal stop conditions (depth limit, parent-PID cycles, PID 1 termination) are verified against injected process trees, since a real process tree cannot be made to exhibit them.
+- **Binary Unit Tests**: 41 tests for CLI output utilities, error sanitization, and version checks
+- **Integration Tests**: 80 tests with real process trees. Temporary process names include the test runner PID and a sequence number, so concurrent `cargo test` invocations cannot collide while staying within Linux's 15-byte `comm` limit. Partial-success batches are covered by spawning a same-named descendant and an orphan (re-parented to PID 1), which is the only way to make `--name` match processes that differ in kill permission.
+- **E2E Tests**: 108 tests for CLI behavior, including private config permissions under a permissive `umask` and sanitization of control characters embedded in clap usage errors
 
 ## Contributing
 
