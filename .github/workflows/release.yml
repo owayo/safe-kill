@@ -1,16 +1,24 @@
+# Rust の CLI のリリース。github-project-standard の正規形 (release-rust.yml) に合わせている。
+# 配布は GitHub Releases の添付だけ (Homebrew の tap と winget は使わない)。safe-kill は Unix の
+# シグナルとプロセスツリーを扱う (nix クレート) ので、Windows には配らない。
+#
+# build の matrix は ci.yml の build と同じ組にする (dry_run では build が走らないので、配布物を
+# 作れることは ci.yml の build で確かめる)。
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Dry run (skip actual release)'
+        description: "Dry run (compute the next version only; no commit, tag or release)"
         type: boolean
         default: false
 
+# 書き込みはジョブ単位で与える (版のコミットとタグの push、Release の作成)
 permissions:
-  contents: write
+  contents: read
 
+# 同時に 2 つのリリースを走らせない (同じ番号を 2 回採る)。走っているものは止めない
 concurrency:
   group: release
   cancel-in-progress: false
@@ -21,145 +29,256 @@ env:
 
 jobs:
   prepare-release:
-    name: Prepare Release
+    name: Prepare release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     outputs:
       version: ${{ steps.bump.outputs.version }}
       tag: ${{ steps.bump.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Configure Git
+      # 本番は既定のブランチからだけ出す (ほかのブランチから出すと、既定のブランチに無いコミットにタグが付く)。
+      # dry_run はどのブランチでも動くので、workflow の変更をブランチで試せる
+      - name: Check the branch
+        if: ${{ !inputs.dry_run }}
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ "${GITHUB_REF}" != "refs/heads/${DEFAULT_BRANCH}" ]; then
+            echo "::error::Run the release from ${DEFAULT_BRANCH} (this run is on ${GITHUB_REF})"
+            exit 1
+          fi
 
-      - name: Bump version
+      - uses: actions/checkout@v7
+
+      # cargo update を mise.toml の版の Rust で実行する (無いとランナーに最初から入っている Rust で動く)
+      - uses: jdx/mise-action@v4
+        with:
+          minimum_release_age: 14d
+          cache: false
+
+      - name: Bump the version
         id: bump
         run: |
-          # Windows MSI 互換のため、年は 2 桁 (YY) にする（major version は 255 以下が必要）
-          YEAR=$(date +%y)
-          MONTH=$(date +%-m)
-
-          CURRENT=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          set -euo pipefail
+          # 版は yy.m.counter。年は 2 桁 (Windows の MSI は major が 255 以下)。月はゼロ埋めしない
+          # (SemVer は数値の先頭の 0 を禁じ、Cargo は 26.08.100 を拒む)。連番は 100 から (桁がそろう)。
+          # 採番は JST で切る。ランナーは UTC なので、素の date では JST の月初 0〜9 時のリリースが
+          # 前の月の連番になる
+          YEAR=$(TZ=Asia/Tokyo date +%y)
+          MONTH=$(TZ=Asia/Tokyo date +%-m)
+          CURRENT=$(awk -F '"' '/^version = /{ print $2; exit }' Cargo.toml)
           echo "Current version: ${CURRENT}"
-
-          if echo "${CURRENT}" | grep -qE '^[0-9]{2,4}\.[0-9]{1,2}\.[0-9]+$'; then
-            OLD_YEAR=$(echo "${CURRENT}" | cut -d. -f1)
-            OLD_MONTH=$(echo "${CURRENT}" | cut -d. -f2)
-            OLD_COUNTER=$(echo "${CURRENT}" | cut -d. -f3)
-            # 2 桁年と 4 桁年の両方を扱う
-            OLD_YEAR_2DIGIT=$(echo "${OLD_YEAR}" | sed 's/^20//')
-            if [ "${OLD_YEAR_2DIGIT}" = "${YEAR}" ] && [ "${OLD_MONTH}" = "${MONTH}" ]; then
-              NEW_COUNTER=$((OLD_COUNTER + 1))
-            else
-              NEW_COUNTER=100
+          COUNTER=100
+          if [[ "${CURRENT}" =~ ^([0-9]{2,4})\.([0-9]{1,2})\.([0-9]+)$ ]]; then
+            # 4 桁の年 (2026.9.105) の版からも続けて採番する
+            if [ "${BASH_REMATCH[1]#20}" = "${YEAR}" ] && [ "${BASH_REMATCH[2]}" = "${MONTH}" ]; then
+              COUNTER=$((BASH_REMATCH[3] + 1))
             fi
-          else
-            NEW_COUNTER=100
+          fi
+          VERSION="${YEAR}.${MONTH}.${COUNTER}"
+          TAG="v${VERSION}"
+          echo "Next version: ${VERSION}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" > /dev/null; then
+            echo "::error::Tag ${TAG} already exists. Check the version in Cargo.toml against the existing tags"
+            exit 1
           fi
 
-          NEW_VERSION="${YEAR}.${MONTH}.${NEW_COUNTER}"
-          echo "New version: ${NEW_VERSION}"
+          # [package] の version (ファイルで最初の `version = ` の行) だけを書き換える (依存の version は触らない)
+          sed -i "0,/^version = \"[^\"]*\"/s//version = \"${VERSION}\"/" Cargo.toml
+          test "$(awk -F '"' '/^version = /{ print $2; exit }' Cargo.toml)" = "${VERSION}"
+          # Cargo.lock は自分のパッケージの版だけを合わせる (lockfile を作り直すと全依存が最新へ
+          # 解決し直され、CI で確かめていない版が配布物に入る)
+          cargo update --workspace
+          git diff --stat
 
-          sed -i "s/^version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
-
-          if [ -f "Cargo.lock" ]; then
-            cargo generate-lockfile 2>/dev/null || true
-          fi
-
-          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
-          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Commit and tag
-        if: ${{ inputs.dry_run != true }}
+        if: ${{ !inputs.dry_run }}
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          git add Cargo.toml
-          [ -f "Cargo.lock" ] && git add Cargo.lock || true
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release ${TAG}"
+          git tag -a "${TAG}" -m "Release ${TAG}"
+          # ブランチとタグを 1 回で送る。--atomic で、ブランチが先に進んでいて片方だけが通ることを防ぐ
+          git push --atomic origin "HEAD:refs/heads/${DEFAULT_BRANCH}" "refs/tags/${TAG}"
 
-          git commit -m "Release ${{ steps.bump.outputs.tag }}"
-          git tag -a "${{ steps.bump.outputs.tag }}" -m "Release ${{ steps.bump.outputs.tag }}"
-          git push origin ${{ github.ref_name }} "${{ steps.bump.outputs.tag }}"
-
-      - name: Dry run info
-        if: ${{ inputs.dry_run == true }}
+      - name: Dry run
+        if: ${{ inputs.dry_run }}
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
         run: |
-          echo "🧪 Dry run mode - skipping commit and tag"
-          echo "Would release: ${{ steps.bump.outputs.tag }}"
+          echo "Dry run: would release ${TAG} (no commit, tag or release)"
+          git diff -- Cargo.toml Cargo.lock
 
-  build-and-release:
-    name: Build and Release
+  build:
+    name: Build (${{ matrix.target }})
     needs: prepare-release
-    if: ${{ inputs.dry_run != true }}
+    if: ${{ !inputs.dry_run }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        # ci.yml の build と同じ組 (行を足したら両方に足す)
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact_name: safe-kill
-            asset_name: safe-kill-linux-amd64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact_name: safe-kill
-            asset_name: safe-kill-darwin-amd64
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact_name: safe-kill
-            asset_name: safe-kill-darwin-arm64
-
+          - os: macos-latest
+            target: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.prepare-release.outputs.tag }}
+          persist-credentials: false
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # ビルドのキャッシュ (rust-cache) は使わない。配布物を作るジョブがキャッシュを読むと、キャッシュを
+      # 書けるほかのジョブの汚染が配布物に入る。Rust の版と mise.toml の [env] は mise-action が渡す
+      - uses: jdx/mise-action@v4
         with:
-          targets: ${{ matrix.target }}
+          minimum_release_age: 14d
+          cache: false
+
+      # mise.toml の rust はホストのツールチェーンと components だけを入れるので、配布のターゲットを足す
+      - name: Add the Rust target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ matrix.asset_name }}
-          path: ./target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
-
-  publish-release:
-    name: Publish Release
-    needs: [prepare-release, build-and-release]
-    if: ${{ inputs.dry_run != true }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v7
-        with:
-          path: artifacts
-
-      - name: Prepare release assets
+      # 添付の名前は <bin>-<target>.tar.gz。中身はバイナリだけを最上位に置く
+      - name: Package
+        id: package
+        env:
+          TARGET: ${{ matrix.target }}
+          TAR_GZ: ${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz
         run: |
-          mkdir -p release-assets
-          for dir in artifacts/*/; do
-            name=$(basename "$dir")
-            # ディレクトリではなくバイナリファイルを探す
-            find "$dir" -type f -exec cp {} "release-assets/$name" \;
-          done
-          ls -la release-assets/
+          set -euo pipefail
+          tar -czf "${TAR_GZ}" -C "target/${TARGET}/release" "${BINARY_NAME}"
+          echo "asset=${TAR_GZ}" >> "$GITHUB_OUTPUT"
 
-      - name: Create Release
+      # archive: false で添付のファイルをそのまま上げる (artifact の名前はファイル名になる)
+      - uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.package.outputs.asset }}
+          archive: false
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [prepare-release, build]
+    if: ${{ !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      assets: ${{ steps.files.outputs.assets }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Write SHA256SUMS
+        id: files
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+          echo "assets=$(printf '%s ' *)" >> "$GITHUB_OUTPUT"
+
+      # タイトルはタグ名だけ。本文は導入の手順で、変更点は generate_release_notes が後ろに足す
+      - name: Create the release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.prepare-release.outputs.tag }}
-          name: Release ${{ needs.prepare-release.outputs.tag }}
-          files: release-assets/*
-          generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ${{ needs.prepare-release.outputs.tag }}
+          body: |
+            ## Install
 
-      - name: Release summary
-        run: echo "🚀 Released ${{ needs.prepare-release.outputs.tag }}"
+            ### Download
+
+            Download `${{ env.BINARY_NAME }}-<target>.tar.gz` for your platform (Linux x86_64, macOS Apple Silicon or Intel) from the assets below, extract it and put `${{ env.BINARY_NAME }}` on your `PATH`. `SHA256SUMS` lists the checksums of all assets.
+
+            ```bash
+            curl -fLO https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare-release.outputs.tag }}/${{ env.BINARY_NAME }}-aarch64-apple-darwin.tar.gz
+            tar -xzf ${{ env.BINARY_NAME }}-aarch64-apple-darwin.tar.gz
+            ```
+          generate_release_notes: true
+          files: release/*
+          fail_on_unmatched_files: true
+
+      # 公開した添付が release/ と名前・大きさ・状態まで一致するか (アップロードの取りこぼしを見つける)。
+      # GitHub が添付の SHA-256 (digest) を返していれば、それも照らす
+      - name: Verify the published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json assets > "${RUNNER_TEMP}/assets.json"
+          find release -type f -printf '%f %s uploaded\n' | LC_ALL=C sort > "${RUNNER_TEMP}/expected.txt"
+          jq -r '.assets[] | "\(.name) \(.size) \(.state)"' "${RUNNER_TEMP}/assets.json" | LC_ALL=C sort > "${RUNNER_TEMP}/published.txt"
+          if ! diff -u "${RUNNER_TEMP}/expected.txt" "${RUNNER_TEMP}/published.txt"; then
+            echo "::error::The published assets differ from the files in release/"
+            exit 1
+          fi
+          jq -r '.assets[] | select(.digest != null) | "\(.digest | ltrimstr("sha256:"))  \(.name)"' "${RUNNER_TEMP}/assets.json" > "${RUNNER_TEMP}/published.sha256"
+          if [ -s "${RUNNER_TEMP}/published.sha256" ]; then
+            (cd release && sha256sum --check --strict --quiet "${RUNNER_TEMP}/published.sha256")
+          else
+            echo "::warning::GitHub returned no asset digests; skipped the SHA-256 comparison"
+          fi
+
+  # ---- 結果のまとめ ------------------------------------------------------------------------
+  # 途中のジョブが落ちても、飛ばされても (dry_run を含む) 結果を書く
+  release-summary:
+    name: Release summary
+    needs: [prepare-release, build, release]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write the summary
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+          PREPARE_RESULT: ${{ needs.prepare-release.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+          ASSETS: ${{ needs.release.outputs.assets }}
+        run: |
+          set -euo pipefail
+          {
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "## Dry run: ${TAG:-no version}"
+              echo
+              echo "prepare-release: ${PREPARE_RESULT}. Nothing was committed, tagged or released, and the build did not run (ci.yml builds every target)."
+              exit 0
+            fi
+            echo "## ${TAG:-no version}"
+            echo
+            echo "| Job | Result | Note |"
+            echo "|---|---|---|"
+            echo "| prepare-release | ${PREPARE_RESULT} | |"
+            echo "| build | ${BUILD_RESULT} | |"
+            echo "| release | ${RELEASE_RESULT} | |"
+            if [ -n "${ASSETS:-}" ]; then
+              echo
+              echo "Assets of ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}:"
+              echo
+              read -r -a assets <<< "${ASSETS}"
+              for asset in "${assets[@]}"; do
+                echo "- \`${asset}\`"
+              done
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
