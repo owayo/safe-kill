@@ -1,33 +1,36 @@
 <h1 align="center">safe-kill</h1>
 
 <p align="center">
-  <strong>AIエージェント向けの安全なプロセス終了ツール（親子関係に基づくアクセス制御）</strong>
+  AI エージェント向けの、親子関係に基づくアクセス制御を備えた安全なプロセス終了ツール
+</p>
+
+<!-- standard:badges:start -->
+<h3 align="center">対応プラットフォーム</h3>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Linux-FCC624?logo=linux&amp;logoColor=black" alt="Linux">
+  <img src="https://img.shields.io/badge/macOS-000000?logo=apple&amp;logoColor=white" alt="macOS">
 </p>
 
 <p align="center">
-  <a href="https://github.com/owayo/safe-kill/actions/workflows/ci.yml">
-    <img alt="CI" src="https://github.com/owayo/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main">
-  </a>
-  <a href="https://github.com/owayo/safe-kill/releases/latest">
-    <img alt="Version" src="https://img.shields.io/github/v/release/owayo/safe-kill">
-  </a>
-  <a href="LICENSE">
-    <img alt="License" src="https://img.shields.io/github/license/owayo/safe-kill">
-  </a>
+  <a href="https://github.com/owayo/safe-kill/actions/workflows/ci.yml"><img src="https://github.com/owayo/safe-kill/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/owayo/safe-kill/releases/latest"><img src="https://img.shields.io/github/v/release/owayo/safe-kill" alt="Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/owayo/safe-kill" alt="License"></a>
 </p>
 
 <p align="center">
   <a href="README.md">English</a> |
   <a href="README.ja.md">日本語</a>
 </p>
+<!-- standard:badges:end -->
 
 ---
 
-## 概要
-
 `safe-kill` は、AIエージェントがシステムプロセスや無関係なアプリケーションを誤って終了させることを防ぐCLIツールです。**親子関係に基づくアクセス制御**を強制し、エージェントのセッションから派生したプロセスのみを終了できます。
 
-## 特徴
+Claude Code などのエージェントに、`kill` / `pkill` / `killall` の代わりとして使わせます。対象は毎回、セッションのプロセスツリーとシステムプロセスの拒否リストに照らして判定し、シグナルを送る直前にも同じプロセスかどうかを確かめ直します。
+
+## 機能
 
 - **親子関係検証**: セッションから派生したプロセスのみ終了可能
 - **自己破壊防止**: 自身や親プロセスの終了を防止。シグナル送信直前に最新の親 PID を OS から再取得して再検証し、判定～kill 間の再ペアレント（親の入れ替わり）にも fail-closed で対応
@@ -46,188 +49,68 @@
 - **決定的な処理順**: バッチ一致結果と終了可能プロセス一覧を PID 昇順にそろえ、出力を再現しやすくする
 - **正確な失敗報告**: ポリシーチェック通過後の `ProcessNotFound` / `PermissionDenied` をそのまま返す
 
-## 動作環境
-
-- **OS**: macOS、Linux
-- **Rust**: 1.85以上（ソースからビルドする場合）
-
 ## インストール
 
-### ソースからビルド
+<!-- standard:install:start -->
+### Cargo
+
+Rust 1.98 以上が必要です。
 
 ```bash
-cargo install --path .
+cargo install --git https://github.com/owayo/safe-kill --locked
 ```
 
-### バイナリダウンロード
+### GitHub Releases から
 
-[Releases](https://github.com/owayo/safe-kill/releases) から最新版をダウンロード。
+[Releases](https://github.com/owayo/safe-kill/releases/latest) から自分の環境のアーカイブを取得して展開し、`safe-kill` を `PATH` の通った場所に置きます。各リリースには、取得したファイルを確かめるための `SHA256SUMS` も添付しています。
 
-## クイックスタート
+| プラットフォーム | ファイル |
+|---|---|
+| Linux (x86_64) | `safe-kill-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS (Intel) | `safe-kill-x86_64-apple-darwin.tar.gz` |
+| macOS (Apple Silicon) | `safe-kill-aarch64-apple-darwin.tar.gz` |
+
+macOS でブラウザから取得した場合は、実行の前に隔離属性を外します: `xattr -d com.apple.quarantine safe-kill`。
+
+### ソースから
+
+[mise](https://mise.jdx.dev/) が必要です (Rust のツールチェーンは `mise.toml` で固定しています)。
+
+```bash
+git clone https://github.com/owayo/safe-kill.git
+cd safe-kill
+make install
+```
+
+`make install` は `/usr/local/bin` に入れます。場所を変えるときは `INSTALL_PATH` を指定します (例: `make install INSTALL_PATH="$HOME/.local/bin"`)。
+<!-- standard:install:end -->
+
+## 使い方
 
 ```bash
 # 終了可能なプロセス一覧
 safe-kill --list
 
-# PIDを指定して終了（安全チェック付き）
-safe-kill 12345
-
-# プロセス名で終了
-safe-kill --name node
-
-# ドライラン（実行せずにプレビュー）
-safe-kill --name python --dry-run
-```
-
-## 使い方
-
-### コマンド
-
-```bash
-safe-kill [OPTIONS] [PID]
-safe-kill init [--force]
-```
-
-`init` は単独で使うサブコマンドです。`PID`、`--name`、`--port`、`--list`、`--signal`、`--dry-run` とは組み合わせできません。
-
-設定ファイルが既に存在する場合、`init` は上書き前に確認を求めます（`--force` で確認を省略）。確認を拒否した場合は既存ファイルを変更せず正常終了します（終了コード 0）。実際の書き込み失敗のみ設定エラー（終了コード 3）として報告されます。
-
-設定ファイルが symlink の場合（`~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml` のような dotfiles 管理の一般的な運用）もそのまま使えます。`init` はリンクを追従して実体ファイルを更新し、symlink 自体は維持します。ただし書き換わるのは指定したパスそのものではないため、確認プロンプトと成功メッセージの両方で解決後の実体パスを開示します。**壊れた** symlink（リンク先が存在しない）は、リンク先へ黙ってファイルを新規作成せず拒否します（`--force` を付けても終了コード 3）。
-
-`init` が受け入れるのは通常ファイル、または通常ファイルへ解決できる symlink だけです。ディレクトリ・FIFO・デバイスと、それらへ解決される symlink は open 前に拒否するため、`--force` でも FIFO で待ち続けたりデバイスへ書き込んだりしません。検証済みの親ディレクトリは device/inode を確認してファイルディスクリプタで固定し、そこから non-blocking・symlink 非追従で書き込み先を開きます。取得したファイルの device/inode も truncate 前に再検証します。open 前のパス置換は fail-closed で停止し、open 後にパスが変わっても固定済みのファイルディスクリプタから別ファイルへ書き込みを誘導されません。
-
-新規設定では、`init` は `~/.config/safe-kill` を `0700`、`config.toml` を `0600` で作成します。作成時の権限上限を明示するため、呼び出し元が `umask 000` でも allowlist・denylist・許可ポート設定を他ユーザーが書き換えられる権限にはなりません。より厳しい `umask` はそのまま有効です。
-
-### オプション
-
-| オプション | 短縮形 | 説明 |
-|-----------|-------|------|
-| `--name <NAME>` | `-N` | プロセス名の完全一致で終了 |
-| `--port <PORT>` | `-p` | 指定ポートを使う設定済み TCP リスナーまたは UDP ソケットを終了（`1`-`65535`。`0` は拒否） |
-| `--signal <SIGNAL>` | `-s` | 送信するシグナル（デフォルト: SIGTERM） |
-| `--list` | `-l` | 終了可能なプロセス一覧 |
-| `--dry-run` | `-n` | シグナルを送信せずにプレビュー |
-| `--help` | `-h` | ヘルプ表示 |
-| `--version` | `-V` | バージョン表示 |
-
-### シグナル
-
-シグナルは名前または番号で指定できます:
-
-| シグナル | 番号 | 説明 |
-|---------|-----|------|
-| SIGTERM | 15 | 正常終了（デフォルト） |
-| SIGKILL | 9 | 強制終了 |
-| SIGHUP | 1 | ハングアップ |
-| SIGINT | 2 | 割り込み |
-| SIGQUIT | 3 | 終了 |
-| SIGUSR1 | 10 (Linux) / 30 (macOS) | ユーザー定義シグナル1（プラットフォーム固有の番号のみ） |
-| SIGUSR2 | 12 (Linux) / 31 (macOS) | ユーザー定義シグナル2（プラットフォーム固有の番号のみ） |
-
-### 使用例
-
-```bash
-# 正常終了
+# PIDを指定して終了（SIGTERM、安全チェック付き）
 safe-kill 12345
 
 # 強制終了
 safe-kill --signal SIGKILL 12345
 safe-kill -s 9 12345
 
-# セッション内のすべてのnodeプロセスを終了
+# セッション内のすべてのnodeプロセスを終了（名前の完全一致）
 safe-kill --name node
 
 # ポート3000を使う設定済み TCP リスナーまたは UDP ソケットを終了
 safe-kill --port 3000
 
-# 終了対象をプレビュー
+# ドライラン（実行せずにプレビュー）
 safe-kill --name python --dry-run
 ```
 
-`--name` / `--port` の dry-run では、実際に kill したと誤解しないように集計行を `would kill` 表示にしています。
+`--name` は実行ファイル名の完全一致で判定し、`--port` は[設定](#設定)の `[allowed_ports]` に書いたポートにだけ使えます。終了コード 2 は常に「権限エラー」を表し、CLI の使用方法エラーはすべて 255 で終了します。全オプション・シグナル・終了コード・環境変数は [docs/cli-reference.ja.md](docs/cli-reference.ja.md) にまとめています。
 
-`--name` は実行ファイル名の完全一致で判定します。部分一致やパターン一致は行いません。
-
-`--name` で複数プロセスが一致した場合、結果は PID 昇順で処理・表示されるため、繰り返し実行しても順序が安定します。
-
-`--port` は TCP では `LISTEN` 状態のソケットだけを対象にします。同じローカルポートを持つ接続済み TCP クライアントソケットは対象外です。UDP は接続状態を持たないため、ローカルポート一致で対象にします。ポート `0` は OS の自動割り当て用の特殊値であり、終了対象ではないため常に拒否します。
-
-### エラーハンドリング
-
-ポリシーチェックは通過したがシグナル送信前に対象プロセスが終了していた場合や、OS により送信が拒否された場合は、`NoKillableTarget` に丸めず `ProcessNotFound` や `PermissionDenied` として元の実行時エラーを返します。
-
-## 設定
-
-`safe-kill init` で設定を初期化するか、`~/.config/safe-kill/config.toml` を手動で作成:
-
-```toml
-# 親子関係チェックをバイパスするプロセス（慎重に使用）
-[allowlist]
-processes = ["my-trusted-app", "next-server"]
-
-# 追加で絶対に終了できないプロセス（許可リストより優先）
-# システム保護の既定 denylist は維持され、この設定はそこへ追加されます
-[denylist]
-processes = ["postgres"]
-
-# --port オプションで許可するポート
-# 指定しない場合、--port オプションは無効（ポート指定でのkillは不可）
-# 有効な値は 1-65535。ポート 0 は設定に含めても常に拒否されます。
-[allowed_ports]
-ports = ["1420", "3000-3010", "5173", "8080"]
-#   - 1420: Tauri開発サーバー
-#   - 3000-3010: Node.js開発サーバー
-#   - 5173: Vite開発サーバー
-#   - 8080: HTTP代替ポート
-```
-
-### デフォルト拒否リスト
-
-以下のシステムプロセスはデフォルトで保護されます:
-
-**macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
-
-**Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
-
-ユーザー定義の `[denylist]` はこの既定保護に追加されます。カスタマイズしてもシステムプロセスの保護は解除されません。
-
-`config.toml` が存在するのにアクセス・読み込み・解析できない場合、または未知フィールドを含む場合、kill/list 系コマンドは設定エラーとして停止します。通常ファイルと、通常ファイルへ解決できる symlink は読み込めます。壊れた symlink、ディレクトリ・FIFO・デバイスへ解決されるパスは読み込み前に拒否し、管理対象の設定消失によるカスタム保護の暗黙解除や、特殊ファイルによる待機・無制限読み込みを防ぎます。
-
-## アーキテクチャ
-
-```mermaid
-flowchart TB
-    CLI[CLIパーサー] --> Policy[ポリシーエンジン]
-    Policy --> Ancestry[親子関係チェッカー]
-    Policy --> Config[設定ローダー]
-    Policy --> Killer[プロセスキラー]
-    Ancestry --> ProcInfo[プロセス情報プロバイダー]
-    Killer --> Signal[シグナル送信]
-```
-
-### 安全レイヤー
-
-1. **自己破壊防止**: 自身および親プロセスの終了を拒否。ポリシー判定時の早期拒否に加え、`kill(2)` 直前に最新の親 PID を OS から再取得して再検証する。判定～kill の間に親が入れ替わった（再ペアレント）場合も fail-closed で拒否し、親 PID が不明な場合も安全側に倒す
-2. **PID検証**: 危険なPID値（`0`・範囲外）をシグナル送信前に拒否。kill 直前の TOCTOU 検証で使う fresh なプロセス情報取得でも、OS のプロセス snapshot を参照する前に PID `0` と `i32::MAX` 超過を拒否する
-3. **拒否リストチェック**: システムプロセスは常に保護
-4. **PID 1 保護**: PID 1（init/launchd 相当）自体は常に kill 対象から外す。コンテナ環境では PID 1 が `node` / `python` などの非標準プロセスとして既定拒否リストに含まれないケースがあり、許可リスト経由やポート kill でも巻き添えで終了させるとコンテナ全体が落ちるため、親子関係 / 許可リスト判定より手前で fail-closed する（`can_kill` と `can_kill_for_port` の両経路）
-5. **ルートPID保護**: 信頼ルート自体は許可リストに含まれていても終了不可
-6. **許可リストバイパス**: 信頼されたプロセスは親子関係チェックをスキップ
-7. **親子関係検証**: ルートセッションの子孫のみ終了可能。PID 1（init/launchd）は信頼ルートとして採用しない。自動検出でルートが PID 1 になる環境（コンテナや systemd サービス配下など、親が PID 1 のケース）では、より内側（親→現在プロセス）へフォールバックして fail-closed に倒し、全プロセスを子孫扱いしてしまうことを防ぐ。さらに信頼ルートの初期 identity（`pid + start_time + name`）を構築時に取得して保持し、すべての子孫判定で identity 同一性を検証する。identity 検証と親子チェーン探索は同一 snapshot 上で行い両者の TOCTOU 窓を最小化する。`refresh()` で identity は更新せず、不一致を検出した場合は以後 fail-closed に倒す（更新すると信頼ルート PID を再利用した別プロセスを正規の信頼ルートとして受け入れてしまうため）。低レベルの親子チェーン探索でも、`target == ancestor` の同一 PID ケースを許可する前に対象 PID が存在することを確認し、存在しない PID を「自分自身の子孫」として扱わない
-8. **PID再利用検出 (TOCTOU 緩和)**: ポリシー判定後、`kill(2)` 直前に最新のプロセス情報を OS から取得し、`pid + start_time + name` の同一性を再検証。判定時と異なるプロセスへ PID が再利用されていれば `ProcessNotFound` で fail-closed する。`start_time` は秒精度のため、同一秒内に同名プロセスへ再利用されたケースは検出できない（実用上は極めて稀）。完全な保護には Linux の `pidfd_open` + `pidfd_send_signal` が必要
-9. **kill 直前の親子関係再評価**: PID/名前指定で `KillPermission::Allowed`（親子関係経由）で許可されたプロセスは、`kill(2)` 直前に新しい `ProcessInfoProvider` snapshot で子孫判定をやり直す。判定～kill の間に対象が再ペアレントされて信頼ルート外に出ていた場合は `NotDescendant` として fail-closed する。`AllowedByAllowlist`（許可リストは設計上親子関係をバイパス）と `--port` 指定は再評価をバイパスする
-10. **ポート保持の再検証 (`--port` 指定時)**: `kill(2)` 直前に対象ポートの保持者集合を再取得し、判定時の対象 PID/プロトコルが含まれなければ `NoProcessOnPort` で fail-closed する。判定～kill の間に対象がポートを離した場合、ユーザーの「ポートを解放したい」意図は既に達成されているため、余計なシグナル送信を抑止する
-11. **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape（画面消去・OSC 等）、改行、タブ、C0/C1 制御文字、Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字（双方向テキスト制御等）を `\xHH` または `\u{HHHH}` のエスケープ表記に置き換えてから出力する（`terminal.rs::sanitize_terminal` / `sanitize_path`）。`--list` 出力、kill 結果表示（`print_kill_result` の `name` 列と `message` 列の両方。`KillResult::failure` は `error.to_string()` を `message` に保持しており、`NotDescendant(pid, name)` や `Denylisted(name)` のように攻撃者プロセス名が含まれ得る）、`main()` の stderr エラー出力、`safe-kill init` の作成/スキップ/上書き確認パス、設定読み込み警告のすべてでサニタイズ済みの文字列のみが端末へ流れる。kill が拒否される側でも表示行の上書きや端末状態の改ざんを防ぎ、双方向制御文字による表示順偽装も防ぐ。サニタイズは `truncate` より前に行うため、escape sequence の途中で切られて端末状態が残ることもない。エスケープ導入文字 `\` 自身も `\\` に置換して変換の単射性を保つ（これを省くと、実際に ESC を含むプロセスと、リテラルで `\x1B[2J` という名前を持つプロセスの表示が一致してしまい、どちらが本当に制御文字を含むのか判別できなくなる）
-
-    clap の使用方法エラーも同じ原則でサニタイズする。clap は `invalid value '<値>' for '[PID]'` のように引数値を無加工で埋め込み、clap 側に制御文字の除去は無く、`Error::print()` は anstream 経由で生バイトを書き出す。そのため端末では `\x1b[2J`（画面消去）や `\r`（行頭復帰による行の上書き）がそのまま画面へ届く。ANSI が落ちるのはパイプへ流したときだけなので、この穴は見落としやすい。`parse_args` は `Error::render()` でプレーンテキスト化し、`sanitize_terminal` に通してから `safe-kill: ...` の 1 行として書き出す。改行も他の制御文字と同様にエスケープするのは、描画後の文字列からは clap 自身のレイアウト改行と引数由来の改行を区別できないため。行構造を残すと、引数に改行を混ぜるだけで独立した `error:` 行を偽造でき、「保護設定を外して再実行せよ」といった偽の復旧手順をツール自身の診断として提示できてしまう。`--help` / `--version` は clap の色付けをそのまま使うが、それが安全なのは `Command` に `bin_name = "safe-kill"` を指定しているからである。未指定だと clap は Usage 行に `argv[0]` の basename を使い（`name` では塞げない）、制御文字を含む名前の symlink 経由や `exec -a` で起動すると `Usage: fake\rFORGED [OPTIONS] [PID]` のように生バイトがそのまま出力される
-
-12. **スレッド（TID）除外**: `sysinfo` は既定でタスク（スレッド）も列挙するため、Linux では `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る。スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の名前を自由に変更でき、TID への `kill(2)` はスレッドグループ全体へ配送される。そのため防御しないと、denylist に載せたプロセスでも「そのスレッド名」を `--name` に渡せば名前一致を回避して本体を落とせてしまう。プロセス一覧の refresh は `without_tasks()` を明示し、`ProcessesToUpdate::Some` はこの設定に関わらず TID を返すため、参照側でも `thread_kind()` が `Some` のエントリを一律に拒否する。macOS は `proc_listallpids` がプロセスのみ返すため影響を受けない。
-
-13. **設定ファイル種別と書き込みの検証**: 厳格設定読み込みと `safe-kill init` は、通常ファイルまたは通常ファイルへ解決できる symlink だけを受け入れる。壊れた symlink と特殊ファイルは I/O 前に拒否する。初期化時は検証済みの親ディレクトリを device/inode 照合後のFDで固定し、そこから `openat(O_NONBLOCK | O_NOFOLLOW)` で書き込み先を開く。取得した通常ファイルの device/inode は truncate 前に再検証し、検証時に存在しなかったパスは `O_CREAT | O_EXCL` による原子的な新規作成に限定する。FIFO での無期限待機とデバイスへの書き込みを拒否し、open 前の symlink・通常ファイル・親ディレクトリ置換は fail-closed、open 後の置換は固定済みFDへの書き込みでリダイレクトを防ぐ。
-
-14. **設定ファイルの非公開権限**: 新規設定ディレクトリは `0700`、新規 `config.toml` は `0600` を上限として作成する。権限は作成時に指定するため、`umask 000` でも allowlist・denylist・許可ポートの認可設定を他ユーザーが変更できる状態にしない。
-
-### プロセスツリーと終了可能範囲
+### 終了できるプロセス
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#666666', 'primaryTextColor': '#000000', 'primaryBorderColor': '#666666' }}}%%
@@ -274,7 +157,6 @@ flowchart TB
 | ルートセッションプロセス | ❌ 不可 | ❌ 不可 | 信頼ルート自体は子孫ではない |
 | `launchd`/`systemd` | ❌ 不可 | ❌ 不可 | システムプロセス（拒否リスト） |
 
-**ポイント**:
 - `safe-kill --name node`: セッション内（緑のエリア）の `node` プロセスのみが終了。親子関係チェック必須。
 - `safe-kill --port 3000`: ポート3000が `allowed_ports` に設定されていれば、自己破壊防止・拒否リスト・root PID 保護・ポート検証を維持したまま、**親子関係に関係なく** TCP リスナーまたは UDP ソケットを終了可能。別ターミナルで起動したままの開発サーバー等を終了する場合に便利。
 - TCP のポート一致では `ESTABLISHED` などの非待ち受けソケットを無視するため、ローカルポートが一致しただけのクライアント接続は選択されません。
@@ -283,110 +165,67 @@ flowchart TB
 - ポートを掴んでいる PID のプロセス情報が解決できない場合（検出後すぐに終了したケース等）、`safe-kill` は `pid:<pid>` のようなプレースホルダ名にフォールバックする代わりに `ProcessNotFound` で fail-closed します。これにより、実プロセス名が不明な状態で denylist 保護がバイパスされる事態を防ぎます。
 - シグナル送信直前に対象ポートの保持者集合を再取得し、対象 PID が既にそのポートを離している場合は `NoProcessOnPort` として中止します。同一 PID が無関係な処理に切り替わっている場合に余計なシグナルを送らないための追加防御です。
 
-## 終了コード
+この判定を支える構成要素と、14 の安全レイヤーは [docs/architecture.ja.md](docs/architecture.ja.md) で説明しています。
 
-| コード | 意味 |
-|-------|------|
-| 0 | 成功 |
-| 1 | 対象が見つからない（名前未一致、許可ポートにプロセスなし、または全件が終了不可） |
-| 2 | 権限エラー |
-| 3 | 設定エラー |
-| 4 | ポート不許可 |
-| 255 | 一般エラー（無効なシグナル・ポート、自己破壊試行、および CLI 使用方法エラー全般） |
+## 設定
 
-CLI の使用方法エラー（未知のフラグ、オプション値の形式エラー、範囲外の PID、
-`--list --port 3000` のようなターゲット指定の競合）はすべて **255** で終了し、2 にはならない。
-終了コード 2 は「権限エラー」専用のため、呼び出し側は typo を権限エラーと取り違えずに分岐できる。
-`--help` / `--version` は 0 で終了する。
+`safe-kill` は `~/.config/safe-kill/config.toml` を読みます。このファイルが無い場合は、既定の拒否リストがシステムプロセスを保護し、`--port` は無効になります。`safe-kill init` でコメント付きのファイルを作るか（既存のファイルを確認なしで上書きするときは `--force`）、手で書いてください。
 
-読み手が出力を閉じても終了コードは変わらない。`safe-kill --list | head -1` が 0 で終了するのは、
-一覧の取得自体は完了していて、いなくなったのは読み手だけだからである。ディスク満杯などその他の
-書き込み失敗は、結果が本当に失われているため **255** になる。終了コードは常に「操作の結果」を
-表し、「その説明が誰かに届いたか」は表さない。kill が成功していれば、結果行を表示できなくても
-成功を返す。Rust は起動時に `SIGPIPE` を無視するため、この処理が無いと `println!` が panic して
-終了コード 101 になり、公開している終了コードの集合から外れてしまう。
+```toml
+# 親子関係チェックをバイパスするプロセス（慎重に使用）
+[allowlist]
+processes = ["my-trusted-app", "next-server"]
 
-## 環境変数
+# 追加で絶対に終了できないプロセス（許可リストより優先）
+[denylist]
+processes = ["postgres"]
 
-| 変数 | 説明 |
-|-----|------|
-| `SAFE_KILL_ROOT_PID` | 親子関係チェックのルートPIDを上書き（`0`・`1`(init/launchd)・無効値は無視。root PID 自体は終了不可） |
-
-## Claude Code 統合
-
-Claude Code で `kill`/`pkill` コマンドの代わりに `safe-kill` を使用するための設定。
-
-### 1. フック設定
-
-`.claude/settings.json` に追加:
-
-```json
-{
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '(^|[;&|])\\s*(kill|pkill|killall)\\s'; then echo '🚫 safe-kill を使用: safe-kill <PID> または safe-kill --name <完全一致名>。シグナル指定は -s <signal>' >&2; exit 2; fi"
-          }
-        ]
-      }
-    ]
-  }
-}
+# --port で対象にできるポート（単一ポートまたは範囲）
+[allowed_ports]
+ports = ["1420", "3000-3010", "5173", "8080"]
 ```
 
-`kill`/`pkill`/`killall` コマンドが検出されると、フックがメッセージを stderr に出力し、終了コード 2 でツール呼び出しをブロックします。メッセージは Claude に表示されます。
+ユーザー定義の `[denylist]` は、システムプロセス（macOS の `launchd` や `WindowServer`、Linux の `systemd` や `sshd` など）を守る既定の保護に追加されます。カスタマイズしても、既定の保護は外れません。ファイルがあるのに読み込めない・解析できない場合や、未知のフィールドを含む場合は、既定値に戻さず設定エラーで止まります。各設定項目、既定の拒否リストの全体、`init` が書き出す内容は [docs/configuration.ja.md](docs/configuration.ja.md) を参照してください。
 
-### 2. CLAUDE.md への記載
+## Claude Code との連携
 
-`CLAUDE.md` に追加:
-
-```markdown
-## プロセス管理ルール
-
-- `kill`、`pkill`、`killall` を直接使用しないでください。安全のため制限されています。
-- プロセスを終了するには `safe-kill <PID>`、`safe-kill --name <プロセス名>`、または `safe-kill --port <ポート>` を使用してください。
-- `safe-kill` はターゲットプロセスがセッションの子孫であることを自動的に検証します。
-- `safe-kill` が失敗した場合、そのプロセスはあなたの管理下にない可能性があります。
-
-### 使用例
-- テストサーバーを終了: `safe-kill --name node`
-- ポート3000を使用するプロセスを終了: `safe-kill --port 3000`
-- スタックしたプロセスを強制終了: `safe-kill -s 9 <PID>`
-- 終了対象をプレビュー: `safe-kill --name python --dry-run`
-```
+`.claude/settings.json` に `PreToolUse` フックを追加して `kill` / `pkill` / `killall` を止め、代わりに `safe-kill` を使うよう Claude に伝えます。あわせて `CLAUDE.md` にプロセス管理のルールを書いておきます。貼り付けるフックとルールは [docs/integrations.ja.md](docs/integrations.ja.md) にあります。
 
 ## 開発
 
+<!-- standard:dev:start -->
+[mise](https://mise.jdx.dev/) が必要です。ツールの版は `mise.toml` で固定しています。
+
 ```bash
-# ビルド
-cargo build
-
-# テスト実行
-cargo test
-
-# リリースビルド
-cargo build --release
+make setup   # ツールチェーン (mise) と依存を取得する
+make ci      # CI と同じ検査 (書き換えない)
 ```
 
-### テストカバレッジ
+| コマンド | 説明 |
+|---|---|
+| `make setup` | ツールチェーン (mise) と依存を取得する |
+| `make build` | デバッグ版をビルドする |
+| `make release` | リリース版をビルドする |
+| `make run` | デバッグ版を実行する (引数は ARGS="...") |
+| `make test` | テストを実行する |
+| `make lint` | clippy を警告ゼロで通す |
+| `make fmt` | コードを整形する (書き換える) |
+| `make fmt-check` | 整形済みかを確かめる (書き換えない) |
+| `make check` | 整形と静的検査 (書き換えない) |
+| `make ci` | CI と同じ検査 (書き換えない) |
+| `make install` | リリース版を INSTALL_PATH (既定 /usr/local/bin) に入れる |
+| `make uninstall` | INSTALL_PATH から取り除く |
+| `make clean` | ビルド成果物を消す |
 
-- **ライブラリユニットテスト**: 全モジュールを網羅する438テスト。ancestry 探索の停止条件（深度上限・親 PID の循環・PID 1 到達）は実プロセスツリーでは作れないため、固定ツリーを注入して検証しています
-- **バイナリユニットテスト**: CLI出力ユーティリティ・エラーサニタイズ・バージョン検証の41テスト
-- **統合テスト**: 実際のプロセスツリーを使用した80テスト。一時プロセス名にテストランナーの PID と連番を含め、Linux の `comm` 15バイト上限を守りながら複数の `cargo test` を並行実行しても衝突しないようにしています。一部成功・一部拒否が混在するバッチは、同名の子孫プロセスと孤児プロセス（親が PID 1 へ付け替わったもの）を並べて検証します。`--name` は名前でしか対象を選べないため、kill 可否が異なる同名プロセスを作るにはこの方法しかありません
-- **E2Eテスト**: CLI動作を検証する108テスト。緩い `umask` 下でも設定が非公開権限で作成されること、clap の使用方法エラーに埋め込まれた制御文字がサニタイズされることを含む
+`make` でターゲットの一覧を表示します。リリースは GitHub Actions で行います (**Actions → Release → Run workflow**)。
+<!-- standard:dev:end -->
 
-## コントリビュート
-
-プルリクエストを歓迎します！お気軽にご貢献ください。
-
-## セキュリティ
+テストの構成と、一部のテストだけを実行する方法は [docs/development.ja.md](docs/development.ja.md) にあります。
 
 セキュリティ脆弱性を発見した場合は、[GitHub Issues](https://github.com/owayo/safe-kill/issues) で報告してください。
 
 ## ライセンス
 
+<!-- standard:license:start -->
 [MIT](LICENSE)
+<!-- standard:license:end -->

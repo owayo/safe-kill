@@ -4,26 +4,34 @@
 
 ## Project Overview
 
-safe-kill は AI エージェント向けの安全なプロセス終了 CLI ツール。ancestry-based access control により、セッションの子孫プロセスのみを終了可能にする。Rust 1.85+ / macOS・Linux 対応。
+safe-kill は AI エージェント向けの安全なプロセス終了 CLI ツール。ancestry-based access control により、セッションの子孫プロセスのみを終了可能にする。macOS・Linux 対応。
 
 ## Commands
 
+開発コマンドは `make help` (引数なしの `make`) で一覧できる。ツールの版は `mise.toml` が正で、Makefile は cargo を `mise exec --` と `--locked` 付きで呼ぶ (Cargo.toml の `rust-version` も mise.toml の rust と同じ major.minor にそろえる)。
+
 ```bash
+# 準備と CI と同じ検査
+make setup              # mise のツールチェーンと依存を取得
+make ci                 # fmt-check + lint + test (GitHub Actions の quality ジョブと同じ)
+
 # ビルド
 make build              # デバッグビルド
 make release            # リリースビルド
-make install            # /usr/local/bin にインストール
+make install            # /usr/local/bin にインストール (INSTALL_PATH で変更可)
 
 # テスト
 make test               # 全テスト実行 (lib 438 + bin 41 + E2E 108 + integration 80)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
-cargo test ancestry     # 特定モジュールのテスト
-cargo test test_is_suicide_self  # 特定テスト名で実行
+mise exec -- cargo test --locked ancestry               # 特定モジュールのテスト
+mise exec -- cargo test --locked test_is_suicide_self   # 特定テスト名で実行
 
 # リント・フォーマット
-make fmt                # cargo fmt
-make check              # cargo clippy --all-targets -- -D warnings && cargo check --all-targets
+make fmt                # cargo fmt (書き換える)
+make fmt-check          # 整形済みかの検査 (書き換えない)
+make lint               # cargo clippy --all-targets -- -D warnings
+make check              # fmt-check + lint
 ```
 
 ## Architecture
@@ -81,7 +89,7 @@ CLI Parser (cli.rs) → Policy Engine (policy.rs) → Killer (killer.rs) → Sig
 
 ## Versioning
 
-YY.M.COUNTER 形式（例: 26.1.105）。リリースは GitHub Actions の workflow_dispatch で実行。
+YY.M.COUNTER 形式（例: 26.1.105。採番は JST）。リリースは GitHub Actions の workflow_dispatch で実行（Actions → Release → Run workflow。まず dry_run で次の版を確かめる）。添付は `safe-kill-<target>.tar.gz`（x86_64-unknown-linux-gnu / aarch64-apple-darwin / x86_64-apple-darwin）と `SHA256SUMS`。
 
 ## Testing Notes
 
