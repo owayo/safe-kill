@@ -1,0 +1,10 @@
+# このリポジトリのツールチェーン。ローカルと CI の両方がここを正とする。
+# 開発のコマンドは make 経由で呼ぶ (Makefile が mise exec -- を付ける。初回は make setup)。
+# mise.lock は置かない。rust は rustup に任せるので、lock に固定するもの (URL と checksum) が無い。
+
+[tools]
+# Cargo.toml の rust-version (MSRV) も同じ major.minor にそろえる (検証している版だけを最低要件にする)。
+# profile と components を明示する。未指定だと rustup の既定の profile 次第で入るものが変わり、
+# GitHub Actions のランナー (minimal) では cargo fmt が無いと言われて落ちる。
+# 配布物のターゲット (x86_64-apple-darwin など) は CI と Release のジョブで rustup target add する
+rust = { version = "1.98.1", profile = "minimal", components = ["rustfmt", "clippy"] }

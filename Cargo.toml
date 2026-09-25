@@ -2,7 +2,7 @@
 name = "safe-kill"
 version = "26.6.100"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98"
 authors = ["owayo <yoheiowa@gmail.com>"]
 description = "Safe process termination tool for AI agents with ancestry-based access control"
 license = "MIT"
