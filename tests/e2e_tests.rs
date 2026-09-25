@@ -1960,12 +1960,20 @@ fn test_init_prompt_with_closed_stderr_leaves_config_untouched() {
         .stderr(closed_pipe())
         .spawn()
         .expect("safe-kill の起動に失敗");
-    child
+    // プロンプトを出せなかった safe-kill は、入力を読む前に終わることがある。そのときの書き込みは
+    // BrokenPipe になるが、それは期待する振る舞い (同意を読まずに止まる) なので許す
+    if let Err(e) = child
         .stdin
         .as_mut()
         .expect("stdin を取得できない")
         .write_all(b"y\n")
-        .expect("stdin への書き込みに失敗");
+    {
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::BrokenPipe,
+            "stdin への書き込みに失敗: {e}"
+        );
+    }
     let status = child.wait().expect("safe-kill の終了待ちに失敗");
 
     assert_eq!(status.code(), Some(255));
