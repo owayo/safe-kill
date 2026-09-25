@@ -1,4 +1,4 @@
-# Rust の CLI のリリース。github-project-standard の正規形 (release-rust.yml) に合わせている。
+# Rust の CLI のリリース (標準の形)。
 # 配布は GitHub Releases の添付だけ (Homebrew の tap と winget は使わない)。safe-kill は Unix の
 # シグナルとプロセスツリーを扱う (nix クレート) ので、Windows には配らない。
 #
