@@ -192,16 +192,14 @@ fn test_real_process_tree_grandparent_ancestor() {
     let current_pid = ProcessInfoProvider::current_pid();
 
     // 祖父プロセスを取得
-    if let Some(current_info) = provider.get(current_pid) {
-        if let Some(parent_pid) = current_info.parent_pid {
-            if let Some(parent_info) = provider.get(parent_pid) {
-                if let Some(grandparent_pid) = parent_info.parent_pid {
-                    let checker = AncestryChecker::new(ProcessInfoProvider::new());
-                    // 現在のプロセスは祖父プロセスの子孫であるべき
-                    assert!(checker.is_descendant_of(current_pid, grandparent_pid));
-                }
-            }
-        }
+    if let Some(current_info) = provider.get(current_pid)
+        && let Some(parent_pid) = current_info.parent_pid
+        && let Some(parent_info) = provider.get(parent_pid)
+        && let Some(grandparent_pid) = parent_info.parent_pid
+    {
+        let checker = AncestryChecker::new(ProcessInfoProvider::new());
+        // 現在のプロセスは祖父プロセスの子孫であるべき
+        assert!(checker.is_descendant_of(current_pid, grandparent_pid));
     }
 }
 
@@ -1155,16 +1153,15 @@ fn test_ancestry_get_root_pid_without_env_var() {
 
     // 現在プロセスの祖父 PID または親 PID と一致するはず
     let current_pid = ProcessInfoProvider::current_pid();
-    if let Some(current_info) = provider.get(current_pid) {
-        if let Some(parent_pid) = current_info.parent_pid {
-            if let Some(parent_info) = provider.get(parent_pid) {
-                if let Some(grandparent_pid) = parent_info.parent_pid {
-                    assert_eq!(root, grandparent_pid, "祖父プロセス PID と一致すべき");
-                } else {
-                    // 祖父が取得できない場合は親 PID にフォールバック
-                    assert_eq!(root, parent_pid, "親プロセス PID にフォールバックすべき");
-                }
-            }
+    if let Some(current_info) = provider.get(current_pid)
+        && let Some(parent_pid) = current_info.parent_pid
+        && let Some(parent_info) = provider.get(parent_pid)
+    {
+        if let Some(grandparent_pid) = parent_info.parent_pid {
+            assert_eq!(root, grandparent_pid, "祖父プロセス PID と一致すべき");
+        } else {
+            // 祖父が取得できない場合は親 PID にフォールバック
+            assert_eq!(root, parent_pid, "親プロセス PID にフォールバックすべき");
         }
     }
 
@@ -1523,10 +1520,10 @@ fn test_policy_engine_kill_by_port_with_real_listener() {
         let result = engine.kill_by_port(port, Signal::SIGTERM, true);
         // nc がポートをバインドできた場合はプロセスが見つかるはず
         // 環境により見つからない場合もあるので、エラーでも OK
-        if let Ok(batch) = result {
-            if batch.total_matched > 0 {
-                assert!(batch.any_success(), "dry-run では成功扱いになるべき");
-            }
+        if let Ok(batch) = result
+            && batch.total_matched > 0
+        {
+            assert!(batch.any_success(), "dry-run では成功扱いになるべき");
         }
 
         // クリーンアップ
@@ -1764,22 +1761,22 @@ fn test_policy_engine_kill_by_port_actual_kill() {
         let result = engine.kill_by_port(port, Signal::SIGTERM, false);
 
         // nc がポートをバインドできた場合
-        if let Ok(batch) = result {
-            if batch.total_matched > 0 {
-                assert!(batch.any_success(), "実際の kill は成功すべき");
+        if let Ok(batch) = result
+            && batch.total_matched > 0
+        {
+            assert!(batch.any_success(), "実際の kill は成功すべき");
 
-                // プロセスが終了したことを確認
-                let mut child = child;
-                let _ = child.wait();
-                std::thread::sleep(std::time::Duration::from_millis(100));
+            // プロセスが終了したことを確認
+            let mut child = child;
+            let _ = child.wait();
+            std::thread::sleep(std::time::Duration::from_millis(100));
 
-                let check = SignalSender::send(child_pid, Signal::SIGTERM);
-                assert!(
-                    matches!(check, Err(SafeKillError::ProcessNotFound(_))),
-                    "kill 後のプロセスは ProcessNotFound になるべき"
-                );
-                return;
-            }
+            let check = SignalSender::send(child_pid, Signal::SIGTERM);
+            assert!(
+                matches!(check, Err(SafeKillError::ProcessNotFound(_))),
+                "kill 後のプロセスは ProcessNotFound になるべき"
+            );
+            return;
         }
 
         // nc が使えなかった場合のクリーンアップ

@@ -357,10 +357,10 @@ impl Config {
         };
 
         for spec in &allowed_ports.ports {
-            if let Ok(range) = PortRange::parse(spec) {
-                if range.contains(port) {
-                    return true;
-                }
+            if let Ok(range) = PortRange::parse(spec)
+                && range.contains(port)
+            {
+                return true;
             }
         }
 

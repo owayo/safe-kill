@@ -680,13 +680,12 @@ mod tests {
         let engine = PolicyEngine::with_defaults();
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(current) = engine.provider.get(current_pid) {
-            if let Some(parent_pid) = current.parent_pid {
-                if let Some(parent) = engine.provider.get(parent_pid) {
-                    let permission = engine.can_kill(&parent);
-                    assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
-                }
-            }
+        if let Some(current) = engine.provider.get(current_pid)
+            && let Some(parent_pid) = current.parent_pid
+            && let Some(parent) = engine.provider.get(parent_pid)
+        {
+            let permission = engine.can_kill(&parent);
+            assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
         }
     }
 
@@ -851,10 +850,10 @@ mod tests {
         assert!(!killable.iter().any(|p| p.pid == current_pid));
 
         // 親プロセスを含まないこと
-        if let Some(current) = engine.provider.get(current_pid) {
-            if let Some(parent_pid) = current.parent_pid {
-                assert!(!killable.iter().any(|p| p.pid == parent_pid));
-            }
+        if let Some(current) = engine.provider.get(current_pid)
+            && let Some(parent_pid) = current.parent_pid
+        {
+            assert!(!killable.iter().any(|p| p.pid == parent_pid));
         }
     }
 
@@ -1116,11 +1115,11 @@ mod tests {
     fn test_can_kill_for_port_suicide_prevention_parent() {
         let engine = PolicyEngine::with_defaults();
         let current_pid = ProcessInfoProvider::current_pid();
-        if let Some(current) = engine.provider.get(current_pid) {
-            if let Some(parent_pid) = current.parent_pid {
-                let permission = engine.can_kill_for_port(parent_pid, "parent_process");
-                assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
-            }
+        if let Some(current) = engine.provider.get(current_pid)
+            && let Some(parent_pid) = current.parent_pid
+        {
+            let permission = engine.can_kill_for_port(parent_pid, "parent_process");
+            assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
         }
     }
 

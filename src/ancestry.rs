@@ -94,30 +94,29 @@ impl AncestryChecker {
     /// 「全プロセスが子孫」と誤判定せず、自プロセスの子孫のみを kill 対象とする。
     pub fn get_root_pid(provider: &ProcessInfoProvider) -> u32 {
         // まず環境変数を確認する
-        if let Ok(env_pid) = env::var(ROOT_PID_ENV_VAR) {
-            if let Some(pid) = Self::parse_root_pid(&env_pid) {
-                return pid;
-            }
+        if let Ok(env_pid) = env::var(ROOT_PID_ENV_VAR)
+            && let Some(pid) = Self::parse_root_pid(&env_pid)
+        {
+            return pid;
         }
 
         // 祖父プロセス（シェルの親）を信頼ルートとして採用する
         // 現在プロセス -> シェル -> 信頼ルート
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(current_info) = provider.get(current_pid) {
-            if let Some(parent_pid) = current_info.parent_pid {
-                // 祖父が妥当な信頼ルートであれば採用する
-                if let Some(parent_info) = provider.get(parent_pid) {
-                    if let Some(grandparent_pid) = parent_info.parent_pid {
-                        if Self::is_valid_root_pid(grandparent_pid) {
-                            return grandparent_pid;
-                        }
-                    }
-                }
-                // 祖父が不適格（PID 1 等）な場合は親へフォールバックする
-                if Self::is_valid_root_pid(parent_pid) {
-                    return parent_pid;
-                }
+        if let Some(current_info) = provider.get(current_pid)
+            && let Some(parent_pid) = current_info.parent_pid
+        {
+            // 祖父が妥当な信頼ルートであれば採用する
+            if let Some(parent_info) = provider.get(parent_pid)
+                && let Some(grandparent_pid) = parent_info.parent_pid
+                && Self::is_valid_root_pid(grandparent_pid)
+            {
+                return grandparent_pid;
+            }
+            // 祖父が不適格（PID 1 等）な場合は親へフォールバックする
+            if Self::is_valid_root_pid(parent_pid) {
+                return parent_pid;
             }
         }
 
@@ -306,12 +305,11 @@ impl AncestryChecker {
         }
 
         // 親プロセスか確認
-        if let Some(info) = self.provider.get(current_pid) {
-            if let Some(parent_pid) = info.parent_pid {
-                if target_pid == parent_pid {
-                    return true;
-                }
-            }
+        if let Some(info) = self.provider.get(current_pid)
+            && let Some(parent_pid) = info.parent_pid
+            && target_pid == parent_pid
+        {
+            return true;
         }
 
         false
@@ -502,10 +500,10 @@ mod tests {
         let current_pid = ProcessInfoProvider::current_pid();
 
         // 現在プロセスは親プロセスの子孫であるはず
-        if let Some(info) = checker.provider.get(current_pid) {
-            if let Some(parent_pid) = info.parent_pid {
-                assert!(checker.is_descendant_of(current_pid, parent_pid));
-            }
+        if let Some(info) = checker.provider.get(current_pid)
+            && let Some(parent_pid) = info.parent_pid
+        {
+            assert!(checker.is_descendant_of(current_pid, parent_pid));
         }
     }
 
@@ -525,10 +523,10 @@ mod tests {
         let checker = AncestryChecker::new(provider);
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(info) = checker.provider.get(current_pid) {
-            if let Some(parent_pid) = info.parent_pid {
-                assert!(checker.is_suicide(parent_pid));
-            }
+        if let Some(info) = checker.provider.get(current_pid)
+            && let Some(parent_pid) = info.parent_pid
+        {
+            assert!(checker.is_suicide(parent_pid));
         }
     }
 
