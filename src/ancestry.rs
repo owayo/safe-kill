@@ -277,9 +277,10 @@ impl AncestryChecker {
                 return false;
             };
 
-            // 親が目的の祖先か確認
+            // 親が目的の祖先でも、その PID が snapshot から消えていれば拒否する。
+            // 親 PID の値だけでは、祖先プロセスの実在を証明できない。
             if parent_pid == ancestor_pid {
-                return true;
+                return lookup(ancestor_pid).is_some();
             }
 
             // PID 1（init/launchd）到達時は探索終了
@@ -717,6 +718,17 @@ mod tests {
             |pid| tree.get(&pid).cloned(),
             10,
             12
+        ));
+    }
+
+    #[test]
+    fn test_is_descendant_false_when_direct_ancestor_disappeared() {
+        // 親 PID が一致しても、祖先そのものが snapshot に存在しなければ拒否する。
+        let tree = build_tree(&[(10, Some(11))]);
+        assert!(!AncestryChecker::is_descendant_of_with_lookup(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            11
         ));
     }
 

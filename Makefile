@@ -1,24 +1,23 @@
-# Development tasks for safe-kill. Run `make` with no arguments to list the targets.
+# safe-kill の開発タスク。引数なしの `make` でターゲット一覧を表示する。
 #
-# Tool versions are pinned in mise.toml. When mise is available, every tool runs through
-# `mise exec --`, so the pinned versions are used even when mise is not activated in the shell
-# (for example when make is started from an IDE or a GUI). SYSTEM_TOOLS=1 uses the tools on PATH
-# instead (the versions are then not guaranteed).
+# ツールの版は mise.toml に固定する。mise があれば各ツールを `mise exec --` 経由で
+# 起動するため、IDE や GUI から起動してシェルで mise を有効化していなくても固定版を使う。
+# SYSTEM_TOOLS=1 では PATH 上のツールを使うため、版は保証されない。
 #
-# Only GNU Make 3.81 features are used (the make that ships with macOS):
-# no .ONESHELL, .SHELLFLAGS, $(file ...) or !=.
+# macOS 標準の GNU Make 3.81 で使える機能に限定する。
+# .ONESHELL、.SHELLFLAGS、$(file ...)、!= は使わない。
 
 .DEFAULT_GOAL := help
 
 BINARY_NAME := safe-kill
 INSTALL_PATH ?= /usr/local/bin
-# Cargo.lock is committed, so resolve dependencies exactly as CI does
+# Cargo.lock をコミットするため、CI と同じ依存解決を使う。
 CARGO_FLAGS ?= --locked
 
-# ---- Toolchain ------------------------------------------------------------------
-# Look for mise on PATH, then in the usual install locations (make started from a GUI may not
-# inherit the shell's PATH). Override with make MISE=/path/to/mise.
-# To try the behavior without mise, empty the candidates with MISE_CANDIDATES=.
+# ---- ツールチェーン --------------------------------------------------------------
+# mise はまず PATH、次に通常のインストール先から探す。GUI 起動ではシェルの PATH が
+# 引き継がれない場合がある。`make MISE=/path/to/mise` で明示できる。
+# mise なしの動作確認では MISE_CANDIDATES= で候補を空にする。
 MISE_CANDIDATES ?= $(HOME)/.local/bin/mise /opt/homebrew/bin/mise /usr/local/bin/mise
 ifeq ($(SYSTEM_TOOLS),1)
 RUN :=
@@ -64,8 +63,7 @@ test-e2e: ## Run only the E2E tests (tests/e2e_tests.rs)
 test-integration: ## Run only the integration tests (tests/integration_tests.rs)
 	$(RUN) cargo test $(CARGO_FLAGS) --test integration_tests
 
-# --all-targets also lints the test code: the safety guarantees of safe-kill are pinned by the
-# tests, so lint gaps in the tests must not slip through
+# --all-targets でテストコードも検査する。安全性を固定するテストの警告を見逃さない。
 lint: ## Run clippy with warnings as errors
 	$(RUN) cargo clippy $(CARGO_FLAGS) --all-targets -- -D warnings
 
@@ -81,10 +79,10 @@ ci: check test ## Run the same checks as CI (no changes)
 
 ## Install
 
-# Replace the binary through a temporary file and a rename instead of copying over it. macOS
-# caches the code signature check per inode, so a binary copied over one that is running (or ran
-# a moment ago) is killed with SIGKILL right after it starts (exit 137). The temporary file sits
-# in the same directory so that the rename swaps the inode.
+# バイナリは同じディレクトリ内の一時ファイルを rename して置き換える。macOS は
+# コード署名の検証結果を inode ごとにキャッシュするため、実行中または直前に実行した
+# バイナリへ上書きコピーすると、次の起動直後に SIGKILL（終了コード 137）になる。
+# rename で inode ごと交換すれば、この不整合を避けられる。
 install: release ## Install the release binary to INSTALL_PATH (default /usr/local/bin)
 	@mkdir -p "$(INSTALL_PATH)"
 	cp "target/release/$(BINARY_NAME)" "$(INSTALL_PATH)/$(BINARY_NAME).new"

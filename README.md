@@ -32,7 +32,7 @@ It takes the place of `kill` / `pkill` / `killall` for agents such as Claude Cod
 
 ## Features
 
-- **Ancestry Verification**: Only kill processes spawned by your session
+- **Ancestry Verification**: Only kill processes spawned by your session; traversal rejects a direct parent PID if the ancestor is absent from the same process snapshot
 - **Suicide Prevention**: Cannot kill self or parent processes; the current parent PID is re-resolved from the OS immediately before signaling, failing closed even if the process was re-parented between the policy decision and the kill
 - **PID 1 Protection**: PID 1 (init/launchd, or a custom container entrypoint) is never killable — even via allowlist match or `--port` bypass — so containerized agents cannot accidentally take down the whole container
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`), including in the fresh process lookup used immediately before signaling
