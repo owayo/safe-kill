@@ -6,7 +6,7 @@ use crate::error::SafeKillError;
 use crate::terminal::{sanitize_path, sanitize_terminal};
 use serde::Deserialize;
 use std::fs::{self, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +37,46 @@ fn ensure_no_dangling_symlink_ancestor(path: &Path) -> Result<(), SafeKillError>
     }
 
     Ok(())
+}
+
+/// OS が報告するプロセス名の最大バイト数（切り詰められない OS では `None`）
+///
+/// Linux の sysinfo は `name` に `/proc/<pid>/stat` の comm をそのまま入れる。comm は
+/// カーネルが `TASK_COMM_LEN`（16、終端 NUL を含む）に収めるため、実行ファイル名の
+/// 先頭 15 バイトに切り詰められて観測される。macOS の名前は実行ファイルパスの
+/// basename で、切り詰められない。
+#[cfg(target_os = "linux")]
+const OBSERVED_NAME_MAX_BYTES: Option<usize> = Some(15);
+#[cfg(not(target_os = "linux"))]
+const OBSERVED_NAME_MAX_BYTES: Option<usize> = None;
+
+/// denylist のエントリが、OS から観測したプロセス名に一致するか判定する
+///
+/// 完全一致に加え、プロセス名が切り詰められる OS（Linux）では、上限より長いエントリを
+/// 同じ上限で切り詰めた表現とも比べる。完全一致だけでは `gnome-terminal-server` の
+/// ような 16 バイト以上のエントリが絶対に一致せず、利用者が気付かないまま保護が外れる。
+/// 拒否側の照合なので、切り詰めで別の名前と重なっても保護が広がるだけで安全側に倒れる。
+/// allowlist と `--name` は、過剰一致が許可範囲や対象の拡大になるため完全一致のまま扱う。
+pub(crate) fn denylist_entry_matches(entry: &str, observed: &str) -> bool {
+    denylist_entry_matches_within(entry, observed, OBSERVED_NAME_MAX_BYTES)
+}
+
+/// [`denylist_entry_matches`] の本体（名前の上限を引数で受け取り、どの OS でも検証できる）
+fn denylist_entry_matches_within(entry: &str, observed: &str, max_bytes: Option<usize>) -> bool {
+    if entry == observed {
+        return true;
+    }
+    let Some(max_bytes) = max_bytes else {
+        return false;
+    };
+    let bytes = entry.as_bytes();
+    if bytes.len() <= max_bytes {
+        return false;
+    }
+    // カーネルはバイト単位で切るので、UTF-8 の文字の途中で切れることがある。
+    // `entry[..max_bytes]` は文字境界でないと panic するため使わず、観測名
+    // （sysinfo の値を `to_string_lossy` したもの）と同じ lossy 変換をした表現で比べる。
+    String::from_utf8_lossy(&bytes[..max_bytes]) == observed
 }
 
 /// メイン設定構造体
@@ -147,21 +187,33 @@ impl Config {
 
     /// 指定されたパスから設定を読み込む
     pub fn load_from_path(path: Option<PathBuf>) -> Self {
+        Self::load_from_path_reporting(path, &mut std::io::stderr())
+    }
+
+    /// 設定を読み込み、失敗したら警告を `warnings` へ書いて既定値を返す
+    ///
+    /// 警告の書き込み失敗は無視する。`eprintln!` は stderr への書き込みに失敗すると
+    /// panic する（std が成功扱いにするのは EBADF だけで、読み手が閉じたパイプの
+    /// EPIPE は panic になる）。それでは「警告を出して既定値を返す」という契約が、
+    /// 警告が届いたかどうかで崩れてしまう。
+    fn load_from_path_reporting(path: Option<PathBuf>, warnings: &mut impl Write) -> Self {
         match Self::try_load_from_path(path.clone()) {
             Ok(config) => config,
             Err(e) => {
-                if let Some(path) = path {
-                    eprintln!(
+                let reason = sanitize_terminal(&e.to_string());
+                let _ = match path {
+                    Some(path) => writeln!(
+                        warnings,
                         "Warning: Failed to load config file {}: {}. Using defaults.",
                         sanitize_path(&path),
-                        sanitize_terminal(&e.to_string())
-                    );
-                } else {
-                    eprintln!(
+                        reason
+                    ),
+                    None => writeln!(
+                        warnings,
                         "Warning: Failed to load config file: {}. Using defaults.",
-                        sanitize_terminal(&e.to_string())
-                    );
-                }
+                        reason
+                    ),
+                };
                 Self::with_defaults()
             }
         }
@@ -330,10 +382,16 @@ impl Config {
     }
 
     /// プロセス名が denylist に含まれるか確認する
+    ///
+    /// 照合規則は [`denylist_entry_matches`] を参照（Linux の comm の切り詰めを考慮する）。
     pub fn is_denied(&self, name: &str) -> bool {
         self.denylist
             .as_ref()
-            .map(|list| list.processes.iter().any(|p| p == name))
+            .map(|list| {
+                list.processes
+                    .iter()
+                    .any(|entry| denylist_entry_matches(entry, name))
+            })
             .unwrap_or(false)
     }
 
@@ -645,8 +703,63 @@ processes = ["node"]
         writeln!(file, "this is not valid TOML {{{{").unwrap();
 
         let config = Config::load_from_path(Some(file.path().to_path_buf()));
-        // 解析エラー時はデフォルトにフォールバックするべき
-        assert!(config.denylist.is_some());
+        // 解析エラー時はデフォルトにフォールバックするべき。`denylist.is_some()` だけでは
+        // 読み込みに成功した場合（`merge_defaults` 後）とも区別できないため、既定値そのものと比べる。
+        assert_eq!(config, Config::with_defaults());
+    }
+
+    /// 常に指定した種類の I/O エラーを返す書き込み先
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn test_load_from_path_falls_back_even_if_warning_cannot_be_written() {
+        // 読み手が閉じたパイプへ警告を書けなくても、既定値を返して処理を続けるべき。
+        // `eprintln!` で書いていた頃は EPIPE で panic し、公開 API の
+        // 「警告を出して既定値を返す」という契約が破れていた。
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "this is not valid TOML {{{{").unwrap();
+
+        let mut warnings = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        let config =
+            Config::load_from_path_reporting(Some(file.path().to_path_buf()), &mut warnings);
+
+        assert_eq!(config, Config::with_defaults());
+    }
+
+    #[test]
+    fn test_load_from_path_warning_escapes_control_characters_in_path() {
+        // 警告にはパスとエラー本文（toml の複数行の診断を含む）が入る。制御文字入りの
+        // ファイル名でも、生の ESC や改行を流さずに 1 行の警告として出すべき。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad\x1b[2J\nname.toml");
+        std::fs::write(&path, "this is not valid TOML {{").unwrap();
+
+        let mut warnings = Vec::new();
+        let config = Config::load_from_path_reporting(Some(path), &mut warnings);
+        let warnings = String::from_utf8(warnings).unwrap();
+
+        assert_eq!(config, Config::with_defaults());
+        assert!(
+            warnings.starts_with("Warning: Failed to load config file "),
+            "{warnings:?}"
+        );
+        assert!(warnings.contains("bad\\x1B[2J\\nname.toml"), "{warnings:?}");
+        assert!(!warnings.contains('\x1b'), "{warnings:?}");
+        assert_eq!(
+            warnings.matches('\n').count(),
+            1,
+            "警告は 1 行で終わるべき: {warnings:?}"
+        );
     }
 
     #[test]
@@ -753,6 +866,91 @@ processes = ["node"]
         };
         assert!(!config.is_denied("systemd"));
         assert!(!config.is_denied("anything"));
+    }
+
+    // denylist の照合規則（Linux の comm の切り詰め）のテスト。
+    // 規則の本体は上限を引数で受け取るので、macOS でも Linux の挙動を検証できる。
+    #[test]
+    fn test_denylist_entry_matches_exact_name_only_for_short_entries() {
+        assert!(denylist_entry_matches_within(
+            "postgres",
+            "postgres",
+            Some(15)
+        ));
+        assert!(!denylist_entry_matches_within(
+            "postgres",
+            "postgresql",
+            Some(15)
+        ));
+        // 15 バイト以下のエントリはカーネルに切り詰められないので、前方一致は認めない
+        assert!(!denylist_entry_matches_within(
+            "gnome-shell",
+            "gnome-shel",
+            Some(15)
+        ));
+    }
+
+    #[test]
+    fn test_denylist_entry_matches_long_entry_against_truncated_comm() {
+        // Linux では `gnome-terminal-server` が comm の `gnome-terminal-` として観測される。
+        // 完全一致だけでは絶対に一致せず、denylist の保護が黙って外れていた。
+        assert!(denylist_entry_matches_within(
+            "gnome-terminal-server",
+            "gnome-terminal-",
+            Some(15)
+        ));
+        // 切り詰め後の表現と異なる観測名には一致しない
+        assert!(!denylist_entry_matches_within(
+            "gnome-terminal-server",
+            "gnome-terminal",
+            Some(15)
+        ));
+        // 名前が切り詰められない OS（macOS）では完全一致だけ
+        assert!(!denylist_entry_matches_within(
+            "gnome-terminal-server",
+            "gnome-terminal-",
+            None
+        ));
+    }
+
+    #[test]
+    fn test_denylist_entry_matches_truncation_inside_multibyte_char() {
+        // ASCII 14 バイトの直後に 3 バイト文字があると、15 バイト目で文字の途中が切れる。
+        // 観測名は sysinfo の値を lossy 変換したもの（末尾が U+FFFD）になる。
+        // panic せず、同じ lossy 表現どうしで一致させる。
+        let entry = "abcdefghijklmnあ-server";
+        let observed = String::from_utf8_lossy(&entry.as_bytes()[..15]).into_owned();
+        assert_eq!(observed, "abcdefghijklmn\u{FFFD}");
+        assert!(denylist_entry_matches_within(entry, &observed, Some(15)));
+    }
+
+    #[test]
+    fn test_is_denied_applies_platform_truncation_rule() {
+        let config = Config {
+            denylist: Some(ProcessList {
+                processes: vec!["gnome-terminal-server".to_string()],
+            }),
+            ..Default::default()
+        };
+        assert!(config.is_denied("gnome-terminal-server"));
+        assert_eq!(
+            config.is_denied("gnome-terminal-"),
+            cfg!(target_os = "linux"),
+            "切り詰めを考慮するのはプロセス名が 15 バイトに切り詰められる Linux だけ"
+        );
+    }
+
+    #[test]
+    fn test_is_allowed_does_not_apply_truncation_rule() {
+        // allowlist は ancestry を迂回させる許可側の設定なので、切り詰めで一致範囲を広げない。
+        let config = Config {
+            allowlist: Some(ProcessList {
+                processes: vec!["gnome-terminal-server".to_string()],
+            }),
+            ..Default::default()
+        };
+        assert!(config.is_allowed("gnome-terminal-server"));
+        assert!(!config.is_allowed("gnome-terminal-"));
     }
 
     // Clone と等値性のテスト

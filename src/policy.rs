@@ -299,7 +299,8 @@ impl PolicyEngine {
     /// 3. PID 再利用検出（`pid + start_time + name` の同一性）
     ///
     /// 順序は「自殺防止 → ancestry 再評価 → 同一性」とし、もっとも重要な保護を
-    /// 先に実行する。
+    /// 先に実行する。ancestry 再評価で拒否するときだけは、同一性を先に確かめて
+    /// 「対象が消えた」と「子孫ではない」を区別する。
     fn verify_final_safety_before_kill(
         &self,
         expected: &ProcessInfo,
@@ -310,6 +311,12 @@ impl PolicyEngine {
         if ancestry_check == FinalAncestryCheck::Required
             && !self.ancestry.is_descendant_fresh(expected.pid)
         {
+            // 判定後に対象が終了した（または PID が別プロセスへ再利用された）場合も、
+            // fresh な子孫判定は false になる。そのまま `NotDescendant` を返すと、
+            // 消えただけの対象を「セッション外のプロセス」と報告して終了コードも 255 になり、
+            // 呼び出し側が権限の問題と誤解する。同一性を先に確かめ、消えた対象は
+            // `ProcessNotFound` として返す。同一性が一致してもシグナルは送らない。
+            self.verify_identity_before_kill(expected)?;
             return Err(SafeKillError::NotDescendant(
                 expected.pid,
                 expected.name.clone(),
@@ -947,8 +954,10 @@ mod tests {
             }),
         };
         let engine = PolicyEngine::new(config);
-        // ポート 3009 は許可されているがプロセスが存在しない
-        let result = engine.kill_by_port(3009, Signal::SIGTERM, false);
+        // ポート 3009 は許可されているがプロセスが存在しない想定。
+        // `--port` は ancestry を通らないため、開発者がこのポートでサーバーを動かして
+        // いれば実 kill になってしまう。dry-run でも NoProcessOnPort の判定は同じ。
+        let result = engine.kill_by_port(3009, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(3009))));
     }
 
@@ -998,8 +1007,9 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // ポート 59995 は許可されているがプロセスが存在しない
-        let result = engine.kill_by_port(59995, Signal::SIGTERM, false);
+        // ポート 59995 は許可されているがプロセスが存在しない想定。
+        // 一時ポートの範囲なので他アプリの UDP ソケットと重なり得る。実 kill にしない。
+        let result = engine.kill_by_port(59995, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59995))));
     }
 
@@ -1575,26 +1585,87 @@ mod tests {
         }
     }
 
+    /// テスト用に待機するだけの子プロセスを起動する
+    ///
+    /// `Command::spawn` は exec の成否を確認してから戻るので、戻った時点で
+    /// プロセス名は `sleep` になっている。
+    fn spawn_sleeper() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep の起動に失敗")
+    }
+
+    /// 自分で起動した子プロセスを終了させて回収する
+    fn reap(mut child: std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[test]
     fn test_verify_final_safety_required_rejects_non_descendant_with_exact_error() {
-        // ancestry_check=Required で「信頼ルートの子孫でない」プロセスを渡すと
-        // NotDescendant で拒否される。
-        // 順序: 自殺防止 → ancestry(Required) → 同一性 のため、ダミー PID が
-        // 信頼ルート配下でないことが ancestry 段で fail-closed され、
-        // NotDescendant が返ることを検証する。
-        let engine = PolicyEngine::with_defaults();
-        let dummy = ProcessInfo {
-            pid: 999_999_998,
-            parent_pid: Some(1),
-            name: "unrelated".to_string(),
-            cmd: vec![],
-            start_time: 0,
-        };
-        let result = engine.verify_final_safety_before_kill(&dummy, FinalAncestryCheck::Required);
+        // ancestry_check=Required で、生きているが信頼ルートの子孫ではないプロセスを
+        // 渡すと NotDescendant で拒否される。兄弟プロセスの一方を信頼ルートにし、
+        // もう一方を対象にすることで、実在する非子孫を環境に依存せず作る。
+        // （存在しない PID を使うと、それは「消えた対象」として ProcessNotFound になる）
+        let root = spawn_sleeper();
+        let sibling = spawn_sleeper();
+        let engine = engine_with_root_pid(Config::default(), root.id());
+        let target = engine
+            .provider
+            .get(sibling.id())
+            .expect("起動直後の兄弟プロセスは snapshot に含まれるはず");
+
+        let result = engine.verify_final_safety_before_kill(&target, FinalAncestryCheck::Required);
+
+        reap(root);
+        reap(sibling);
         assert!(
             matches!(result, Err(SafeKillError::NotDescendant(pid, ref name))
-                if pid == dummy.pid && name == &dummy.name),
-            "Required では ancestry 段で NotDescendant に倒れるべき、実際: {:?}",
+                if pid == target.pid && name == &target.name),
+            "生存中の非子孫は ancestry 段で NotDescendant に倒れるべき、実際: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_verify_final_safety_reports_vanished_descendant_as_process_not_found() {
+        // 許可判定の後に対象が終了すると、fresh な子孫判定も false になる。
+        // それを NotDescendant（終了コード 255、「セッション外」）と報告せず、
+        // ProcessNotFound（終了コード 1）として返すことを固定する。
+        let child = spawn_sleeper();
+        let engine = engine_with_root_pid(Config::default(), ProcessInfoProvider::current_pid());
+        let target = engine
+            .provider
+            .get(child.id())
+            .expect("起動直後の子プロセスは snapshot に含まれるはず");
+        reap(child);
+
+        let result = engine.verify_final_safety_before_kill(&target, FinalAncestryCheck::Required);
+
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(pid)) if pid == target.pid),
+            "判定後に終了した対象は ProcessNotFound になるべき、実際: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_kill_by_pid_reports_target_exited_after_snapshot_as_not_found() {
+        // PolicyEngine の snapshot には対象が残っているが、OS 上ではもう終了している状況。
+        // can_kill は古い snapshot で Allowed を返し、kill 直前の再検証で不在に気付く。
+        // dry-run なので、万一 PID が再利用されていてもシグナルは送らない。
+        let child = spawn_sleeper();
+        let pid = child.id();
+        let engine = engine_with_root_pid(Config::default(), ProcessInfoProvider::current_pid());
+        assert!(engine.provider.get(pid).is_some());
+        reap(child);
+
+        let result = engine.kill_by_pid(pid, Signal::SIGTERM, true);
+
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == pid),
+            "判定後に終了した対象は ProcessNotFound になるべき、実際: {:?}",
             result
         );
     }

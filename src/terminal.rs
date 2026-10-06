@@ -22,11 +22,25 @@ pub fn sanitize_terminal(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || is_format_control(c) => push_escaped_char(&mut out, c),
+            c if c.is_control() || is_format_control(c) || is_unicode_line_separator(c) => {
+                push_escaped_char(&mut out, c)
+            }
             c => out.push(c),
         }
     }
     out
+}
+
+/// 制御文字（Cc）にも format 文字（Cf）にも属さない Unicode の改行か判定する。
+///
+/// U+2028 LINE SEPARATOR（Zl）と U+2029 PARAGRAPH SEPARATOR（Zp）は UAX #14 の
+/// 必須改行（BK）で、Python の `str.splitlines()` や JavaScript の行終端子のように
+/// Unicode を解釈する行分割では行の区切りになる。素通しすると、端末では 1 行に
+/// 見えても、出力を行単位で読む AI エージェントやスクリプトには偽の `error:` 行を
+/// 見せられる。ほかの改行（LF・VT・FF・CR・NEL）は C0/C1 制御文字として
+/// `is_control()` の側でエスケープされる。
+fn is_unicode_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 /// 端末表示を偽装できる非印字の Unicode format 文字か判定する。
@@ -265,6 +279,44 @@ mod tests {
             !sanitized.contains('\n'),
             "診断が複数行に分かれると行の出自を偽装できる"
         );
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_unicode_line_and_paragraph_separators() {
+        // U+2028 / U+2029 は Cc にも Cf にも属さないため、個別に扱わないと素通しになる。
+        assert_eq!(
+            sanitize_terminal("x\u{2028}error: forged"),
+            "x\\u{2028}error: forged"
+        );
+        assert_eq!(
+            sanitize_terminal("x\u{2029}error: forged"),
+            "x\\u{2029}error: forged"
+        );
+        // 実際の改行文字と、そのエスケープ表記をリテラルで持つ文字列は区別できるべき。
+        assert_ne!(
+            sanitize_terminal("a\u{2028}b"),
+            sanitize_terminal(r"a\u{2028}b")
+        );
+    }
+
+    #[test]
+    fn test_sanitize_terminal_output_has_no_unicode_line_break() {
+        // Unicode を解釈する行分割（Python の `str.splitlines()` が区切りにする文字）で
+        // 見ても、サニタイズ後の出力は必ず 1 行のままであるべき。1 文字でも漏れると、
+        // 出力を行単位で読む AI エージェントへ独立した偽の診断行を見せられる。
+        const LINE_BREAKS: &[char] = &[
+            '\n', '\r', '\u{0B}', '\u{0C}', '\u{1C}', '\u{1D}', '\u{1E}', '\u{85}', '\u{2028}',
+            '\u{2029}',
+        ];
+
+        for &line_break in LINE_BREAKS {
+            let sanitized = sanitize_terminal(&format!("ok{line_break}error: forged"));
+            assert!(
+                !sanitized.contains(LINE_BREAKS),
+                "U+{:04X} が改行のまま残っている: {sanitized:?}",
+                line_break as u32
+            );
+        }
     }
 
     #[test]

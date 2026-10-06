@@ -2,6 +2,7 @@
 //!
 //! プロセスが現在セッションの子孫かどうかを判定する。
 
+use crate::config::{Config, denylist_entry_matches};
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
 use std::env;
 
@@ -10,6 +11,25 @@ const MAX_ANCESTRY_DEPTH: u32 = 100;
 
 /// ルート PID を上書きする環境変数名
 const ROOT_PID_ENV_VAR: &str = "SAFE_KILL_ROOT_PID";
+
+/// 信頼ルートの自動検出で「エージェントと safe-kill の間に挟まったシェル」とみなす名前
+///
+/// ここに無いシェルは内側（親）を信頼ルートにする側へ倒れる。範囲が狭まるだけで
+/// 広がらないので、未知のシェルは `SAFE_KILL_ROOT_PID` で明示してもらう。
+/// `busybox` は多数のコマンドを兼ねるため、名前だけではシェルと断定できず含めない。
+const SHELL_NAMES: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "ksh93", "mksh", "pdksh", "yash", "fish", "tcsh",
+    "csh",
+];
+
+/// プロセス名がシェルか判定する
+///
+/// ログインシェルは `-zsh` のように先頭に `-` を付けて現れることがあるので、
+/// 判定のときだけ 1 つ外す（保持しているプロセス名や identity は変えない）。
+fn is_shell_process_name(name: &str) -> bool {
+    let name = name.strip_prefix('-').unwrap_or(name);
+    SHELL_NAMES.contains(&name)
+}
 
 /// プロセスツリー検証用 ancestry チェッカー
 pub struct AncestryChecker {
@@ -84,14 +104,8 @@ impl AncestryChecker {
     ///
     /// 優先順位:
     /// 1. `SAFE_KILL_ROOT_PID` 環境変数
-    /// 2. 呼び出しシェルの親（現在プロセスの祖父）
-    /// 3. 呼び出しシェル（現在プロセスの親）
-    /// 4. 現在プロセス PID（フォールバック）
-    ///
-    /// 祖父・親が PID 1（init/launchd）等で信頼ルートに不適格な場合は、
-    /// より内側（親→現在プロセス）へフォールバックして fail-closed に倒す。
-    /// これにより、コンテナや systemd サービス配下で親が PID 1 になる場合でも
-    /// 「全プロセスが子孫」と誤判定せず、自プロセスの子孫のみを kill 対象とする。
+    /// 2. 自動検出（[`Self::detect_root_pid`]）: 親がシェルならシェルの親（エージェント）、
+    ///    そうでなければ親、どちらも不適格なら現在プロセス
     pub fn get_root_pid(provider: &ProcessInfoProvider) -> u32 {
         // まず環境変数を確認する
         if let Ok(env_pid) = env::var(ROOT_PID_ENV_VAR)
@@ -100,28 +114,56 @@ impl AncestryChecker {
             return pid;
         }
 
-        // 祖父プロセス（シェルの親）を信頼ルートとして採用する
-        // 現在プロセス -> シェル -> 信頼ルート
-        let current_pid = ProcessInfoProvider::current_pid();
+        Self::detect_root_pid(|pid| provider.get(pid), ProcessInfoProvider::current_pid())
+    }
 
-        if let Some(current_info) = provider.get(current_pid)
-            && let Some(parent_pid) = current_info.parent_pid
-        {
-            // 祖父が妥当な信頼ルートであれば採用する
-            if let Some(parent_info) = provider.get(parent_pid)
-                && let Some(grandparent_pid) = parent_info.parent_pid
-                && Self::is_valid_root_pid(grandparent_pid)
+    /// 信頼ルートを自動検出する（参照関数を注入できる本体）
+    ///
+    /// 想定する呼び出し構造は「エージェント → ツール用シェル → safe-kill」で、
+    /// エージェントを信頼ルートにする。ただし祖父を無条件には採らない。
+    /// `sh -c 'safe-kill …'` のように最後の単一コマンドを渡すと、sh / bash / zsh は
+    /// fork せず exec するため間のシェルが消え、親がエージェント、祖父が
+    /// エージェントを起動したもの（端末のシェルや IDE のプロセス）になる。
+    /// そこで祖父を採ると、エージェントの兄弟プロセスまで「子孫」として kill できて
+    /// しまう。祖父を採るのは親がシェルのときだけにし、それ以外は親を信頼ルートにする。
+    ///
+    /// 候補は [`Self::is_eligible_auto_root`] を満たす必要があり、不適格なら
+    /// より内側（親 → 現在プロセス）へ倒す。外側へは決して探索しない。
+    fn detect_root_pid(lookup: impl Fn(u32) -> Option<ProcessInfo>, current_pid: u32) -> u32 {
+        let parent = lookup(current_pid)
+            .and_then(|current| current.parent_pid)
+            .and_then(&lookup);
+
+        if let Some(parent) = parent {
+            if is_shell_process_name(&parent.name)
+                && let Some(grandparent) = parent.parent_pid.and_then(&lookup)
+                && Self::is_eligible_auto_root(&grandparent)
             {
-                return grandparent_pid;
+                return grandparent.pid;
             }
-            // 祖父が不適格（PID 1 等）な場合は親へフォールバックする
-            if Self::is_valid_root_pid(parent_pid) {
-                return parent_pid;
+            if Self::is_eligible_auto_root(&parent) {
+                return parent.pid;
             }
         }
 
         // 最終フォールバックは現在 PID（自プロセスの子孫のみ kill 可能=fail-closed）
         current_pid
+    }
+
+    /// 自動検出の候補として信頼ルートにできるプロセスか判定する
+    ///
+    /// - PID 0/1 は不可（[`Self::is_valid_root_pid`]）
+    /// - 既定 denylist に載るシステムプロセス（`systemd` / `init` / `launchd` など）は不可。
+    ///   Linux では孤児が最寄りの subreaper（`systemd --user` など、PID 1 ではない）へ
+    ///   付け替えられるため、PID だけを見ると、それが信頼ルートになってユーザーセッション
+    ///   全体が子孫扱いになる。PID 1 を拒否しているのと同じ理由で除外する。
+    ///   利用者が追加した denylist は保護対象の指定であって信頼ルートの適格性とは別なので
+    ///   含めない（`node` を保護しただけで Node 製エージェントがルートになれなくなるため）。
+    fn is_eligible_auto_root(process: &ProcessInfo) -> bool {
+        Self::is_valid_root_pid(process.pid)
+            && !Config::default_denylist()
+                .iter()
+                .any(|entry| denylist_entry_matches(entry, &process.name))
     }
 
     /// 設定済みルート PID を返す
@@ -137,9 +179,11 @@ impl AncestryChecker {
     /// - 渡された provider snapshot から取得した identity と `pid + start_time + name` が一致
     ///
     /// 識別子検証と子孫判定を同一 snapshot 上で行えるようにすることで、両者の間に
-    /// 発生し得る微小な TOCTOU 窓を最小化する（例えば `is_descendant_fresh` 内で
-    /// 別タイミング snapshot を 2 つ使うと、その間隔で信頼ルート PID が再利用された場合に
-    /// identity 検証は通過したが子孫判定は別プロセスの親子関係を見ている、という不整合が起こりうる）。
+    /// 発生し得る微小な TOCTOU 窓を最小化する（別タイミングの snapshot を 2 つ使うと、
+    /// その間隔で信頼ルート PID が再利用された場合に、identity 検証は通過したが
+    /// 子孫判定は別プロセスの親子関係を見ている、という不整合が起こりうる）。
+    /// kill 直前の `is_descendant_fresh` は snapshot ではなくチェーンの往復検証で同じ
+    /// 不整合を防ぐ（[`Self::verify_fresh_chain`]）。
     fn root_identity_matches_in_provider(&self, provider: &ProcessInfoProvider) -> bool {
         if !Self::is_valid_root_pid(self.root_pid) {
             return false;
@@ -197,24 +241,94 @@ impl AncestryChecker {
 
     /// fresh な OS 情報で子孫判定する（kill 直前の TOCTOU 緩和用）
     ///
-    /// 信頼ルートの identity 整合性に加え、新しい `ProcessInfoProvider` snapshot で
-    /// 子孫判定をやり直す。`AncestryChecker` 構築時の親子関係 snapshot に依存しないため、
-    /// 判定〜kill の間に対象プロセスが再ペアレントされて信頼ルート外に出たケースを
-    /// 捕捉できる。
+    /// `AncestryChecker` 構築時の親子関係 snapshot に依存せず、対象から信頼ルートまでの
+    /// 親チェーンを OS から 1 プロセスずつ取り直して検証する（[`Self::verify_fresh_chain`]）。
+    /// 判定〜kill の間に対象プロセスが再ペアレントされて信頼ルート外に出たケースや、
+    /// 信頼ルート・途中の祖先の PID が別プロセスへ再利用されたケースを捕捉できる。
     ///
-    /// **重要**: identity 同一性検証と子孫判定は同一 snapshot で行う。
-    /// 別タイミング snapshot を使うと、その間隔で信頼ルート PID が再利用された場合に
-    /// identity 検証は通過したが子孫判定は別プロセスの親子関係を見ている、という
-    /// 不整合が起き得るため。
+    /// 以前は呼び出しのたびに全プロセスの snapshot を作り直していた（macOS の約 900
+    /// プロセスで 1 回約 30ms）。`--name` は許可された一致ごとにこれを呼ぶため、
+    /// 一致 200 件で約 6 秒かかっていた。チェーンだけを取り直せば対象ごとの
+    /// コストは親チェーンの深さに比例する。全プロセスの snapshot も OS 全体を
+    /// 一時点で固めたものではなく、各プロセスを順に読んだ結果なので、チェーンを
+    /// 往復で検証する方が「途中で何かが変わった」ことを明示的に検出できる。
     ///
-    /// `ProcessInfoProvider::new()` で都度 fresh 取得するため、頻繁な呼び出しは
-    /// オーバーヘッドが大きい。kill 直前の最終ガード用途に限定する。
+    /// 信頼ルートの初期 identity を持たない（PID 0/1、初期取得失敗、`refresh` で
+    /// 不一致を検出済み）場合は常に `false`（fail-closed）。
     pub fn is_descendant_fresh(&self, target_pid: u32) -> bool {
-        let fresh = ProcessInfoProvider::new();
-        if !self.root_identity_matches_in_provider(&fresh) {
+        if !Self::is_valid_root_pid(self.root_pid) {
             return false;
         }
-        Self::is_descendant_of_with_provider(&fresh, target_pid, self.root_pid)
+        let Some(root) = &self.root_identity else {
+            return false;
+        };
+        Self::verify_fresh_chain(ProcessInfoProvider::fetch_fresh, target_pid, root)
+    }
+
+    /// 対象から信頼ルートまでの親チェーンを取り直して検証する本体
+    ///
+    /// 1. 対象から親をたどり、各ノードの identity（`pid + start_time + name`）と親 PID を
+    ///    記録する。PID 0/1 への到達・循環・深度上限超過・取得失敗はその時点で拒否する。
+    /// 2. 到達したルートの identity が、構築時に固定した信頼ルートと一致することを確かめる。
+    /// 3. ルートから対象へ逆順に取り直し、各ノードの identity と親子関係が 1 の記録から
+    ///    変わっていないことを確かめる（対象を最後に確かめるので kill までの窓が短い）。
+    ///
+    /// 2 回の観測の間に変化して元へ戻った場合や、検証後の変化は検出できない。
+    /// 呼び出し側（`PolicyEngine`）は、この後に対象の identity を判定時の値とも照合する。
+    ///
+    /// 取得関数を引数で受け取るのは、取得のたびに結果が変わる状況（途中の祖先の
+    /// PID 再利用や再ペアレント）を固定のシナリオで検証できるようにするため。
+    fn verify_fresh_chain(
+        mut fetch: impl FnMut(u32) -> Option<ProcessInfo>,
+        target_pid: u32,
+        root: &ProcessInfo,
+    ) -> bool {
+        let mut chain: Vec<ProcessInfo> = Vec::new();
+        let mut pid = target_pid;
+
+        // 対象自身に加えて最大 MAX_ANCESTRY_DEPTH ホップ先まで（`is_descendant_of_with_lookup` と同じ上限）
+        for _ in 0..=MAX_ANCESTRY_DEPTH {
+            // PID 1（init/launchd）より外へは進まない。PID 0 は実プロセスではない。
+            if !Self::is_valid_root_pid(pid) || chain.iter().any(|node| node.pid == pid) {
+                return false;
+            }
+            let Some(node) = fetch(pid).filter(|node| node.pid == pid) else {
+                return false;
+            };
+
+            if pid == root.pid {
+                if !node.is_same_process(root) {
+                    return false;
+                }
+                chain.push(node);
+                return Self::chain_is_unchanged(&mut fetch, &chain, root.pid);
+            }
+
+            let Some(parent_pid) = node.parent_pid else {
+                return false;
+            };
+            chain.push(node);
+            pid = parent_pid;
+        }
+
+        // 最大深度超過
+        false
+    }
+
+    /// 記録したチェーンをルート側から取り直し、identity と親子関係が変わっていないか確かめる
+    ///
+    /// ルート自身の親は認可の条件ではない（ルートより外は見ない）ので比べない。
+    fn chain_is_unchanged(
+        fetch: &mut impl FnMut(u32) -> Option<ProcessInfo>,
+        chain: &[ProcessInfo],
+        root_pid: u32,
+    ) -> bool {
+        chain.iter().rev().all(|recorded| {
+            fetch(recorded.pid).is_some_and(|fresh| {
+                recorded.is_same_process(&fresh)
+                    && (recorded.pid == root_pid || recorded.parent_pid == fresh.parent_pid)
+            })
+        })
     }
 
     /// 親チェーンをたどる木探索の本体（`ancestor_pid` の妥当性は確認済み前提）
@@ -741,6 +855,337 @@ mod tests {
             10,
             11
         ));
+    }
+
+    // =====================================================================
+    // 信頼ルート自動検出（detect_root_pid）のテスト
+    //
+    // 実プロセスツリーでは「親がシェルか」「祖父が PID 1 / subreaper か」を
+    // 選べないため、名前付きの固定ツリーを注入して規則そのものを固定する。
+    // =====================================================================
+
+    /// テスト用のプロセス情報を作る
+    fn process(pid: u32, parent_pid: Option<u32>, name: &str, start_time: u64) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid,
+            name: name.to_string(),
+            cmd: Vec::new(),
+            start_time,
+        }
+    }
+
+    /// `(pid, parent_pid, name)` の組から名前付きのプロセスツリーを組み立てる
+    fn named_tree(entries: &[(u32, Option<u32>, &str)]) -> HashMap<u32, ProcessInfo> {
+        entries
+            .iter()
+            .map(|&(pid, parent_pid, name)| (pid, process(pid, parent_pid, name, 1)))
+            .collect()
+    }
+
+    fn detect_root(tree: &HashMap<u32, ProcessInfo>, current_pid: u32) -> u32 {
+        AncestryChecker::detect_root_pid(|pid| tree.get(&pid).cloned(), current_pid)
+    }
+
+    /// プラットフォームの既定 denylist に載る（システムプロセス扱いの）名前
+    fn system_process_name() -> String {
+        Config::default_denylist()
+            .into_iter()
+            .next()
+            .expect("既定 denylist は空ではない")
+    }
+
+    #[test]
+    fn test_detect_root_pid_uses_agent_above_tool_shell() {
+        // エージェント(20) → ツール用シェル(50) → safe-kill(100) の通常の構造。
+        let tree = named_tree(&[
+            (100, Some(50), "safe-kill"),
+            (50, Some(20), "zsh"),
+            (20, Some(5), "claude"),
+            (5, Some(1), "zsh"),
+        ]);
+        assert_eq!(detect_root(&tree, 100), 20);
+    }
+
+    #[test]
+    fn test_detect_root_pid_keeps_agent_when_shell_execed_into_safe_kill() {
+        // `sh -c 'safe-kill …'` はシェルが safe-kill を exec するので、親がエージェント自身になる。
+        // ここで祖父（エージェントを起動した端末のシェル 5）を採ると、エージェントの
+        // 兄弟プロセスまで子孫扱いになる。親を信頼ルートにするべき。
+        let tree = named_tree(&[
+            (100, Some(20), "safe-kill"),
+            (20, Some(5), "codex"),
+            (5, Some(1), "zsh"),
+        ]);
+        assert_eq!(detect_root(&tree, 100), 20);
+    }
+
+    #[test]
+    fn test_detect_root_pid_accepts_login_shell_name() {
+        // ログインシェルは `-zsh` のように `-` 付きで現れることがある
+        let tree = named_tree(&[
+            (100, Some(50), "safe-kill"),
+            (50, Some(20), "-zsh"),
+            (20, Some(5), "agent"),
+        ]);
+        assert_eq!(detect_root(&tree, 100), 20);
+    }
+
+    #[test]
+    fn test_detect_root_pid_falls_back_to_shell_when_grandparent_is_pid_one() {
+        // 祖父が PID 1（init/launchd）なら信頼ルートにせず、シェル自身へ倒す。
+        let tree = named_tree(&[
+            (100, Some(50), "safe-kill"),
+            (50, Some(1), "bash"),
+            (1, None, "init"),
+        ]);
+        assert_eq!(detect_root(&tree, 100), 50);
+    }
+
+    #[test]
+    fn test_detect_root_pid_rejects_system_process_as_grandparent() {
+        // Linux の孤児は PID 1 ではない subreaper（`systemd --user` など）へ付け替えられる。
+        // PID だけで判定するとそれが信頼ルートになり、ユーザーセッション全体が子孫扱いになる。
+        let system = system_process_name();
+        let tree = named_tree(&[
+            (100, Some(50), "safe-kill"),
+            (50, Some(900), "sh"),
+            (900, Some(1), &system),
+        ]);
+        assert_eq!(detect_root(&tree, 100), 50);
+    }
+
+    #[test]
+    fn test_detect_root_pid_falls_back_to_current_when_parent_is_ineligible() {
+        // 親がシステムプロセス（シェルではない）なら、親も祖父も採らず自プロセスへ倒す。
+        let system = system_process_name();
+        let tree = named_tree(&[(100, Some(900), "safe-kill"), (900, Some(1), &system)]);
+        assert_eq!(detect_root(&tree, 100), 100);
+
+        // 親が PID 1 の場合も同じ（コンテナで直接起動された場合など）
+        let tree = named_tree(&[(100, Some(1), "safe-kill"), (1, None, "node")]);
+        assert_eq!(detect_root(&tree, 100), 100);
+    }
+
+    #[test]
+    fn test_detect_root_pid_falls_back_to_current_when_parent_is_unknown() {
+        // 親の情報を取得できなければ、外側へ広げずに自プロセスへ倒す。
+        let tree = named_tree(&[(100, Some(50), "safe-kill")]);
+        assert_eq!(detect_root(&tree, 100), 100);
+        let tree = named_tree(&[(100, None, "safe-kill")]);
+        assert_eq!(detect_root(&tree, 100), 100);
+    }
+
+    #[test]
+    fn test_is_shell_process_name() {
+        for name in ["sh", "bash", "zsh", "dash", "fish", "-bash", "-zsh"] {
+            assert!(is_shell_process_name(name), "{name} はシェル扱いするべき");
+        }
+        for name in ["node", "python3", "codex", "busybox", "--zsh", "zsh5", ""] {
+            assert!(!is_shell_process_name(name), "{name} はシェル扱いしない");
+        }
+    }
+
+    // =====================================================================
+    // kill 直前の親チェーン検証（verify_fresh_chain）のテスト
+    //
+    // 取得のたびに結果が変わる状況（途中の祖先の PID 再利用・再ペアレント・消失）は
+    // 実プロセスでは意図的に作れない。呼び出し回数で返す内容を切り替える取得関数を
+    // 注入して、往復の再確認が変化を検出することを固定する。
+    // =====================================================================
+
+    /// 対象(10) → 中間(11) → 信頼ルート(12) のチェーン
+    fn stable_chain() -> HashMap<u32, ProcessInfo> {
+        [
+            process(10, Some(11), "worker", 30),
+            process(11, Some(12), "npm", 20),
+            process(12, Some(5), "agent", 10),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect()
+    }
+
+    /// 最初の `first_calls` 回は `first` を、以降は `second` を返す取得関数
+    fn changing_fetch(
+        first: HashMap<u32, ProcessInfo>,
+        first_calls: usize,
+        second: HashMap<u32, ProcessInfo>,
+    ) -> impl FnMut(u32) -> Option<ProcessInfo> {
+        let mut calls = 0;
+        move |pid| {
+            calls += 1;
+            if calls <= first_calls {
+                first.get(&pid).cloned()
+            } else {
+                second.get(&pid).cloned()
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_accepts_stable_chain() {
+        let tree = stable_chain();
+        let root = tree[&12].clone();
+        assert!(AncestryChecker::verify_fresh_chain(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            &root
+        ));
+        // 対象が信頼ルート自身でも、identity が一致すれば子孫とみなす
+        assert!(AncestryChecker::verify_fresh_chain(
+            |pid| tree.get(&pid).cloned(),
+            12,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_rejects_reused_root_pid() {
+        // 信頼ルートの PID が別プロセス（起動時刻が違う）に再利用されていたら拒否する
+        let tree = stable_chain();
+        let original_root = process(12, Some(5), "agent", 9);
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| tree.get(&pid).cloned(),
+            10,
+            &original_root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_rejects_ancestor_replaced_between_passes() {
+        // 往路（3 回の取得）の後に中間の祖先 11 が終了し、同じ PID が別プロセスになった
+        let first = stable_chain();
+        let mut second = stable_chain();
+        second.insert(11, process(11, Some(12), "npm", 21));
+        let root = first[&12].clone();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            changing_fetch(first, 3, second),
+            10,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_rejects_target_reparented_between_passes() {
+        // 往路の後に対象が信頼ルートの外へ付け替えられた（親が PID 1 になった）
+        let first = stable_chain();
+        let mut second = stable_chain();
+        second.insert(10, process(10, Some(1), "worker", 30));
+        let root = first[&12].clone();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            changing_fetch(first, 3, second),
+            10,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_rejects_target_vanished_before_recheck() {
+        // 往路の後に対象が終了した
+        let first = stable_chain();
+        let mut second = stable_chain();
+        second.remove(&10);
+        let root = first[&12].clone();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            changing_fetch(first, 3, second),
+            10,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_rejects_cycle_pid_one_and_missing_parent() {
+        let root = process(12, Some(5), "agent", 10);
+
+        // 親 PID が循環している（PID 再利用直後に起こり得る）
+        let cycle: HashMap<u32, ProcessInfo> =
+            [process(10, Some(11), "a", 1), process(11, Some(10), "b", 1)]
+                .into_iter()
+                .map(|p| (p.pid, p))
+                .collect();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| cycle.get(&pid).cloned(),
+            10,
+            &root
+        ));
+
+        // チェーンが PID 1 に到達したら、その先は追わない
+        let via_init: HashMap<u32, ProcessInfo> = [
+            process(10, Some(1), "a", 1),
+            process(1, Some(12), "init", 1),
+            root.clone(),
+        ]
+        .into_iter()
+        .map(|p| (p.pid, p))
+        .collect();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| via_init.get(&pid).cloned(),
+            10,
+            &root
+        ));
+
+        // 親 PID が不明・途中の祖先が取得できない
+        let orphan: HashMap<u32, ProcessInfo> = [process(10, None, "a", 1)]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| orphan.get(&pid).cloned(),
+            10,
+            &root
+        ));
+        let broken: HashMap<u32, ProcessInfo> = [process(10, Some(11), "a", 1), root.clone()]
+            .into_iter()
+            .map(|p| (p.pid, p))
+            .collect();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| broken.get(&pid).cloned(),
+            10,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_verify_fresh_chain_respects_max_depth() {
+        // `is_descendant_of_with_lookup` と同じく、上限ちょうどの祖先は検出し、1 ホップ超えたら拒否する
+        let tree = linear_chain(1000, MAX_ANCESTRY_DEPTH, None);
+        let root = tree[&(1000 + MAX_ANCESTRY_DEPTH)].clone();
+        assert!(AncestryChecker::verify_fresh_chain(
+            |pid| tree.get(&pid).cloned(),
+            1000,
+            &root
+        ));
+
+        let hops = MAX_ANCESTRY_DEPTH + 1;
+        let tree = linear_chain(1000, hops, None);
+        let root = tree[&(1000 + hops)].clone();
+        assert!(!AncestryChecker::verify_fresh_chain(
+            |pid| tree.get(&pid).cloned(),
+            1000,
+            &root
+        ));
+    }
+
+    #[test]
+    fn test_is_descendant_fresh_follows_real_child() {
+        // 実プロセスでも、子は自プロセスを信頼ルートにした fresh 判定で子孫になり、
+        // 逆向き（子を信頼ルートにして自プロセスを判定）は子孫にならない。
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("sleep の起動に失敗");
+        let current_pid = ProcessInfoProvider::current_pid();
+
+        let from_current = AncestryChecker::with_root_pid(ProcessInfoProvider::new(), current_pid);
+        let child_is_descendant = from_current.is_descendant_fresh(child.id());
+        let from_child = AncestryChecker::with_root_pid(ProcessInfoProvider::new(), child.id());
+        let current_is_descendant = from_child.is_descendant_fresh(current_pid);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(child_is_descendant, "自プロセスの子は子孫であるべき");
+        assert!(!current_is_descendant, "親は子の子孫ではない");
     }
 
     // 環境変数定数テスト

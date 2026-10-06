@@ -10,7 +10,10 @@ use thiserror::Error;
 pub enum SafeKillExitCode {
     /// 正常終了
     Success = 0,
-    /// 対象未指定または対象プロセスなし
+    /// 対象プロセスが見つからない（名前未一致、許可ポートにプロセスなし、全件が終了不可）
+    ///
+    /// 「対象未指定」（`SafeKillError::NoTarget`）はここではなく `GeneralError`(255)。
+    /// variant 名は歴史的経緯で `NoTarget` のままだが、意味は「指定した対象が居ない」だけ。
     NoTarget = 1,
     /// 権限不足
     PermissionDenied = 2,
@@ -48,7 +51,10 @@ pub enum SafeKillError {
     #[error("Invalid port: {0}")]
     InvalidPort(String),
 
-    /// 対象未指定
+    /// 対象未指定（PID・`--name`・`--port`・`--list` のいずれも無い）
+    ///
+    /// CLI の使用方法エラーなので、終了コードは `SafeKillExitCode::NoTarget`(1) ではなく
+    /// `GeneralError`(255)。理由は `exit_code()` を参照。
     #[error("No target specified. Use --help for usage.")]
     NoTarget,
 
@@ -116,8 +122,14 @@ impl SafeKillError {
     /// このエラーに対応する終了コードを返す
     pub fn exit_code(&self) -> SafeKillExitCode {
         match self {
-            SafeKillError::NoTarget
-            | SafeKillError::ProcessNotFound(_)
+            // 対象の指定漏れは「使用方法の誤り」であって「対象が既に居ない」ではない。
+            // 1 を返すと、空の `$PID` をクォートせずに展開して `safe-kill $PID` と呼んだ
+            // エージェントが「対象は既に終了済み」と誤読し、kill し損ねたまま先へ進む。
+            // README の「CLI の使用方法エラーはすべて 255」という契約に揃え、
+            // `InvalidUsage` や clap 由来のエラーと同じ 255 にする。
+            // `_` のフォールバックに任せず明示するのは、上の 1 のグループへ戻す退行を防ぐため。
+            SafeKillError::NoTarget => SafeKillExitCode::GeneralError,
+            SafeKillError::ProcessNotFound(_)
             | SafeKillError::ProcessNameNotFound(_)
             | SafeKillError::NoKillableTarget(_)
             | SafeKillError::NoProcessOnPort(_) => SafeKillExitCode::NoTarget,
@@ -308,10 +320,42 @@ mod tests {
 
     #[test]
     fn test_error_to_exit_code_no_target() {
+        // 対象未指定は使用方法エラーなので 255。1 は「指定した対象が居ない」専用で、
+        // 空の `$PID` を渡したエージェントがこれを「既に終了済み」と誤読しないようにする。
         assert_eq!(
             SafeKillError::NoTarget.exit_code(),
-            SafeKillExitCode::NoTarget
+            SafeKillExitCode::GeneralError
         );
+    }
+
+    #[test]
+    fn test_no_target_shares_exit_code_with_other_usage_errors() {
+        // 使用方法エラーは種類を問わず同じ終了コードで返す契約（README）。
+        // `validate()` が返す 2 種類（NoTarget / InvalidUsage）が食い違うと、
+        // `safe-kill`（対象なし）と `safe-kill --list 1234`（競合）で分岐が割れる。
+        assert_eq!(
+            SafeKillError::NoTarget.exit_code(),
+            SafeKillError::InvalidUsage("x".to_string()).exit_code()
+        );
+    }
+
+    #[test]
+    fn test_no_target_is_distinguishable_from_target_not_found() {
+        // 「指定し忘れた」と「指定した対象が居ない」を終了コードだけで区別できること。
+        // 同じ値に戻ると、呼び出し側は kill 漏れを「既に終了済み」と取り違える。
+        for not_found in [
+            SafeKillError::ProcessNotFound(123),
+            SafeKillError::ProcessNameNotFound("node".to_string()),
+            SafeKillError::NoKillableTarget("name 'node'".to_string()),
+            SafeKillError::NoProcessOnPort(3000),
+        ] {
+            assert_eq!(not_found.exit_code(), SafeKillExitCode::NoTarget);
+            assert_ne!(
+                SafeKillError::NoTarget.exit_code(),
+                not_found.exit_code(),
+                "{not_found:?} と対象未指定が同じ終了コードになっている"
+            );
+        }
     }
 
     #[test]

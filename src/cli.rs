@@ -1,14 +1,31 @@
 //! safe-kill の CLI 引数パーサー
 //!
 //! clap derive を使用した型安全な引数解析を提供する。
+//!
+//! clap derive の型（`CliArgs` / `Command`）とそのフィールド・variant には `///` を書かない。
+//! clap derive は `///` を help 文（`help` / `long_help`、`about` / `long_about`）として
+//! 取り込むため、日本語の説明を `///` で書くと `--help` へそのまま漏れる（過去に実際に
+//! 漏れていた）。明示した `help = "..."` / `about = "..."` で上書きしても防げない。
+//! clap derive は doc comment 由来の設定を明示属性より先に適用するので、短い方は
+//! 上書きされても、段落を足した doc comment から生まれる `long_help` / `long_about` は
+//! 残り、`--help` ではそちらが優先される。利用者向けの文言は英語の明示属性で書き、
+//! 開発者向けの説明は `//` コメントに分けて、help への混入経路そのものを断つ。
 
+use std::ffi::OsString;
 use std::io::{self, Write};
 
-use clap::{Parser, Subcommand};
+use clap::builder::styling::Styles;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use crate::error::{SafeKillError, SafeKillExitCode};
 use crate::signal::{Signal, SignalSender};
 use crate::terminal::sanitize_terminal;
+
+/// 使用方法エラーの本文を組み立てられなかったときに出す固定の診断
+///
+/// 引数を一切埋め込まない。ここへ来るのは想定外の経路なので、利用者の引数を
+/// サニタイズせずに表示する危険を冒すより、情報を減らしてでも安全側に倒す。
+const GENERIC_USAGE_ERROR: &str = "safe-kill: error: invalid command line. Use --help for usage.";
 
 /// CLI 引数から決定される実行モード
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,18 +42,21 @@ pub enum ExecutionMode {
     InitConfig { force: bool },
 }
 
-/// safe-kill のサブコマンド
+// safe-kill のサブコマンド
+// （clap derive の型なので `///` は使わない。理由はモジュール先頭のコメントを参照）
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// ~/.config/safe-kill/config.toml に設定ファイルを初期化
+    // ~/.config/safe-kill/config.toml に設定ファイルを初期化する
+    #[command(about = "Create ~/.config/safe-kill/config.toml with a starter configuration")]
     Init {
-        /// 既存の設定ファイルを確認なしで上書き
-        #[arg(long)]
+        // 既存の設定ファイルを確認なしで上書きする
+        #[arg(long, help = "Overwrite an existing config file without prompting")]
         force: bool,
     },
 }
 
-/// safe-kill の CLI 引数
+// safe-kill の CLI 引数
+// （clap derive の型なので `///` は使わない。理由はモジュール先頭のコメントを参照）
 #[derive(Parser, Debug)]
 #[command(
     name = "safe-kill",
@@ -54,32 +74,53 @@ pub enum Command {
                   preventing accidental termination of system or unrelated processes."
 )]
 pub struct CliArgs {
-    /// サブコマンド（例: init）
+    // サブコマンド（例: init）
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// kill 対象の PID
-    #[arg(value_name = "PID")]
+    // kill 対象の PID
+    #[arg(value_name = "PID", help = "Target PID to kill")]
     pub pid: Option<u32>,
 
-    /// プロセス名の完全一致で終了
-    #[arg(short = 'N', long, value_name = "NAME")]
+    // プロセス名の完全一致で終了する（部分一致・パターン一致はしない）
+    #[arg(
+        short = 'N',
+        long,
+        value_name = "NAME",
+        help = "Kill processes whose name exactly matches NAME"
+    )]
     pub name: Option<String>,
 
-    /// 指定ポートを使用するプロセスを kill
-    #[arg(short = 'p', long, value_name = "PORT")]
+    // 指定ポートを使用するプロセスを kill する（TCP は LISTEN のみ、UDP はローカルポート一致）。
+    // config.toml の [allowed_ports] に載っているポートだけが対象
+    #[arg(
+        short = 'p',
+        long,
+        value_name = "PORT",
+        help = "Kill the TCP listener or UDP socket using PORT (must be listed in [allowed_ports])"
+    )]
     pub port: Option<u16>,
 
-    /// 送信するシグナル（名前または番号）
-    #[arg(short, long, default_value = "SIGTERM", value_name = "SIGNAL")]
+    // 送信するシグナル（名前または番号）。既定値の表示は clap が `[default: SIGTERM]` を付ける
+    #[arg(
+        short,
+        long,
+        default_value = "SIGTERM",
+        value_name = "SIGNAL",
+        help = "Signal to send (name or number)"
+    )]
     pub signal: String,
 
-    /// kill 可能なプロセスを一覧表示
-    #[arg(short, long)]
+    // kill 可能なプロセスを一覧表示する
+    #[arg(short, long, help = "List killable processes")]
     pub list: bool,
 
-    /// dry-run モード（実際にはシグナルを送信しない）
-    #[arg(short = 'n', long)]
+    // dry-run モード（実際にはシグナルを送信しない）
+    #[arg(
+        short = 'n',
+        long,
+        help = "Show what would be killed without sending signals"
+    )]
     pub dry_run: bool,
 }
 
@@ -96,16 +137,21 @@ impl CliArgs {
     /// 内部的にも不整合だった（例: `safe-kill 0` は 255、`safe-kill 99999999999` は 2）。
     /// clap 由来のエラーも `GeneralError`(255) に揃える。`--help` / `--version` は
     /// エラーではないので従来どおり 0 で終了する。
+    ///
+    /// argv は 1 度だけ取得して使い回す。使用方法エラーの表示用に同じ argv を
+    /// もう 1 度解析し直すため（`render_usage_error` を参照）。
     pub fn parse_args() -> Self {
-        match Self::try_parse() {
+        let argv: Vec<OsString> = std::env::args_os().collect();
+        match Self::try_parse_from(&argv) {
             Ok(args) => args,
             Err(e) => {
                 // clap の `Error::print()` は use_stderr() に従って出力先を選ぶ
                 // （エラーは stderr、--help / --version は stdout）。
                 if !e.use_stderr() {
                     // --help / --version は `Command` の静的な定義から描画され、
-                    // argv の値を一切埋め込まない。攻撃者が制御文字を差し込む経路が
-                    // 構造的に無いため、clap の色付けを保ったまま出力する。
+                    // argv の値を一切埋め込まない（argv[0] も `bin_name` の固定で塞いである）。
+                    // 攻撃者が制御文字を差し込む経路が構造的に無いため、clap の色付けを
+                    // 保ったまま出力する。
                     let _ = e.print();
                     std::process::exit(i32::from(SafeKillExitCode::Success as u8));
                 }
@@ -115,25 +161,14 @@ impl CliArgs {
                 // 除去は無く、`Error::print()` は anstream 経由で書くため、端末直結では
                 // `\x1b[2J`（画面消去）や `\x1b]52`（クリップボード書き換え）が生のまま
                 // 画面へ届く。パイプ時だけ anstream が ANSI を落とすので見落としやすい。
-                // 他の表示経路（`main.rs` / `init.rs` / `config.rs`）と同じくサニタイズする。
-                //
-                // 改行も含めてすべてエスケープし、1 行に畳んで出す。clap の描画結果からは
-                // 「clap 自身のレイアウト改行」と「引数値に含まれていた改行」を区別できず、
-                // 行構造を残すと引数に改行を混ぜるだけで独立した `error:` 行を偽造できる。
-                // 診断を読む人間や AI エージェントに、ツール自身の出力として偽の復旧手順
-                // （例:「保護設定を外して再実行せよ」）を提示されるのを防ぐ。
-                //
-                // `render()` の `Display` は clap 自身の色付けを含まないプレーンテキストな
-                // ので、サニタイズ後に残る制御文字は引数由来のものだけになる。エラー表示の
-                // 色と改行は失うが、表示偽装を防ぐ方を優先する。
-                let rendered = sanitize_terminal(e.render().to_string().trim_end());
+                // そこで `print()` は使わず、サニタイズ済みの 1 行を自前で書く。
+                // 組み立て方と、制御文字を削除せずエスケープして見せる理由は
+                // `render_usage_error` を参照。
+                let line = usage_error_line(&argv);
                 let mut stderr = io::stderr();
-                // 他の診断（`main()` の `safe-kill: ...`）と同じ接頭辞に揃える。行頭が
-                // 常に固定文字列になるので、本文側に `error:` が現れても行の出自を誤れない。
-                //
                 // 診断が届かなくても終了コードは変えない（`main()` のエラー出力と同じ方針）。
                 // `exit()` はバッファを flush しないため明示的に flush する。
-                let _ = writeln!(stderr, "safe-kill: {}", rendered);
+                let _ = writeln!(stderr, "{line}");
                 let _ = stderr.flush();
                 std::process::exit(i32::from(SafeKillExitCode::GeneralError as u8));
             }
@@ -220,6 +255,88 @@ impl CliArgs {
     pub fn parse_signal(&self) -> Result<Signal, SafeKillError> {
         SignalSender::parse_signal(&self.signal)
     }
+}
+
+/// 使用方法エラーとして stderr へ書く 1 行（末尾の改行なし）を返す
+///
+/// 本文を組み立てられなければ、引数を一切含まない固定の診断に倒す。
+fn usage_error_line(argv: &[OsString]) -> String {
+    render_usage_error(argv).unwrap_or_else(|| GENERIC_USAGE_ERROR.to_string())
+}
+
+/// argv を解析し直し、使用方法エラーを端末へ安全に出せる 1 行へ変換する
+///
+/// 戻り値は `safe-kill: ` から始まる 1 行（末尾の改行なし）。解析が成功した場合と、
+/// 結果が `--help` / `--version` のように stdout へ出す種類だった場合は `None`。
+/// 呼び出し元では同じ argv が使用方法エラーになったことを確認済みなので、
+/// `None` は想定外の経路であり、固定の診断へ倒す。
+///
+/// ## 色付けを無効にした `Command` で解析し直す理由
+///
+/// 最初の解析で得たエラーをそのまま描画すると、利用者が渡した制御文字を開示できない。
+/// `StyledStr` の `Display`（`render().to_string()`）は anstream の `strip_str` を通り、
+/// clap 自身の色付けと一緒に、引数値に含まれていた ESC シーケンスや BEL・BS などの
+/// C0 制御文字まで黙って削除する。安全性は保たれるが、`safe-kill $'x\a\by'` と
+/// `safe-kill xy` の診断がバイト単位で一致し、`$'\e[2Jx'` は `x` と表示される。
+/// 削除は非単射なので、読み手は「引数に何が含まれていたか」を診断から判別できない。
+/// これはサニタイズ（`sanitize_terminal`）の「削除せず、エスケープして見せる」方針と
+/// 矛盾する。
+///
+/// 逆に `render().ansi()` は生の文字列を返すが、既定のスタイルでは clap 自身の色付け
+/// （`error:` の太字赤など）の ESC も含み、それがエスケープ表記の雑音として残る。
+/// 最初のエラーへ `Error::format` で別の `Command` を当て直しても、エラー生成時に
+/// 描画済みの Usage 行は色付きのまま残る。そこで、すべてのスタイルを `Styles::plain()`
+/// にした `Command` で同じ argv を解析し直す。plain スタイルでは clap は ESC を一切
+/// 出さないので、`ansi()` に残る制御文字は利用者の引数由来のものだけになり、
+/// サニタイズでそのまま `\x1B` などのエスケープ表記として開示できる。
+///
+/// 解析は argv だけで決まる（環境変数を読む `env` 属性は使っていない）ので、
+/// 解析し直しても最初と同じエラーになる。
+///
+/// ## 1 行に畳む理由
+///
+/// 改行も含めてすべてエスケープし、1 行に畳んで出す。clap の描画結果からは
+/// 「clap 自身のレイアウト改行」と「引数値に含まれていた改行」を区別できず、
+/// 行構造を残すと引数に改行を混ぜるだけで独立した `error:` 行を偽造できる。
+/// 診断を読む人間や AI エージェントに、ツール自身の出力として偽の復旧手順
+/// （例:「保護設定を外して再実行せよ」）を提示されるのを防ぐ。エラー表示の色と
+/// 改行は失うが、表示偽装を防ぐ方を優先する。
+fn render_usage_error(argv: &[OsString]) -> Option<String> {
+    let mut cmd = plain_command();
+    let err = match cmd.try_get_matches_from_mut(argv) {
+        // derive の `try_parse_from` と同じく、照合後の `FromArgMatches` で出る
+        // エラーも拾う。`Error::format` で plain スタイルの `Command` を当てる。
+        Ok(mut matches) => match CliArgs::from_arg_matches_mut(&mut matches) {
+            Ok(_) => return None,
+            Err(e) => e.format(&mut cmd),
+        },
+        Err(e) => e,
+    };
+    if !err.use_stderr() {
+        return None;
+    }
+
+    let rendered = err.render().ansi().to_string();
+    // 他の診断（`main()` の `safe-kill: ...`）と同じ接頭辞に揃える。行頭が
+    // 常に固定文字列になるので、本文側に `error:` が現れても行の出自を誤れない。
+    // `trim_end()` で落とすのは clap が付ける末尾の改行で、clap の描画は常に
+    // `For more information, try '--help'.` で終わるため引数値は削られない。
+    Some(format!(
+        "safe-kill: {}",
+        sanitize_terminal(rendered.trim_end())
+    ))
+}
+
+/// 端末向けの装飾を一切出さない `Command` を組み立てる
+///
+/// サブコマンドのエラー（例: `init --bogus`）はサブコマンド側の `Command` の
+/// スタイルで描画される。clap は構築時に親の設定をサブコマンドへ伝播させるが、
+/// その内部挙動に頼らず、全階層へ明示的に `Styles::plain()` を当てる。
+fn plain_command() -> clap::Command {
+    fn without_styles(cmd: clap::Command) -> clap::Command {
+        cmd.styles(Styles::plain()).mut_subcommands(without_styles)
+    }
+    without_styles(CliArgs::command())
 }
 
 #[cfg(test)]

@@ -32,6 +32,53 @@ impl fmt::Display for OutputStream {
     }
 }
 
+/// 表示が操作の中で担う役割
+///
+/// 書き込みに失敗したときの終了コードは、表示が「済んだ操作の報告」なのか
+/// 「表示そのものが成果物」なのかで変わる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputRole {
+    /// 操作は既に完了しており、表示はその報告に過ぎない
+    /// （dry-run でない PID / 名前 / ポート指定の kill、`init` の生成とスキップ）。
+    ///
+    /// シグナルは送信済み（設定ファイルは書き込み済み）で取り消せない。ここで失敗の
+    /// 終了コードを返すと、呼び出し側は「kill に失敗した」と誤解して再試行したり
+    /// SIGKILL などの別手段へ進んだりする。終了コードは操作の結果を表す契約なので、
+    /// 報告を書けなくても成功を返し、報告が失われたことは stderr の警告で伝える。
+    Informational,
+    /// 表示そのものが成果物（`--list` と、すべての dry-run）
+    ///
+    /// 呼び出し側が欲しいのは出力そのものなので、書き出せなければ何も得られていない。
+    /// 失敗として報告する（`RunError::Output`、終了コード 255）。
+    Required,
+}
+
+impl OutputRole {
+    /// kill 系の実行モードにおける表示の役割
+    ///
+    /// dry-run はシグナルを送らず「何が kill されるか」を見せるだけなので、表示が成果物。
+    /// 実際の kill は送信を終えた後の報告なので、表示は補助的なものになる。
+    fn for_kill(dry_run: bool) -> Self {
+        if dry_run {
+            OutputRole::Required
+        } else {
+            OutputRole::Informational
+        }
+    }
+}
+
+/// `run()` が成功したときの内訳
+#[derive(Debug)]
+enum RunOutcome {
+    /// 操作も表示も完了した（読み手がパイプを閉じただけの場合を含む）
+    Completed,
+    /// 操作は完了したが、その報告（`OutputRole::Informational` の表示）を書き出せなかった
+    ReportLost {
+        stream: OutputStream,
+        source: io::Error,
+    },
+}
+
 /// `run()` の失敗理由
 ///
 /// 「操作そのものの失敗（ドメインエラー）」と「操作結果を表示できなかった失敗」を
@@ -40,7 +87,7 @@ impl fmt::Display for OutputStream {
 enum RunError {
     /// kill 判定・設定読み込みなど、操作自体の失敗
     Domain(SafeKillError),
-    /// 操作は確定したが、その結果を書き出せなかった
+    /// 成果物である表示（`OutputRole::Required`）を書き出せなかった
     Output {
         stream: OutputStream,
         source: io::Error,
@@ -55,7 +102,13 @@ impl From<SafeKillError> for RunError {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(RunOutcome::Completed) => ExitCode::SUCCESS,
+        Ok(RunOutcome::ReportLost { stream, source }) => {
+            // 操作は完了しているので終了コードは成功のまま（`OutputRole::Informational`
+            // を参照）。警告すら書けない状況（stderr も失われている）でも結果は変えない。
+            let _ = writeln!(io::stderr(), "{}", report_lost_warning(stream, &source));
+            ExitCode::SUCCESS
+        }
         Err(RunError::Domain(e)) => {
             // エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
             // OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
@@ -73,8 +126,10 @@ fn main() -> ExitCode {
             e.exit_code().into()
         }
         Err(RunError::Output { stream, source }) => {
-            // BrokenPipe は `finish_output` が成功として処理済みなので、ここへ来るのは
-            // ディスク満杯（ENOSPC）や I/O エラーなど「出力が本当に失われた」場合だけ。
+            // BrokenPipe は `finish_output` が成功として処理済みで、Informational な表示の
+            // 失敗は `RunOutcome::ReportLost` になる。ここへ来るのは、成果物である表示
+            // （`--list` / dry-run）がディスク満杯（ENOSPC）や I/O エラーで本当に
+            // 失われた場合だけ。
             let _ = writeln!(
                 io::stderr(),
                 "safe-kill: failed to write to {}: {}",
@@ -86,6 +141,17 @@ fn main() -> ExitCode {
     }
 }
 
+/// 操作は完了したのに報告を書き出せなかったときの警告文（1 行、末尾の改行なし）
+///
+/// I/O エラーの本文は OS 由来の文字列なので、他の診断と同じくサニタイズしてから出す。
+fn report_lost_warning(stream: OutputStream, source: &io::Error) -> String {
+    format!(
+        "safe-kill: warning: operation completed, but failed to write to {}: {}",
+        stream,
+        sanitize_terminal(&source.to_string())
+    )
+}
+
 /// 操作結果と表示結果を突き合わせて最終的な実行結果を決める
 ///
 /// 優先順位は「操作の結果 > 表示の結果」。
@@ -93,28 +159,36 @@ fn main() -> ExitCode {
 /// * ドメインエラーが出ていれば、表示が成功していようと失敗していようとそれを返す
 ///   （終了コードは操作の意味を表すという契約を守る）
 /// * 表示が `BrokenPipe` で失敗した場合は、読み手がパイプを閉じただけであり操作は
-///   完了しているので成功として扱う。`safe-kill --list | head -1` のような通常の
-///   シェル利用で、Rust の `println!` が panic して終了コード 101 になるのを防ぐ
+///   完了しているので、役割を問わず成功として扱う（警告も出さない）。
+///   `safe-kill --list | head -1` のような通常のシェル利用で、Rust の `println!` が
+///   panic して終了コード 101 になるのを防ぐ
 ///   （Rust ランタイムは起動時に SIGPIPE を無視するため、EPIPE が panic に化ける）
-/// * それ以外の I/O エラーは出力が本当に失われているので `Output` として報告する
+/// * それ以外の I/O エラーは出力が本当に失われている。扱いは表示の役割で分かれる
+///   * `Informational`: 操作は取り消せない形で完了済みなので成功のまま、
+///     `RunOutcome::ReportLost` で「報告が失われた」ことだけを伝える
+///   * `Required`: 表示が成果物なので `RunError::Output` として失敗を報告する
 fn finish_output(
     outcome: Result<(), SafeKillError>,
     printed: io::Result<()>,
     stream: OutputStream,
-) -> Result<(), RunError> {
+    role: OutputRole,
+) -> Result<RunOutcome, RunError> {
     if let Err(e) = outcome {
         return Err(RunError::Domain(e));
     }
 
     match printed {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(()),
-        Err(source) => Err(RunError::Output { stream, source }),
+        Ok(()) => Ok(RunOutcome::Completed),
+        Err(e) if e.kind() == io::ErrorKind::BrokenPipe => Ok(RunOutcome::Completed),
+        Err(source) => match role {
+            OutputRole::Informational => Ok(RunOutcome::ReportLost { stream, source }),
+            OutputRole::Required => Err(RunError::Output { stream, source }),
+        },
     }
 }
 
 /// メインの実行ロジック
-fn run() -> Result<(), RunError> {
+fn run() -> Result<RunOutcome, RunError> {
     // CLI 引数を解析する
     let args = CliArgs::parse_args();
 
@@ -134,7 +208,12 @@ fn run() -> Result<(), RunError> {
             } else {
                 Err(single_result_error(&result))
             };
-            finish_output(outcome, printed, OutputStream::Stdout)
+            finish_output(
+                outcome,
+                printed,
+                OutputStream::Stdout,
+                OutputRole::for_kill(args.dry_run),
+            )
         }
         ExecutionMode::KillByName(name) => {
             let engine = PolicyEngine::try_with_defaults()?;
@@ -149,13 +228,19 @@ fn run() -> Result<(), RunError> {
                     &batch_result,
                 ))
             };
-            finish_output(outcome, printed, OutputStream::Stdout)
+            finish_output(
+                outcome,
+                printed,
+                OutputStream::Stdout,
+                OutputRole::for_kill(args.dry_run),
+            )
         }
         ExecutionMode::ListKillable => {
             let engine = PolicyEngine::try_with_defaults()?;
             let processes = engine.list_killable();
             let printed = print_killable_list(&processes);
-            finish_output(Ok(()), printed, OutputStream::Stdout)
+            // 一覧は表示そのものが成果物
+            finish_output(Ok(()), printed, OutputStream::Stdout, OutputRole::Required)
         }
         ExecutionMode::KillByPort(port) => {
             let engine = PolicyEngine::try_with_defaults()?;
@@ -169,8 +254,15 @@ fn run() -> Result<(), RunError> {
             } else {
                 Err(batch_result_error(format!("port {}", port), &batch_result))
             };
-            finish_output(outcome, printed, OutputStream::Stdout)
+            finish_output(
+                outcome,
+                printed,
+                OutputStream::Stdout,
+                OutputRole::for_kill(args.dry_run),
+            )
         }
+        // init はファイルの書き込み（またはスキップの確定）を終えてから表示するので、
+        // どちらの結果でも表示は報告に過ぎない。
         ExecutionMode::InitConfig { force } => match InitCommand::execute(force)? {
             InitOutcome::Created {
                 config_path,
@@ -178,7 +270,12 @@ fn run() -> Result<(), RunError> {
                 via_symlink,
             } => {
                 let printed = print_init_created(&config_path, &written_path, via_symlink);
-                finish_output(Ok(()), printed, OutputStream::Stdout)
+                finish_output(
+                    Ok(()),
+                    printed,
+                    OutputStream::Stdout,
+                    OutputRole::Informational,
+                )
             }
             InitOutcome::SkippedExisting {
                 config_path,
@@ -186,7 +283,12 @@ fn run() -> Result<(), RunError> {
                 via_symlink,
             } => {
                 let printed = print_init_skipped(&config_path, &target_path, via_symlink);
-                finish_output(Ok(()), printed, OutputStream::Stderr)
+                finish_output(
+                    Ok(()),
+                    printed,
+                    OutputStream::Stderr,
+                    OutputRole::Informational,
+                )
             }
         },
     }
