@@ -38,7 +38,7 @@ It takes the place of `kill` / `pkill` / `killall` for agents such as Claude Cod
 - **PID Validation**: Rejects unsafe PID values (`0` and values beyond `i32::MAX`), including in the fresh process lookup used immediately before signaling
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
-- **Terminal Output Sanitization**: ANSI escape sequences, newlines, C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, config-load warnings, and clap usage errors (which embed the offending argument verbatim).
+- **Terminal Output Sanitization**: ANSI escape sequences, newlines (including the Unicode line/paragraph separators U+2028/U+2029), C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, config-load warnings, and clap usage errors (which embed the offending argument verbatim).
 - **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing
 - **Private Config Creation**: `safe-kill init` creates its configuration directory with mode `0700` and a new config file with mode `0600`, even under a permissive `umask`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
@@ -85,6 +85,8 @@ make install
 `make install` installs to `/usr/local/bin`. Set `INSTALL_PATH` to change it (for example `make install INSTALL_PATH="$HOME/.local/bin"`).
 <!-- standard:install:end -->
 
+Building on macOS (from source or with `cargo install`) needs Xcode or the Command Line Tools: the build generates the libproc bindings used for `--port` from the macOS SDK headers with bindgen.
+
 ## Usage
 
 ```bash
@@ -108,7 +110,7 @@ safe-kill --port 3000
 safe-kill --name python --dry-run
 ```
 
-`--name` matches the executable name exactly, and `--port` works only for ports listed in `[allowed_ports]` of the [configuration](#configuration). Exit code 2 always means "permission denied", and every CLI usage error exits with 255. All options, signals, exit codes, and environment variables: [docs/cli-reference.md](docs/cli-reference.md)
+`--name` matches the process name the OS reports exactly (the executable's file name on macOS, the kernel's 15-byte `comm` on Linux; see [Process Names](docs/configuration.md#process-names)), and `--port` works only for ports listed in `[allowed_ports]` of the [configuration](#configuration). Exit code 2 always means "permission denied", and every CLI usage error exits with 255. All options, signals, exit codes, and environment variables: [docs/cli-reference.md](docs/cli-reference.md)
 
 ### What Can Be Killed
 
@@ -161,7 +163,7 @@ flowchart TB
 - `safe-kill --port 3000`: Kills a TCP listener or UDP socket using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, root PID, and port validation protections. Useful for killing orphaned dev servers started in other terminals.
 - TCP port matching ignores `ESTABLISHED` and other non-listening sockets so client connections are not selected just because their local port matches.
 - `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. Port `0` is invalid even when a configured range includes it; use `1-65535` for a full valid range.
-- `SAFE_KILL_ROOT_PID` changes the trust root for ancestry checks, but that root PID itself remains protected.
+- Without `SAFE_KILL_ROOT_PID`, the trust root is the agent that ran `safe-kill`: the parent of its shell, or its direct parent when no shell sits in between (a shell that `exec`s `sh -c 'safe-kill …'` disappears). `SAFE_KILL_ROOT_PID` overrides it, for example when `safe-kill` runs under a wrapper such as `timeout`, but that root PID itself remains protected. See [docs/cli-reference.md](docs/cli-reference.md#environment-variables).
 - When the process information for a port-bound PID cannot be resolved (e.g., the process exited between detection and policy check), `safe-kill` fails closed with `ProcessNotFound` instead of falling back to a placeholder name like `pid:<pid>`. This prevents denylist bypass when the real process name is unavailable.
 - Immediately before signaling, the live port-holder set is re-queried. If the target PID is no longer holding the port (e.g., the dev server already exited), the kill is aborted as `NoProcessOnPort` so that a same-PID process now doing unrelated work is not signaled.
 
@@ -173,8 +175,10 @@ The components and the 14 safety layers behind these rules: [docs/architecture.m
 
 ```toml
 # Processes that bypass ancestry checks (use with caution)
+# Use the name the OS reports (the NAME column of `safe-kill --list`),
+# not a package name or a command-line title
 [allowlist]
-processes = ["my-trusted-app", "next-server"]
+processes = ["trusted-worker"]
 
 # Additional processes that can never be killed (takes precedence over allowlist)
 [denylist]
@@ -189,7 +193,7 @@ User-defined `[denylist]` entries are added to the built-in protection of system
 
 ## Claude Code Integration
 
-Add a `PreToolUse` hook to `.claude/settings.json` that blocks `kill` / `pkill` / `killall` and tells Claude to use `safe-kill` instead, then add process management rules to your `CLAUDE.md`. The hook and the rules to paste: [docs/integrations.md](docs/integrations.md)
+Add a `PreToolUse` hook to `.claude/settings.json` that blocks `kill` / `pkill` / `killall` and tells Claude to use `safe-kill` instead, then add process management rules to your `CLAUDE.md`. The hook reads the tool call that Claude Code passes as JSON on stdin, so it needs [jq](https://jqlang.org/). The hook, the rules to paste, and an optional permission rule: [docs/integrations.md](docs/integrations.md)
 
 ## Development
 

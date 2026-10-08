@@ -319,8 +319,9 @@ fn render_usage_error(argv: &[OsString]) -> Option<String> {
     let rendered = err.render().ansi().to_string();
     // 他の診断（`main()` の `safe-kill: ...`）と同じ接頭辞に揃える。行頭が
     // 常に固定文字列になるので、本文側に `error:` が現れても行の出自を誤れない。
-    // `trim_end()` で落とすのは clap が付ける末尾の改行で、clap の描画は常に
-    // `For more information, try '--help'.` で終わるため引数値は削られない。
+    // `trim_end()` で落とすのは clap が付ける末尾の改行。このコマンドは `--help` を
+    // 持つので、使用方法エラーの末尾は clap 固定の `For more information, try '--help'.`
+    // になり、引数値の末尾の空白や改行が削られて開示から漏れることはない。
     Some(format!(
         "safe-kill: {}",
         sanitize_terminal(rendered.trim_end())
@@ -809,5 +810,317 @@ mod tests {
     fn test_cli_parser_rejects_dry_run_with_init_subcommand() {
         let result = CliArgs::try_parse_from(["safe-kill", "init", "--dry-run"]);
         assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // help 文の言語の回帰テスト
+    //
+    // clap derive は `///` を help 文として取り込むため、コメントの日本語化で
+    // `--help` が日本語に化けたことがある。利用者向けの文言は英語の明示属性で書く。
+    // =========================================================================
+
+    /// 利用者が help を表示する各経路の argv
+    const HELP_INVOCATIONS: [&[&str]; 7] = [
+        &["safe-kill", "--help"],
+        &["safe-kill", "-h"],
+        &["safe-kill", "help"],
+        &["safe-kill", "init", "--help"],
+        &["safe-kill", "init", "-h"],
+        &["safe-kill", "help", "init"],
+        &["safe-kill", "help", "help"],
+    ];
+
+    #[test]
+    fn test_help_output_is_english_only() {
+        // 実際に `e.print()` で出る文面（DisplayHelp エラーの描画）を経路ごとに検査する。
+        // 英語の文言は ASCII だけで書けるので、非 ASCII が 1 文字でもあれば混入とみなす。
+        for argv in HELP_INVOCATIONS {
+            let err = CliArgs::try_parse_from(argv).expect_err("help はエラー経路で返る");
+            assert!(!err.use_stderr(), "{argv:?} は stdout へ出す help のはず");
+            let rendered = err.render().to_string();
+            assert!(!rendered.is_empty(), "{argv:?} の help が空");
+            let non_ascii: String = rendered.chars().filter(|c| !c.is_ascii()).collect();
+            assert!(
+                non_ascii.is_empty(),
+                "{argv:?} の help に非 ASCII 文字が混入している ({non_ascii:?}):\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_help_strings_are_english_only_in_command_definition() {
+        // 描画経路に現れない長い help（long_help / long_about）も含め、定義そのものを
+        // 全階層で検査する。段落を足した `///` は明示した `help` を上書きできないが
+        // `long_help` として残り、`--help` ではそちらが優先されるため。
+        fn check(cmd: &clap::Command) {
+            let mut texts: Vec<String> = Vec::new();
+            for s in [cmd.get_about(), cmd.get_long_about()]
+                .into_iter()
+                .flatten()
+            {
+                texts.push(s.to_string());
+            }
+            for arg in cmd.get_arguments() {
+                for s in [arg.get_help(), arg.get_long_help()].into_iter().flatten() {
+                    texts.push(s.to_string());
+                }
+            }
+            for text in texts {
+                assert!(
+                    text.is_ascii(),
+                    "`{}` の help 文に非 ASCII 文字が混入している: {text:?}",
+                    cmd.get_name()
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                check(sub);
+            }
+        }
+
+        let mut cmd = CliArgs::command();
+        // 自動生成される `help` サブコマンドや `--help` / `--version` も含めて検査する
+        cmd.build();
+        check(&cmd);
+    }
+
+    #[test]
+    fn test_help_describes_each_option_consistently_with_cli_reference() {
+        // docs/cli-reference.md の説明と食い違わないよう、主要な文言を固定する。
+        let long = CliArgs::try_parse_from(["safe-kill", "--help"])
+            .unwrap_err()
+            .render()
+            .to_string();
+        for expected in [
+            "Target PID to kill",
+            "Kill processes whose name exactly matches NAME",
+            "Kill the TCP listener or UDP socket using PORT (must be listed in [allowed_ports])",
+            "Signal to send (name or number)",
+            "[default: SIGTERM]",
+            "List killable processes",
+            "Show what would be killed without sending signals",
+            "Create ~/.config/safe-kill/config.toml with a starter configuration",
+        ] {
+            assert!(
+                long.contains(expected),
+                "--help に {expected:?} が無い:\n{long}"
+            );
+        }
+
+        let init = CliArgs::try_parse_from(["safe-kill", "init", "--help"])
+            .unwrap_err()
+            .render()
+            .to_string();
+        for expected in [
+            "Create ~/.config/safe-kill/config.toml with a starter configuration",
+            "Overwrite an existing config file without prompting",
+        ] {
+            assert!(
+                init.contains(expected),
+                "init --help に {expected:?} が無い:\n{init}"
+            );
+        }
+    }
+
+    // =========================================================================
+    // 使用方法エラーの描画（render_usage_error）の回帰テスト
+    //
+    // 利用者の引数に含まれる制御文字は「削除」ではなく「エスケープして開示」する。
+    // 削除すると `x\a\by` と `xy` の診断が一致し、読み手が中身を判別できない。
+    // =========================================================================
+
+    fn os_argv(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn render(args: &[&str]) -> String {
+        render_usage_error(&os_argv(args))
+            .unwrap_or_else(|| panic!("{args:?} は使用方法エラーとして描画されるべき"))
+    }
+
+    /// 端末へ生で届くと表示を壊せる文字が 1 つも残っていないこと
+    fn assert_no_raw_controls(line: &str) {
+        let raw: Vec<char> = line
+            .chars()
+            .filter(|&c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202E}'))
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "生の制御文字 {raw:?} が残っている: {line:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_usage_error_is_single_prefixed_line() {
+        let line = render(&["safe-kill", "--bogus"]);
+        assert!(line.starts_with("safe-kill: error: "), "{line}");
+        assert!(line.contains("'--bogus'"), "{line}");
+        // clap のレイアウト改行も畳まれて 1 行になり、末尾の改行は落ちている
+        assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
+        assert!(
+            line.contains("\\n"),
+            "レイアウト改行はエスケープ表記で残る: {line}"
+        );
+        assert!(
+            line.ends_with("For more information, try '--help'."),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn test_render_usage_error_emits_no_clap_styling() {
+        // clap 自身の色付け（`error:` の太字赤など）が混ざると、サニタイズ後に
+        // `\x1B[1m` のような雑音になり、利用者由来の ESC と区別できなくなる。
+        // plain スタイルの適用が外れていないことを、制御文字を含まない引数で確かめる。
+        for args in [
+            &["safe-kill", "--bogus"][..],
+            &["safe-kill", "--port", "abc"],
+            &["safe-kill", "99999999999"],
+            &["safe-kill", "--name"],
+            &["safe-kill", "--list", "init"],
+            // サブコマンドのエラーはサブコマンド側の `Command` のスタイルで描画される
+            &["safe-kill", "init", "--bogus"],
+            &["safe-kill", "init", "--force", "extra"],
+            &["safe-kill", "help", "nonexistent"],
+        ] {
+            let line = render(args);
+            assert!(
+                !line.contains("\\x1B"),
+                "clap 自身の ANSI 装飾が混入している ({args:?}): {line}"
+            );
+            assert_no_raw_controls(&line);
+            // `trim_end()` が削るのは clap 固定の末尾の後ろだけ、という前提を固定する
+            assert!(
+                line.ends_with("For more information, try '--help'."),
+                "末尾が clap 固定の文言で終わっていない ({args:?}): {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_render_usage_error_escapes_bel_and_backspace_instead_of_deleting() {
+        let line = render(&["safe-kill", "x\x07\x08y"]);
+        assert!(line.contains("'x\\x07\\x08y'"), "{line}");
+        assert_no_raw_controls(&line);
+    }
+
+    #[test]
+    fn test_render_usage_error_is_injective_for_control_characters() {
+        // anstream の strip で制御文字を削除していた頃は、この 2 つがバイト単位で一致した。
+        assert_ne!(
+            render(&["safe-kill", "x\x07\x08y"]),
+            render(&["safe-kill", "xy"])
+        );
+        // ESC シーケンスごと消えて `x` と同じ表示になることもない
+        assert_ne!(
+            render(&["safe-kill", "\x1b[2Jx"]),
+            render(&["safe-kill", "x"])
+        );
+        // 実 ESC と、リテラルで `\x1B` と書いた引数も区別できる（`\` 自身もエスケープ）
+        assert_ne!(
+            render(&["safe-kill", "\x1b[2Jx"]),
+            render(&["safe-kill", "\\x1B[2Jx"])
+        );
+    }
+
+    #[test]
+    fn test_render_usage_error_escapes_ansi_escape_sequences() {
+        let line = render(&["safe-kill", "\x1b[2J\x1b]52;c;ZXZpbA==\x07x"]);
+        assert!(
+            line.contains("'\\x1B[2J\\x1B]52;c;ZXZpbA==\\x07x'"),
+            "{line}"
+        );
+        assert_no_raw_controls(&line);
+    }
+
+    #[test]
+    fn test_render_usage_error_cannot_forge_lines() {
+        // CR（行頭復帰で行を上書き）、LF、Unicode の行区切り（U+2028）のどれを混ぜても
+        // 独立した行を作れず、エスケープ表記で開示される。
+        for (arg, escaped) in [
+            (
+                "fake\rerror: killed successfully",
+                "fake\\rerror: killed successfully",
+            ),
+            (
+                "x\nerror: protection disabled",
+                "x\\nerror: protection disabled",
+            ),
+            ("x\u{2028}error: forged", "x\\u{2028}error: forged"),
+            ("x\u{2029}error: forged", "x\\u{2029}error: forged"),
+        ] {
+            let line = render(&["safe-kill", arg]);
+            assert!(line.starts_with("safe-kill: error: "), "{line}");
+            assert!(line.contains(escaped), "{arg:?} が開示されていない: {line}");
+            assert_no_raw_controls(&line);
+            assert_eq!(line.lines().count(), 1, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn test_render_usage_error_escapes_bidi_controls() {
+        // 双方向テキスト制御で表示順を入れ替える偽装も開示する
+        let line = render(&["safe-kill", "x\u{202E}y"]);
+        assert!(line.contains("x\\u{202E}y"), "{line}");
+        assert_no_raw_controls(&line);
+    }
+
+    #[test]
+    fn test_render_usage_error_for_subcommand_errors() {
+        let line = render(&["safe-kill", "init", "--bogus"]);
+        assert!(line.starts_with("safe-kill: error: "), "{line}");
+        assert!(line.contains("'--bogus'"), "{line}");
+        assert!(line.contains("Usage: safe-kill init"), "{line}");
+
+        // サブコマンドの引数に混ぜた制御文字も開示される
+        let line = render(&["safe-kill", "init", "--x\x1b[2J\x07"]);
+        assert!(line.contains("--x\\x1B[2J\\x07"), "{line}");
+        assert_no_raw_controls(&line);
+    }
+
+    #[test]
+    fn test_render_usage_error_handles_invalid_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+
+        // UTF-8 でない引数でも panic せず、生バイトを出さずに診断を組み立てる
+        let argv = vec![
+            OsString::from("safe-kill"),
+            OsString::from_vec(vec![b'x', 0xff, 0x1b, b'y']),
+        ];
+        let line = render_usage_error(&argv).expect("使用方法エラーとして描画されるべき");
+        assert!(line.starts_with("safe-kill: error: "), "{line}");
+        assert_no_raw_controls(&line);
+    }
+
+    #[test]
+    fn test_render_usage_error_returns_none_for_non_errors() {
+        // 解析が成功する argv と help / version は使用方法エラーではない
+        for args in [
+            &["safe-kill"][..],
+            &["safe-kill", "--list"],
+            &["safe-kill", "1234"],
+            &["safe-kill", "init", "--force"],
+            &["safe-kill", "--help"],
+            &["safe-kill", "--version"],
+            &["safe-kill", "help", "init"],
+        ] {
+            assert_eq!(render_usage_error(&os_argv(args)), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn test_usage_error_line_falls_back_to_generic_message() {
+        // 再解析が想定外に成功した場合は、引数を一切含まない固定の診断に倒す
+        let line = usage_error_line(&os_argv(&["safe-kill", "--list"]));
+        assert_eq!(line, GENERIC_USAGE_ERROR);
+        assert_eq!(
+            GENERIC_USAGE_ERROR,
+            "safe-kill: error: invalid command line. Use --help for usage."
+        );
+    }
+
+    #[test]
+    fn test_usage_error_line_uses_rendered_error() {
+        let argv = os_argv(&["safe-kill", "--bogus"]);
+        assert_eq!(usage_error_line(&argv), render(&["safe-kill", "--bogus"]));
     }
 }

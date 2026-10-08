@@ -1,12 +1,51 @@
 //! safe-kill のポート検出モジュール
 //!
-//! netstat2 を使用して特定ポートを使用するプロセスを検出する。
+//! 特定ポートを使用するプロセスを検出する。OS ごとの実装は次のとおり。
+//!
+//! - Linux: netstat2（netlink の sock_diag と `/proc/<pid>/fd`）。`linux.rs`
+//! - macOS: libproc（`proc_listallpids` / `proc_pidinfo` / `proc_pidfdinfo`）を直接呼ぶ自前の実装。
+//!   `macos.rs`。netstat2 の macOS 実装は失敗した問い合わせのバッファを別 PID の結果として
+//!   返すため使わない（詳細は `macos.rs` の冒頭）
+//!
+//! どちらも「TCP は LISTEN のみ、UDP はローカルポートの一致、IPv4 と IPv6 の両方」を対象にする。
 
 use std::cell::OnceCell;
 
 use crate::error::SafeKillError;
 use crate::process_info::{ProcessInfo, ProcessInfoProvider};
-use netstat2::{AddressFamilyFlags, ProtocolFlags, ProtocolSocketInfo, TcpState, get_sockets_info};
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+use linux as backend;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos as backend;
+
+/// ポート検出に対応していない OS の実装（`--port` は常に検出エラー、再検証は常に不成立）
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod backend {
+    use super::PortProtocol;
+    use crate::error::SafeKillError;
+
+    pub(super) fn find_port_holders(port: u16) -> Result<Vec<(u32, PortProtocol)>, SafeKillError> {
+        Err(SafeKillError::PortDetectionError {
+            port,
+            reason: "port detection is not supported on this platform".to_string(),
+        })
+    }
+
+    pub(super) fn pid_holds_port(_pid: u32, _port: u16, _protocol: PortProtocol) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    pub(super) fn count_raw_socket_entries(_pid: u32, _port: u16) -> usize {
+        0
+    }
+}
 
 /// 特定ポートを使用するプロセスの情報
 #[derive(Debug, Clone)]
@@ -35,30 +74,6 @@ impl std::fmt::Display for PortProtocol {
             PortProtocol::Udp => write!(f, "UDP"),
         }
     }
-}
-
-/// netstat2 が参照するソケット情報源が読める状態かを確認する
-///
-/// netstat2 の Linux 実装は `/proc` を `read_dir("/proc/").expect("Can't read /proc/")` で
-/// 読むため、`/proc` が未マウント・読み取り不可の環境ではライブラリ内部で panic する。
-/// panic の終了コード 101 は公開している終了コード契約（0/1/2/3/4/255）に存在せず、
-/// panic メッセージは `terminal.rs` のサニタイズも通らない。呼び出す前に可読性を
-/// 確認して、通常の `PortDetectionError` へ落とす。
-///
-/// macOS の実装は `proc_listallpids` を使い `/proc` を参照しないため確認は不要。
-#[cfg(target_os = "linux")]
-fn ensure_socket_source_readable(port: u16) -> Result<(), SafeKillError> {
-    std::fs::read_dir("/proc")
-        .map(|_| ())
-        .map_err(|e| SafeKillError::PortDetectionError {
-            port,
-            reason: format!("Cannot read /proc: {}", e),
-        })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn ensure_socket_source_readable(_port: u16) -> Result<(), SafeKillError> {
-    Ok(())
 }
 
 /// 特定ポートを使用するプロセスを検出するポート検出器
@@ -94,27 +109,16 @@ impl PortDetector {
             return Err(SafeKillError::InvalidPort(port.to_string()));
         }
 
-        ensure_socket_source_readable(port)?;
+        let mut holders = backend::find_port_holders(port)?;
 
-        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-        let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
+        // 重複を除去（同一 PID が異なるソケットで複数回出現する場合がある）。
+        // 安定ソートなので、同一 PID では最初に見つかったソケットのプロトコルが残る。
+        holders.sort_by_key(|&(pid, _)| pid);
+        holders.dedup_by_key(|&mut (pid, _)| pid);
 
-        let sockets_info = get_sockets_info(af_flags, proto_flags).map_err(|e| {
-            SafeKillError::PortDetectionError {
-                port,
-                reason: e.to_string(),
-            }
-        })?;
-
-        let mut results = Vec::new();
-
-        for si in sockets_info {
-            let Some(protocol) = socket_matches_port(&si.protocol_socket_info, port) else {
-                continue;
-            };
-
-            for pid in &si.associated_pids {
-                let pid = *pid;
+        let results = holders
+            .into_iter()
+            .map(|(pid, protocol)| {
                 // プロセス情報が取れない場合は表示用のプレースホルダ名を入れる。
                 // この名前はあくまで UI 出力用であり、denylist 等のポリシー判定には
                 // 使ってはならない（呼び出し側で fresh なプロセス情報を再取得すること）。
@@ -124,18 +128,14 @@ impl PortDetector {
                     .map(|p| p.name)
                     .unwrap_or_else(|| format!("pid:{}", pid));
 
-                results.push(PortProcess {
+                PortProcess {
                     pid,
                     name,
                     port,
                     protocol,
-                });
-            }
-        }
-
-        // 重複を除去（同一 PID が異なるソケットで複数回出現する場合がある）
-        results.sort_by_key(|p| p.pid);
-        results.dedup_by_key(|p| p.pid);
+                }
+            })
+            .collect();
 
         Ok(results)
     }
@@ -145,42 +145,15 @@ impl PortDetector {
     /// kill 直前の TOCTOU 緩和用。判定〜kill の窓を最小化するため、対象 PID ごとに
     /// その都度 OS へ問い合わせ直す。
     ///
-    /// 呼び出しコストは軽くない。`get_sockets_info` は 1 回ごとにシステム全体の
-    /// ソケット表を走査する（macOS は全 PID × 全 FD に `proc_pidfdinfo`、Linux は
-    /// netlink dump に加えて `/proc/*/fd` 全体の `read_link`）。同一ポートを N 個の
-    /// プロセスが保持していれば、その N 回ぶん全体走査が走る。窓を狭めるために
-    /// この重さを受け入れている、というのが意図した設計上のトレードオフである。
+    /// 呼び出しコストは OS で異なる。macOS は対象 PID の FD だけを `proc_pidfdinfo` で
+    /// 問い合わせ直す（システム全体は走査しない）。Linux は netstat2 の `get_sockets_info` が
+    /// 1 回ごとにシステム全体のソケット表を走査する（netlink dump に加えて `/proc/*/fd` 全体の
+    /// `read_link`）ため、同一ポートを N 個のプロセスが保持していれば、その N 回ぶん全体走査が
+    /// 走る。窓を狭めるためにこの重さを受け入れている、というのが意図した設計上のトレードオフである。
     ///
-    /// 取得に失敗した場合は安全側に倒して `false` を返す（fail-closed）。
+    /// 取得に失敗した場合や調べ切れなかった場合は安全側に倒して `false` を返す（fail-closed）。
     pub fn pid_holds_port(&self, pid: u32, port: u16, protocol: PortProtocol) -> bool {
-        // 情報源が読めない場合は「保持していない」と断定できないので fail-closed。
-        if ensure_socket_source_readable(port).is_err() {
-            return false;
-        }
-
-        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-        let proto_flags = match protocol {
-            PortProtocol::Tcp => ProtocolFlags::TCP,
-            PortProtocol::Udp => ProtocolFlags::UDP,
-        };
-
-        let Ok(sockets_info) = get_sockets_info(af_flags, proto_flags) else {
-            return false;
-        };
-
-        for si in sockets_info {
-            if !si.associated_pids.contains(&pid) {
-                continue;
-            }
-            let Some(matched_protocol) = socket_matches_port(&si.protocol_socket_info, port) else {
-                continue;
-            };
-            if matched_protocol == protocol {
-                return true;
-            }
-        }
-
-        false
+        backend::pid_holds_port(pid, port, protocol)
     }
 
     /// 指定ポートを使用するすべてのプロセスのプロセス情報を取得
@@ -204,23 +177,6 @@ impl PortDetector {
         if let Some(provider) = self.provider.get_mut() {
             provider.refresh();
         }
-    }
-}
-
-/// 指定ポートの待ち受けソケットか判定する
-///
-/// TCP は LISTEN 状態のみを対象にする。ESTABLISHED などの接続済みソケットまで
-/// kill 対象に含めると、同じローカルポートを持つクライアントプロセスを誤って
-/// 終了する可能性がある。UDP は状態を持たないため、ローカルポート一致で対象にする。
-fn socket_matches_port(socket: &ProtocolSocketInfo, port: u16) -> Option<PortProtocol> {
-    match socket {
-        ProtocolSocketInfo::Tcp(tcp_si)
-            if tcp_si.local_port == port && tcp_si.state == TcpState::Listen =>
-        {
-            Some(PortProtocol::Tcp)
-        }
-        ProtocolSocketInfo::Udp(udp_si) if udp_si.local_port == port => Some(PortProtocol::Udp),
-        _ => None,
     }
 }
 
@@ -487,16 +443,7 @@ mod tests {
     /// 「そもそも重複が発生していないので assert が素通りしている」状態に
     /// 気付けない（この関数を足す前のテストがまさにその状態だった）。
     fn count_raw_socket_entries(pid: u32, port: u16) -> usize {
-        let af_flags = AddressFamilyFlags::IPV4 | AddressFamilyFlags::IPV6;
-        let proto_flags = ProtocolFlags::TCP | ProtocolFlags::UDP;
-        get_sockets_info(af_flags, proto_flags)
-            .expect("ソケット一覧の取得に失敗")
-            .iter()
-            .filter(|si| {
-                socket_matches_port(&si.protocol_socket_info, port).is_some()
-                    && si.associated_pids.contains(&pid)
-            })
-            .count()
+        backend::count_raw_socket_entries(pid, port)
     }
 
     /// 指定ポートの検出結果が得られるまで短く待って取得する
@@ -706,53 +653,26 @@ mod tests {
     }
 
     #[test]
-    fn test_socket_matches_port_accepts_tcp_listen_only() {
-        let tcp_listen = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
-            local_addr: "127.0.0.1".parse().unwrap(),
-            local_port: 3000,
-            remote_addr: "0.0.0.0".parse().unwrap(),
-            remote_port: 0,
-            state: TcpState::Listen,
-        });
-        let tcp_established = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
-            local_addr: "127.0.0.1".parse().unwrap(),
-            local_port: 3000,
-            remote_addr: "127.0.0.1".parse().unwrap(),
-            remote_port: 4000,
-            state: TcpState::Established,
-        });
+    fn test_find_by_port_ignores_connected_tcp_client() {
+        // TCP は LISTEN のみが対象。接続先ポートを共有するだけの接続済みソケット
+        // （サーバー側の accept 済みソケットとクライアント）は保持者に数えない。
+        let listener = TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let client =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("リスナーへの接続に失敗");
+        let (_accepted, _) = listener.accept().expect("接続の受け入れに失敗");
+        let current_pid = ProcessInfoProvider::current_pid();
 
+        // 接続済みソケットまで数えていれば、同一 PID でも LISTEN との 2 件以上になる。
         assert_eq!(
-            socket_matches_port(&tcp_listen, 3000),
-            Some(PortProtocol::Tcp)
+            count_raw_socket_entries(current_pid, port),
+            1,
+            "LISTEN 以外の TCP ソケットを保持者として数えている (port {port})"
         );
-        assert_eq!(socket_matches_port(&tcp_established, 3000), None);
-    }
 
-    #[test]
-    fn test_socket_matches_port_rejects_tcp_listen_on_other_port() {
-        // LISTEN 状態でもローカルポートが一致しなければ対象外（None）。
-        // 別ポートで待ち受けるサービスを誤って巻き込まないことを保証する。
-        let tcp_listen = ProtocolSocketInfo::Tcp(netstat2::TcpSocketInfo {
-            local_addr: "127.0.0.1".parse().unwrap(),
-            local_port: 3000,
-            remote_addr: "0.0.0.0".parse().unwrap(),
-            remote_port: 0,
-            state: TcpState::Listen,
-        });
-
-        assert_eq!(socket_matches_port(&tcp_listen, 9999), None);
-    }
-
-    #[test]
-    fn test_socket_matches_port_accepts_udp_by_local_port() {
-        let udp = ProtocolSocketInfo::Udp(netstat2::UdpSocketInfo {
-            local_addr: "127.0.0.1".parse().unwrap(),
-            local_port: 5353,
-        });
-
-        assert_eq!(socket_matches_port(&udp, 5353), Some(PortProtocol::Udp));
-        assert_eq!(socket_matches_port(&udp, 5354), None);
+        // 接続側のローカルポート（エフェメラルポート）では保持者にならない。
+        let client_port = client.local_addr().unwrap().port();
+        assert!(!PortDetector::new().pid_holds_port(current_pid, client_port, PortProtocol::Tcp));
     }
 
     // =========================================================================

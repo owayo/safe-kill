@@ -54,14 +54,20 @@ run: ## Run the debug binary (arguments via ARGS="...")
 
 ## Checks
 
+# SAFE_KILL_ROOT_PID は信頼ルートの自動検出を上書きする。AI エージェントのセッションなどで
+# 設定されたままテストを走らせると、テストプロセスの子を子孫と判定できずに失敗する。
+# ライブラリと統合テストは同じプロセス内で環境変数を読むので、並列に走るテストの中から
+# 書き換えるとデータ競合になる。起動前に外しておく（E2E は起動する子プロセス側でも外す）。
+TEST_ENV := env -u SAFE_KILL_ROOT_PID
+
 test: ## Run the tests
-	$(RUN) cargo test $(CARGO_FLAGS)
+	$(RUN) $(TEST_ENV) cargo test $(CARGO_FLAGS)
 
 test-e2e: ## Run only the E2E tests (tests/e2e_tests.rs)
-	$(RUN) cargo test $(CARGO_FLAGS) --test e2e_tests
+	$(RUN) $(TEST_ENV) cargo test $(CARGO_FLAGS) --test e2e_tests
 
 test-integration: ## Run only the integration tests (tests/integration_tests.rs)
-	$(RUN) cargo test $(CARGO_FLAGS) --test integration_tests
+	$(RUN) $(TEST_ENV) cargo test $(CARGO_FLAGS) --test integration_tests
 
 # --all-targets でテストコードも検査する。安全性を固定するテストの警告を見逃さない。
 lint: ## Run clippy with warnings as errors
@@ -92,11 +98,13 @@ install-hooks: ## Show how to set up the Claude Code hook that redirects kill to
 	@echo "Claude Code Integration Setup"
 	@echo ""
 	@echo "1. Add to .claude/settings.json:"
-	@echo '   {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"if echo \"$$TOOL_INPUT\" | grep -qE '"'"'(^|[;&|])\\s*(kill|pkill|killall)\\s'"'"'; then echo '"'"'🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <name> (like pkill). Use -s <signal> for signal.'"'"' >&2; exit 2; fi"}]}]}}'
+	@echo '   {"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"if jq -r '"'"'.tool_input.command // empty'"'"' | grep -qE '"'"'(^|[;&|])[[:space:]]*(kill|pkill|killall)[[:space:]]'"'"'; then echo '"'"'🚫 Use safe-kill instead: safe-kill <PID> or safe-kill --name <exact-name>. Use -s <signal> for signal.'"'"' >&2; exit 2; fi"}]}]}}'
+	@echo "   (Claude Code passes the tool call as JSON on stdin; the hook needs jq)"
 	@echo ""
 	@echo "2. Add process management rules to CLAUDE.md (see docs/integrations.md)"
 	@echo ""
-	@echo "3. Grant permission: claude /permissions add Bash \"safe-kill*\""
+	@echo "3. Allow safe-kill without a permission prompt: add \"Bash(safe-kill *)\" to permissions.allow"
+	@echo "   in .claude/settings.json (or add the rule from /permissions inside Claude Code)"
 
 uninstall: ## Remove the binary from INSTALL_PATH
 	rm -f "$(INSTALL_PATH)/$(BINARY_NAME)"

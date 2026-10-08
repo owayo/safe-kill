@@ -38,7 +38,7 @@ Claude Code などのエージェントに、`kill` / `pkill` / `killall` の代
 - **PID検証**: 危険なPID値（`0` と `i32::MAX` 超過）を拒否。シグナル送信直前の fresh なプロセス情報取得でも同じ境界を拒否
 - **PID再利用検出**: シグナル送信直前に対象の同一性 (`pid + start_time + name`) を再検証し、ポリシー判定と `kill(2)` の間に発生する PID 再利用 (TOCTOU) を緩和
 - **ポート保持の再検証**: `--port` 指定 kill では、シグナル送信直前に対象ポートを保持しているプロセス集合を再取得し、対象 PID/プロトコルが含まれない場合は `NoProcessOnPort` として fail-closed
-- **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape・改行・C0/C1 制御文字・Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字を `\xHH` または `\u{HHHH}` にエスケープしてから出力する。`--list` / kill 結果（`name` と `message` の両方）/ stderr のエラー出力（`safe-kill: ...`）/ `safe-kill init` のパス表示 / 設定読み込み警告 / clap の使用方法エラー（引数値をそのまま埋め込む）に適用し、表示行の上書き、端末状態の改ざん、双方向制御文字による表示順偽装を防ぐ
+- **端末制御文字のサニタイズ**: OS から取得したプロセス名・コマンドライン引数・エラーメッセージ本文・設定パスに含まれる ANSI escape・改行（Unicode の行区切り U+2028 / 段落区切り U+2029 を含む）・C0/C1 制御文字・Unicode 17.0 の general category `Cf` に属する全 170 個の format 制御文字を `\xHH` または `\u{HHHH}` にエスケープしてから出力する。`--list` / kill 結果（`name` と `message` の両方）/ stderr のエラー出力（`safe-kill: ...`）/ `safe-kill init` のパス表示 / 設定読み込み警告 / clap の使用方法エラー（引数値をそのまま埋め込む）に適用し、表示行の上書き、端末状態の改ざん、双方向制御文字による表示順偽装を防ぐ
 - **設定の fail-closed 読み込み**: 通常ファイルと通常ファイルへの symlink だけを受け入れ、壊れた symlink や特殊ファイルは解析前に拒否
 - **設定の非公開権限**: `safe-kill init` は呼び出し元の `umask` が緩くても、設定ディレクトリを `0700`、新規設定ファイルを `0600` で作成
 - **設定可能なリスト**: 許可リスト・拒否リストによる細かな制御
@@ -85,6 +85,8 @@ make install
 `make install` は `/usr/local/bin` に入れます。場所を変えるときは `INSTALL_PATH` を指定します (例: `make install INSTALL_PATH="$HOME/.local/bin"`)。
 <!-- standard:install:end -->
 
+macOS でビルドする場合（ソースからでも `cargo install` でも）は Xcode か Command Line Tools が必要です。`--port` が使う libproc の定義を、ビルド時に bindgen で macOS SDK のヘッダから生成するためです。
+
 ## 使い方
 
 ```bash
@@ -108,7 +110,7 @@ safe-kill --port 3000
 safe-kill --name python --dry-run
 ```
 
-`--name` は実行ファイル名の完全一致で判定し、`--port` は[設定](#設定)の `[allowed_ports]` に書いたポートにだけ使えます。終了コード 2 は常に「権限エラー」を表し、CLI の使用方法エラーはすべて 255 で終了します。全オプション・シグナル・終了コード・環境変数は [docs/cli-reference.ja.md](docs/cli-reference.ja.md) にまとめています。
+`--name` は OS が報告するプロセス名（macOS は実行ファイル名、Linux はカーネルの 15 バイトの `comm`。[プロセス名](docs/configuration.ja.md#プロセス名)を参照）の完全一致で判定し、`--port` は[設定](#設定)の `[allowed_ports]` に書いたポートにだけ使えます。終了コード 2 は常に「権限エラー」を表し、CLI の使用方法エラーはすべて 255 で終了します。全オプション・シグナル・終了コード・環境変数は [docs/cli-reference.ja.md](docs/cli-reference.ja.md) にまとめています。
 
 ### 終了できるプロセス
 
@@ -161,7 +163,7 @@ flowchart TB
 - `safe-kill --port 3000`: ポート3000が `allowed_ports` に設定されていれば、自己破壊防止・拒否リスト・root PID 保護・ポート検証を維持したまま、**親子関係に関係なく** TCP リスナーまたは UDP ソケットを終了可能。別ターミナルで起動したままの開発サーバー等を終了する場合に便利。
 - TCP のポート一致では `ESTABLISHED` などの非待ち受けソケットを無視するため、ローカルポートが一致しただけのクライアント接続は選択されません。
 - `--port` オプションは `config.toml` での明示的な設定が必要です。設定がない場合、ポート指定でのkillは無効です。ポート `0` は範囲設定に含まれていても無効で、全有効ポートを許可する場合は `1-65535` を使います。
-- `SAFE_KILL_ROOT_PID` は親子関係チェックの信頼ルートを変更しますが、その root PID 自体は保護されます。
+- `SAFE_KILL_ROOT_PID` が無いとき、信頼ルートは `safe-kill` を実行したエージェントです。シェルを挟んでいればシェルの親、挟んでいなければ直接の親になります（`sh -c 'safe-kill …'` のようにシェルが exec すると、シェルは消えます）。`timeout` などのラッパー経由で実行する場合は `SAFE_KILL_ROOT_PID` で上書きできますが、その root PID 自体は保護されます。詳細は [docs/cli-reference.ja.md](docs/cli-reference.ja.md#環境変数) を参照してください。
 - ポートを掴んでいる PID のプロセス情報が解決できない場合（検出後すぐに終了したケース等）、`safe-kill` は `pid:<pid>` のようなプレースホルダ名にフォールバックする代わりに `ProcessNotFound` で fail-closed します。これにより、実プロセス名が不明な状態で denylist 保護がバイパスされる事態を防ぎます。
 - シグナル送信直前に対象ポートの保持者集合を再取得し、対象 PID が既にそのポートを離している場合は `NoProcessOnPort` として中止します。同一 PID が無関係な処理に切り替わっている場合に余計なシグナルを送らないための追加防御です。
 
@@ -173,8 +175,9 @@ flowchart TB
 
 ```toml
 # 親子関係チェックをバイパスするプロセス（慎重に使用）
+# パッケージ名や表示名ではなく、OS が報告する名前（safe-kill --list の NAME 列）を書く
 [allowlist]
-processes = ["my-trusted-app", "next-server"]
+processes = ["trusted-worker"]
 
 # 追加で絶対に終了できないプロセス（許可リストより優先）
 [denylist]
@@ -189,7 +192,7 @@ ports = ["1420", "3000-3010", "5173", "8080"]
 
 ## Claude Code との連携
 
-`.claude/settings.json` に `PreToolUse` フックを追加して `kill` / `pkill` / `killall` を止め、代わりに `safe-kill` を使うよう Claude に伝えます。あわせて `CLAUDE.md` にプロセス管理のルールを書いておきます。貼り付けるフックとルールは [docs/integrations.ja.md](docs/integrations.ja.md) にあります。
+`.claude/settings.json` に `PreToolUse` フックを追加して `kill` / `pkill` / `killall` を止め、代わりに `safe-kill` を使うよう Claude に伝えます。あわせて `CLAUDE.md` にプロセス管理のルールを書いておきます。フックは Claude Code が stdin に JSON で渡すツール呼び出しを読むので、[jq](https://jqlang.org/) が必要です。貼り付けるフックとルール、任意の権限ルールは [docs/integrations.ja.md](docs/integrations.ja.md) にあります。
 
 ## 開発
 

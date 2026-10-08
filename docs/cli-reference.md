@@ -39,7 +39,7 @@ Supported signals can be specified by name or number:
 
 ## Choosing Targets
 
-`--name` matches the executable name exactly. It does not perform substring or pattern matching.
+`--name` matches the process name the OS reports exactly: the executable's file name on macOS, the kernel's `comm` (truncated to 15 bytes) on Linux — see [Process Names](configuration.md#process-names). It does not perform substring or pattern matching, so on Linux a name longer than 15 bytes never matches; pass its first 15 bytes instead.
 
 When multiple processes match `--name`, results are processed and displayed in ascending PID order so repeated runs stay stable.
 
@@ -49,25 +49,27 @@ For `--name` and `--port` dry runs, batch summaries use `would kill` so preview 
 
 ## Error Handling
 
-If a process matched policy checks but disappeared before signal delivery, or the OS rejected the signal, `safe-kill` returns the original runtime error such as `ProcessNotFound` or `PermissionDenied` instead of collapsing it into `NoKillableTarget`.
+If a process matched policy checks but disappeared before signal delivery, or the OS rejected the signal, `safe-kill` returns the original runtime error such as `ProcessNotFound` or `PermissionDenied` instead of collapsing it into `NoKillableTarget`. A target that exits while the pre-kill ancestry re-check runs is reported as `ProcessNotFound` (exit 1), not as `NotDescendant`.
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | No target found (no name match, no process on allowed port, or no killable match) |
+| 1 | A specified target was not found (PID not found, no name match, no process on allowed port, or no killable match) |
 | 2 | Permission denied |
 | 3 | Configuration error |
 | 4 | Port not allowed |
 | 255 | General error (invalid signal/port, suicide attempt, and all CLI usage errors) |
 
-CLI usage errors — unknown flags, malformed option values, an out-of-range PID, and conflicting targets such as `--list --port 3000` — all exit with **255**, never 2. Exit code 2 means *only* "permission denied", so a caller can branch on it without mistaking a typo for a real permission failure. `--help` and `--version` exit 0.
+CLI usage errors — unknown flags, malformed option values, an out-of-range PID, a missing target (no `PID`, `--name`, `--port`, or `--list`, e.g. `safe-kill`, `safe-kill --dry-run`, or an empty unquoted `$PID`), and conflicting targets such as `--list --port 3000` — all exit with **255**, never 1 or 2. Exit code 1 is reserved for a target that was specified but not found, so a caller does not mistake a forgotten argument for "the process is already gone". Exit code 2 means *only* "permission denied", so a caller can branch on it without mistaking a typo for a real permission failure. `--help` and `--version` exit 0.
 
-A reader closing the output stream does not change the exit code: `safe-kill --list | head -1` exits 0 because the listing itself completed and only the reader went away. Other write failures (a full disk, for example) exit with **255**, since the result was genuinely lost. The exit code always describes the operation, never whether its description reached anyone — a kill that succeeded reports success even if the result line could not be printed. Rust ignores `SIGPIPE` at startup, so without this handling `println!` would panic and yield exit code 101, which is outside the documented set.
+A reader closing the output stream does not change the exit code: `safe-kill --list | head -1` exits 0 because the listing itself completed and only the reader went away. Other write failures (a full disk or a file-size limit, for example) depend on what the output is for. For `--list` and every `--dry-run`, the output is the product, so `safe-kill` exits with **255** (`safe-kill: failed to write to stdout: ...`). After an actual kill (PID, `--name`, or `--port`) or `init`, the operation has already happened: the exit code stays 0 and stderr gets one warning line (`safe-kill: warning: operation completed, but failed to write to stdout: ...`), because a non-zero code would make a caller retry or escalate a kill that succeeded. The exit code always describes the operation, never whether its description reached anyone. Rust ignores `SIGPIPE` at startup, so without this handling `println!` would panic and yield exit code 101, which is outside the documented set.
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
 | `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0`, `1` (init/launchd), or invalid values are ignored; the root PID itself is not killable) |
+
+Without `SAFE_KILL_ROOT_PID`, the trust root is detected automatically. When the direct parent of `safe-kill` is a shell (`sh`, `bash`, `zsh`, `dash`, `fish`, …), the root is the shell's parent — the agent that ran the shell. Otherwise the root is the direct parent: a shell that `exec`s its last command (`sh -c 'safe-kill …'`) disappears, leaving the agent itself as the parent. PID 1 and processes on the built-in denylist (such as `systemd`) are never chosen; detection falls back to the parent, then to `safe-kill` itself. If you run `safe-kill` through a wrapper such as `timeout`, `make`, or an npm script, the wrapper becomes the parent and fewer processes are killable; set `SAFE_KILL_ROOT_PID` to the agent's PID (for example `os.getpid()` in the agent process) in that case. Details: [architecture.md](architecture.md) (Safety Layers 7).

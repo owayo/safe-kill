@@ -35,11 +35,26 @@ serde = { version = "1.0.229", features = ["derive"] }
 # ホームディレクトリ検出
 dirs = "7.0.0"
 
-# ポート使用プロセス検出
+# エラーハンドリング
+thiserror = "2.0.21"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# ポート使用プロセス検出（Linux のみ。netlink と /proc を読む）
+# macOS は netstat2 を使わず、libproc を直接呼ぶ自前の実装 (src/port/macos.rs) で検出する。
+# netstat2 0.11.2 の macOS 実装は proc_pidfdinfo の失敗 (戻り値 0) を成功と誤認し、
+# 書き込まれていないバッファ（実際には直前の FD の情報）を別の PID のソケットとして返すため
 netstat2 = "0.11.2"
 
-# エラーハンドリング
-thiserror = "2.0.20"
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# macOS SDK のヘッダ (<libproc.h> / <sys/proc_info.h>) から libproc の FFI 定義を生成する (build.rs)
+# 既定の機能から prettyplease だけを外す (logging と runtime は既定のまま)。build.rs は整形に既定の
+# rustfmt を使い、prettyplease を使っていない (rustfmt が無ければ bindgen は未整形のまま書き出して続ける)。
+# bindgen 0.73.1 以降は syn を ">=2, <4"、prettyplease を ">=0.2.7, <0.4" で受けるので、prettyplease を
+# 有効にしたままだと、bindgen 側の syn 3 と prettyplease 0.2 側の syn 2 が組み合わさったときに bindgen
+# 自身のコンパイルが E0277 (`syn::file::File: ParseQuote` が無い) で失敗する。prettyplease 0.2 は
+# Linux 向けの netstat2 が使う bindgen 0.72 経由で lock に載っているため、bindgen の版だけを上げて
+# cargo に最小限の更新をさせると、実際にこの組み合わせが選ばれる
+bindgen = { version = "0.73.2", default-features = false, features = ["logging", "runtime"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

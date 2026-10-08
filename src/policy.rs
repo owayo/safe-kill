@@ -673,7 +673,7 @@ mod tests {
     // can_kill のテスト
     #[test]
     fn test_can_kill_self_denied() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
 
         if let Some(process) = engine.provider.get(current_pid) {
@@ -684,7 +684,7 @@ mod tests {
 
     #[test]
     fn test_can_kill_parent_denied() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
 
         if let Some(current) = engine.provider.get(current_pid)
@@ -803,36 +803,38 @@ mod tests {
     // kill_by_pid のテスト
     #[test]
     fn test_kill_by_pid_not_found() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let result = engine.kill_by_pid(999999999, Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::ProcessNotFound(_))));
     }
 
     #[test]
     fn test_kill_by_pid_zero_rejected_as_invalid() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let result = engine.kill_by_pid(0, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
     }
 
     #[test]
     fn test_kill_by_pid_over_i32_max_rejected_as_invalid() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let result = engine.kill_by_pid(i32::MAX as u32 + 1, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
     }
 
     #[test]
     fn test_kill_by_pid_self_prevented() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
-        let result = engine.kill_by_pid(current_pid, Signal::SIGTERM, false);
+        // 自殺防止の判定はシグナル送信の前に行われるので dry-run でも同じ結果になる。
+        // dry-run でなければ、自殺防止が退行したときにテストランナー自身が SIGTERM で落ちる。
+        let result = engine.kill_by_pid(current_pid, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::SuicidePrevention(_))));
     }
 
     #[test]
     fn test_kill_by_pid_dry_run() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         // 存在しないプロセスに dry_run を使用 - プロセス未検出で失敗するはず
         let result = engine.kill_by_pid(999999999, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::ProcessNotFound(_))));
@@ -841,7 +843,7 @@ mod tests {
     // kill_by_name のテスト
     #[test]
     fn test_kill_by_name_not_found() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let result = engine.kill_by_name("__nonexistent_process__", Signal::SIGTERM, false);
         assert!(matches!(result, Err(SafeKillError::ProcessNameNotFound(_))));
     }
@@ -849,7 +851,7 @@ mod tests {
     // list_killable のテスト
     #[test]
     fn test_list_killable() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let killable = engine.list_killable();
 
         // 自プロセスを含まないこと
@@ -868,7 +870,7 @@ mod tests {
     fn test_list_killable_excludes_denylisted() {
         #[cfg(target_os = "macos")]
         {
-            let engine = PolicyEngine::with_defaults();
+            let engine = PolicyEngine::new(Config::default());
             let killable = engine.list_killable();
 
             // launchd を含まないこと（macOS のデフォルト denylist に含まれる）
@@ -877,7 +879,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         {
-            let engine = PolicyEngine::with_defaults();
+            let engine = PolicyEngine::new(Config::default());
             let killable = engine.list_killable();
 
             // systemd を含まないこと（Linux のデフォルト denylist に含まれる）
@@ -888,7 +890,7 @@ mod tests {
     // root PID のテスト
     #[test]
     fn test_root_pid() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let root_pid = engine.root_pid();
         assert!(root_pid > 0);
     }
@@ -971,8 +973,9 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // config が None の場合、すべてのポートで PortNotAllowed を返す
-        let result = engine.kill_by_port(3000, Signal::SIGTERM, false);
+        // config が None の場合、すべてのポートで PortNotAllowed を返す。
+        // 許可判定が退行しても 3000 番の開発サーバーを落とさないよう dry-run で検証する。
+        let result = engine.kill_by_port(3000, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
     }
 
@@ -989,8 +992,8 @@ mod tests {
         };
         let engine = PolicyEngine::new(config);
 
-        // ポート 59996 は許可リストに含まれていない
-        let result = engine.kill_by_port(59996, Signal::SIGTERM, false);
+        // ポート 59996 は許可リストに含まれていない（退行しても実 kill しないよう dry-run）
+        let result = engine.kill_by_port(59996, Signal::SIGTERM, true);
         assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
     }
 
@@ -1034,7 +1037,7 @@ mod tests {
     // can_kill_for_port のテスト
     #[test]
     fn test_can_kill_for_port_allowed() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         // 自プロセスでも denylist にも含まれないランダムな PID
         let permission = engine.can_kill_for_port(99999, "random_process");
         assert_eq!(permission, KillPermission::Allowed);
@@ -1042,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_can_kill_for_port_suicide_prevention() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let permission = engine.can_kill_for_port(current_pid, "safe-kill");
         assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
@@ -1081,7 +1084,7 @@ mod tests {
     fn test_can_kill_for_port_no_ancestor_check() {
         // can_kill_for_port が ancestry チェックを行わないことを検証
         // 設計上の意図: ポート指定 kill は ancestry 走査を適用しない
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
 
         // 確実に子孫ではないランダムなプロセス
         // denylist に含まれていなければ許可されるべき
@@ -1093,7 +1096,7 @@ mod tests {
 
     #[test]
     fn test_can_kill_non_descendant_process() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let process = ProcessInfo {
             pid: 99999,
             parent_pid: Some(1),
@@ -1108,9 +1111,10 @@ mod tests {
 
     #[test]
     fn test_kill_by_pid_not_descendant() {
-        // PID 1 は通常のセッションの子孫にはなり得ない
-        let engine = PolicyEngine::with_defaults();
-        let result = engine.kill_by_pid(1, Signal::SIGTERM, false);
+        // PID 1 は通常のセッションの子孫にはなり得ない。
+        // 保護が退行しても PID 1 へシグナルを送らないよう dry-run で検証する。
+        let engine = PolicyEngine::new(Config::default());
+        let result = engine.kill_by_pid(1, Signal::SIGTERM, true);
         assert!(result.is_err());
         // DeniedByDenylist（launchd/systemd が denylist に含まれる）または SuicidePrevention の可能性
         match result {
@@ -1123,7 +1127,7 @@ mod tests {
 
     #[test]
     fn test_can_kill_for_port_suicide_prevention_parent() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         if let Some(current) = engine.provider.get(current_pid)
             && let Some(parent_pid) = current.parent_pid
@@ -1187,7 +1191,7 @@ mod tests {
     #[test]
     fn test_list_killable_excludes_root_pid() {
         // 信頼ルート PID 自体は子孫扱いされず、kill 可能リストに含まれてはならない。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let root_pid = engine.root_pid();
         let killable = engine.list_killable();
         assert!(
@@ -1200,7 +1204,7 @@ mod tests {
     #[test]
     fn test_can_kill_root_pid_with_default_engine() {
         // デフォルト設定のエンジンでも、root PID 自体への kill は拒否される。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let root_pid = engine.root_pid();
 
         // root PID のプロセス情報が取得できる場合のみ検証（環境依存）
@@ -1218,7 +1222,7 @@ mod tests {
     fn test_kill_by_pid_i32_max_boundary() {
         // i32::MAX は有効な PID 範囲だが、対応するプロセスが存在しないため
         // InvalidPid ではなく ProcessNotFound が返るべき。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let result = engine.kill_by_pid(i32::MAX as u32, Signal::SIGTERM, true);
         assert!(
             matches!(result, Err(SafeKillError::ProcessNotFound(_))),
@@ -1377,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_verify_identity_before_kill_succeeds_for_current_process() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let process = engine
             .provider
@@ -1394,7 +1398,7 @@ mod tests {
 
     #[test]
     fn test_verify_identity_before_kill_fails_when_pid_disappeared() {
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         // 存在しない可能性が極めて高い PID を使った擬似 ProcessInfo
         let stale = ProcessInfo {
             pid: 999_999_999,
@@ -1415,7 +1419,7 @@ mod tests {
         // PID 再利用シミュレーション: 現在プロセスの PID で、start_time だけ
         // 改ざんした擬似スナップショットを渡す。OS から取得し直した start_time
         // とは一致しないため、ProcessNotFound として fail-closed されるべき。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let mut tampered = engine
             .provider
@@ -1434,7 +1438,7 @@ mod tests {
     fn test_verify_identity_before_kill_fails_on_name_mismatch() {
         // 同じ秒に PID 再利用された場合の補助検証として、名前が異なれば
         // 別プロセスと判定する。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let mut tampered = engine
             .provider
@@ -1494,7 +1498,7 @@ mod tests {
     fn test_verify_final_safety_rejects_current_parent() {
         // 最終安全検証は、自殺防止（親）と同一性検証の複合ガードとして機能する。
         // 現在の親プロセスを対象にすると SuicidePrevention で拒否される。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let parent_pid = ProcessInfoProvider::fetch_fresh(current_pid)
             .and_then(|p| p.parent_pid)
@@ -1675,7 +1679,7 @@ mod tests {
         // ancestry_check=Bypassed では、ancestry 経由の NotDescendant では拒否されない。
         // 順序: 自殺防止 → ancestry(skip) → 同一性 のため、ダミー PID は
         // 同一性検証段の ProcessNotFound で fail-closed される（NotDescendant ではない）。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let dummy = ProcessInfo {
             pid: 999_999_998,
             parent_pid: Some(1),
@@ -1694,7 +1698,7 @@ mod tests {
     #[test]
     fn test_verify_final_safety_bypassed_still_rejects_self_kill() {
         // ancestry_check=Bypassed でも自殺防止は引き続き適用される。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         if let Some(process) = engine.provider.get(current_pid) {
             let result =
@@ -1750,7 +1754,7 @@ mod tests {
     fn test_can_kill_rejects_pid_one_even_when_not_in_default_denylist() {
         // 既定 denylist に含まれない名前（コンテナ環境の PID 1 を想定）の
         // PID 1 でも拒否されることを検証する。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
 
         let process = ProcessInfo {
             pid: 1,
@@ -1773,7 +1777,7 @@ mod tests {
         // ポート kill は ancestry をバイパスする設計のため、PID 1 を明示的に
         // 拒否する経路がないと、PID 1 が許可ポートを listen しているケースで
         // コンテナ全体が落ちる。常に NotDescendant で拒否されるべき。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let permission = engine.can_kill_for_port(1, "custom_init");
         assert_eq!(
             permission,
@@ -1786,7 +1790,7 @@ mod tests {
     fn test_can_kill_for_port_rejects_pid_zero() {
         // PID 0 はプロセスグループ用の特殊値であり、通常の kill 対象にできない。
         // ポート kill の fail-closed として PID 1 と同じ扱いにする。
-        let engine = PolicyEngine::with_defaults();
+        let engine = PolicyEngine::new(Config::default());
         let permission = engine.can_kill_for_port(0, "anything");
         assert_eq!(permission, KillPermission::DeniedNotDescendant);
     }

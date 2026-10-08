@@ -7,7 +7,7 @@
 ```toml
 # Processes that bypass ancestry checks (use with caution)
 [allowlist]
-processes = ["my-trusted-app", "next-server"]
+processes = ["trusted-worker"]
 
 # Additional processes that can never be killed (takes precedence over allowlist)
 # Built-in system protections stay enabled even when you customize this list.
@@ -32,6 +32,17 @@ ports = ["1420", "3000-3010", "5173", "8080"]
 | `[allowed_ports]` | `ports` | Ports that `--port` may target, as single ports (`"8080"`) or ranges (`"3000-3010"`). Port `0` is rejected even inside a range; use `1-65535` for the full valid range |
 
 `--port` kills bypass the ancestry check for the configured ports, which is useful for orphaned dev servers started in another terminal. Suicide prevention, the denylist, and the protection of the trust root and PID 1 still apply.
+
+## Process Names
+
+`[allowlist]`, `[denylist]`, and `--name` compare against the process name the OS reports, not a package name or a command-line title:
+
+- **macOS**: the file name of the executable. A Next.js dev server is `node`, even though it sets its title to `next-server (v15…)`.
+- **Linux**: the kernel's `comm`, truncated to the first 15 bytes. A program can rename it (Node.js's `process.title` does), so the same server shows up as `next-server (v1`.
+
+For a process that `safe-kill --list` shows, copy its NAME column. On Linux you can also read the name with `ps -o comm= -p <PID>`.
+
+The allowlist and `--name` require an exact match. The allowlist bypasses the ancestry check for every process with that name, so avoid generic names such as `node`. On Linux, a denylist entry longer than 15 bytes also matches its first 15 bytes (`gnome-terminal-server` protects `gnome-terminal-`), so long names stay protected; any other process sharing those 15 bytes is protected too, which errs on the safe side.
 
 ## Default Denylist
 

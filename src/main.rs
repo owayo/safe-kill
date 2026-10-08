@@ -106,23 +106,14 @@ fn main() -> ExitCode {
         Ok(RunOutcome::ReportLost { stream, source }) => {
             // 操作は完了しているので終了コードは成功のまま（`OutputRole::Informational`
             // を参照）。警告すら書けない状況（stderr も失われている）でも結果は変えない。
-            let _ = writeln!(io::stderr(), "{}", report_lost_warning(stream, &source));
+            let _ = write_report_lost_warning(&mut io::stderr(), stream, &source);
             ExitCode::SUCCESS
         }
         Err(RunError::Domain(e)) => {
-            // エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
-            // OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
-            // ANSI escape を含む引数でプロセスを起動した場合に、エラー経路でも表示偽装や
-            // 端末状態改ざんが起きないよう、表示前に必ずサニタイズする。
-            //
             // 診断の書き込み失敗で終了コードを変えてはいけない。呼び出し側が分岐に使う
             // のは「なぜ失敗したか」であって「その説明が届いたか」ではないため、
             // ここでは書き込み結果を捨てて元の終了コードを維持する。
-            let _ = writeln!(
-                io::stderr(),
-                "safe-kill: {}",
-                sanitize_terminal(&e.to_string())
-            );
+            let _ = write_domain_error(&mut io::stderr(), &e);
             e.exit_code().into()
         }
         Err(RunError::Output { stream, source }) => {
@@ -130,22 +121,53 @@ fn main() -> ExitCode {
             // 失敗は `RunOutcome::ReportLost` になる。ここへ来るのは、成果物である表示
             // （`--list` / dry-run）がディスク満杯（ENOSPC）や I/O エラーで本当に
             // 失われた場合だけ。
-            let _ = writeln!(
-                io::stderr(),
-                "safe-kill: failed to write to {}: {}",
-                stream,
-                sanitize_terminal(&source.to_string())
-            );
+            let _ = write_output_failure(&mut io::stderr(), stream, &source);
             SafeKillExitCode::GeneralError.into()
         }
     }
 }
 
-/// 操作は完了したのに報告を書き出せなかったときの警告文（1 行、末尾の改行なし）
+// `main()` の診断 3 種は、書き込み先を引数に取る関数へ切り出してある。
+// `io::stderr()` へ直接書くと、テストは `sanitize_terminal` 単体しか検証できず、
+// 表示経路からサニタイズ呼び出しを外す退行（変異）を検出できないため。
+
+/// ドメインエラーの診断を 1 行書く
+///
+/// エラーメッセージには `NotDescendant(pid, name)` や `Denylisted(name)` のように
+/// OS から取得したプロセス名が含まれることがある。攻撃者が `\x1b[2J` 等の
+/// ANSI escape を含む引数でプロセスを起動した場合に、エラー経路でも表示偽装や
+/// 端末状態改ざんが起きないよう、表示前に必ずサニタイズする。
+fn write_domain_error(out: &mut impl Write, error: &SafeKillError) -> io::Result<()> {
+    writeln!(out, "safe-kill: {}", sanitize_terminal(&error.to_string()))
+}
+
+/// 成果物である表示（`--list` / dry-run）を書き出せなかった診断を 1 行書く
 ///
 /// I/O エラーの本文は OS 由来の文字列なので、他の診断と同じくサニタイズしてから出す。
-fn report_lost_warning(stream: OutputStream, source: &io::Error) -> String {
-    format!(
+fn write_output_failure(
+    out: &mut impl Write,
+    stream: OutputStream,
+    source: &io::Error,
+) -> io::Result<()> {
+    writeln!(
+        out,
+        "safe-kill: failed to write to {}: {}",
+        stream,
+        sanitize_terminal(&source.to_string())
+    )
+}
+
+/// 操作は完了したのに報告を書き出せなかったときの警告を 1 行書く
+///
+/// 終了コードが 0 のままである理由（操作は完了済み）と、失われた出力先を明示する。
+/// I/O エラーの本文は他の診断と同じくサニタイズしてから出す。
+fn write_report_lost_warning(
+    out: &mut impl Write,
+    stream: OutputStream,
+    source: &io::Error,
+) -> io::Result<()> {
+    writeln!(
+        out,
         "safe-kill: warning: operation completed, but failed to write to {}: {}",
         stream,
         sanitize_terminal(&source.to_string())
@@ -441,8 +463,17 @@ fn print_port_kill_result(port: u16, result: &BatchKillResult, dry_run: bool) ->
 
 /// 終了可能なプロセス一覧を表示する
 fn print_killable_list(processes: &[process_info::ProcessInfo]) -> io::Result<()> {
-    let mut out = io::stdout().lock();
+    write_killable_list(&mut io::stdout().lock(), processes)
+}
 
+/// 終了可能なプロセス一覧を任意の書き込み先へ出力する
+///
+/// 書き込み先を引数に取るのは、サニタイズと切り詰めの順序を実際の表示経路で
+/// テストするため（`write_kill_result` と同じ構成）。
+fn write_killable_list(
+    out: &mut impl Write,
+    processes: &[process_info::ProcessInfo],
+) -> io::Result<()> {
     if processes.is_empty() {
         return writeln!(out, "No killable processes found.");
     }
@@ -888,25 +919,47 @@ mod tests {
         }
     }
 
+    const ALL_ROLES: [OutputRole; 2] = [OutputRole::Informational, OutputRole::Required];
+
     #[test]
-    fn test_finish_output_broken_pipe_keeps_success() {
-        // 読み手がパイプを閉じただけで操作は完了している。
-        // ここを失敗にすると `safe-kill --list | head -1` が異常終了する。
-        let result = finish_output(
-            Ok(()),
-            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-            OutputStream::Stdout,
-        );
-        assert!(result.is_ok());
+    fn test_finish_output_success_is_completed_for_every_role() {
+        for role in ALL_ROLES {
+            let result = finish_output(Ok(()), Ok(()), OutputStream::Stdout, role);
+            assert!(
+                matches!(result, Ok(RunOutcome::Completed)),
+                "{role:?}: {result:?}"
+            );
+        }
     }
 
     #[test]
-    fn test_finish_output_reports_other_io_errors() {
-        // ディスク満杯などは出力が本当に失われているので隠さない。
+    fn test_finish_output_broken_pipe_keeps_success() {
+        // 読み手がパイプを閉じただけで操作は完了している。役割を問わず成功で、警告も出さない
+        // （ReportLost にしない）。ここを失敗にすると `safe-kill --list | head -1` が
+        // 異常終了し、`--name x | head -1` のような実 kill では余計な警告が出る。
+        for role in ALL_ROLES {
+            let result = finish_output(
+                Ok(()),
+                Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                OutputStream::Stdout,
+                role,
+            );
+            assert!(
+                matches!(result, Ok(RunOutcome::Completed)),
+                "{role:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finish_output_required_output_loss_is_failure() {
+        // `--list` や dry-run は表示そのものが成果物。ディスク満杯などで出力が
+        // 本当に失われたら、呼び出し側は何も受け取れていないので隠さない（255）。
         let result = finish_output(
             Ok(()),
             Err(io::Error::from(io::ErrorKind::StorageFull)),
             OutputStream::Stdout,
+            OutputRole::Required,
         );
         assert!(matches!(
             result,
@@ -918,30 +971,351 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_output_domain_error_takes_precedence() {
-        // 終了コードは「操作の結果」を表す契約なので、表示の失敗で塗り替えない。
+    fn test_finish_output_informational_output_loss_keeps_success() {
+        // 実際の kill は送信済みで取り消せない。結果行を書けなかっただけで失敗を返すと、
+        // 呼び出し側は kill に失敗したと誤解して再試行や SIGKILL へ進む。
+        // 成功のまま、報告が失われたことだけを ReportLost で伝える。
         let result = finish_output(
-            Err(SafeKillError::PermissionDenied(123)),
+            Ok(()),
             Err(io::Error::from(io::ErrorKind::StorageFull)),
             OutputStream::Stdout,
+            OutputRole::Informational,
+        );
+        match result {
+            Ok(RunOutcome::ReportLost { stream, source }) => {
+                assert_eq!(stream, OutputStream::Stdout);
+                assert_eq!(source.kind(), io::ErrorKind::StorageFull);
+            }
+            other => panic!("ReportLost になるべき: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_finish_output_informational_keeps_failing_stream() {
+        // `init` のスキップ表示は stderr へ書く。警告文に正しい出力先が載るよう、
+        // 失敗した stream を取り違えずに運ぶこと。
+        let result = finish_output(
+            Ok(()),
+            Err(io::Error::from(io::ErrorKind::FileTooLarge)),
+            OutputStream::Stderr,
+            OutputRole::Informational,
         );
         assert!(matches!(
             result,
-            Err(RunError::Domain(SafeKillError::PermissionDenied(123)))
+            Ok(RunOutcome::ReportLost {
+                stream: OutputStream::Stderr,
+                ..
+            })
         ));
     }
 
     #[test]
-    fn test_finish_output_domain_error_survives_broken_pipe() {
+    fn test_finish_output_informational_with_failing_writer() {
+        // 実際の表示関数が返すエラーをそのまま渡す経路で確かめる。
+        // `ulimit -f` 超過（EFBIG）で結果行を書けなかった実 kill を想定する。
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::FileTooLarge,
+        };
+        let printed = write_kill_result(&mut writer, "node", 42, true, "Sent SIGTERM");
         let result = finish_output(
-            Err(SafeKillError::NoProcessOnPort(3000)),
-            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
-            OutputStream::Stderr,
+            Ok(()),
+            printed,
+            OutputStream::Stdout,
+            OutputRole::for_kill(false),
         );
-        assert!(matches!(
-            result,
-            Err(RunError::Domain(SafeKillError::NoProcessOnPort(3000)))
-        ));
+        assert!(matches!(result, Ok(RunOutcome::ReportLost { .. })));
+    }
+
+    #[test]
+    fn test_finish_output_dry_run_with_failing_writer_is_failure() {
+        // dry-run は「何が kill されるか」の表示が成果物なので、書けなければ失敗。
+        let mut writer = FailingWriter {
+            kind: io::ErrorKind::FileTooLarge,
+        };
+        let printed = write_kill_result(&mut writer, "node", 42, true, "Would send SIGTERM");
+        let result = finish_output(
+            Ok(()),
+            printed,
+            OutputStream::Stdout,
+            OutputRole::for_kill(true),
+        );
+        assert!(matches!(result, Err(RunError::Output { .. })));
+    }
+
+    #[test]
+    fn test_finish_output_domain_error_takes_precedence() {
+        // 終了コードは「操作の結果」を表す契約なので、表示の失敗で塗り替えない。
+        // 役割が Informational でも、操作自体が失敗していれば成功にはしない。
+        for role in ALL_ROLES {
+            let result = finish_output(
+                Err(SafeKillError::PermissionDenied(123)),
+                Err(io::Error::from(io::ErrorKind::StorageFull)),
+                OutputStream::Stdout,
+                role,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(RunError::Domain(SafeKillError::PermissionDenied(123)))
+                ),
+                "{role:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_finish_output_domain_error_survives_broken_pipe() {
+        for role in ALL_ROLES {
+            let result = finish_output(
+                Err(SafeKillError::NoProcessOnPort(3000)),
+                Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+                OutputStream::Stderr,
+                role,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(RunError::Domain(SafeKillError::NoProcessOnPort(3000)))
+                ),
+                "{role:?}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_output_role_for_kill() {
+        // dry-run の表示は成果物、実際の kill の表示は送信後の報告。
+        assert_eq!(OutputRole::for_kill(true), OutputRole::Required);
+        assert_eq!(OutputRole::for_kill(false), OutputRole::Informational);
+    }
+
+    // =========================================================================
+    // 実際の表示関数を通したサニタイズの回帰テスト
+    //
+    // `sanitize_terminal` 単体のテストだけでは、表示経路からサニタイズ呼び出しを
+    // 外す退行を検出できない（変異テストで確認済み）。ここでは書き込み先に Vec<u8> を
+    // 渡して、表示関数が実際に書いたバイト列を検査する。
+    // =========================================================================
+
+    /// 表示関数の出力を `Vec<u8>` に受けて文字列として取り出す
+    fn capture(write: impl FnOnce(&mut Vec<u8>) -> io::Result<()>) -> String {
+        let mut buf = Vec::new();
+        write(&mut buf).expect("Vec<u8> への書き込みは失敗しない");
+        String::from_utf8(buf).expect("出力は UTF-8 のはず")
+    }
+
+    /// 生の制御文字・Unicode の行区切り・双方向制御が 1 つも残っていないこと
+    /// （行末の改行は表示関数自身が付けるものなので除いて検査する）
+    fn assert_no_raw_controls(output: &str) {
+        let raw: Vec<char> = output
+            .split('\n')
+            .flat_map(str::chars)
+            .filter(|&c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202E}'))
+            .collect();
+        assert!(
+            raw.is_empty(),
+            "生の制御文字 {raw:?} が残っている: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_write_domain_error_sanitizes_process_name() {
+        // `NotDescendant(pid, name)` は OS から取得したプロセス名をそのまま含む。
+        // 改行で偽の行を作ったり、ESC で画面を消したりできないこと。
+        let err = SafeKillError::NotDescendant(42, "evil\x1b[2J\nname".to_string());
+        let output = capture(|out| write_domain_error(out, &err));
+        assert_eq!(
+            output,
+            "safe-kill: Process 42 (evil\\x1B[2J\\nname) is not a descendant of the current session\n"
+        );
+        assert_eq!(output.lines().count(), 1, "{output:?}");
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_domain_error_escapes_cr_and_unicode_line_separator() {
+        let err = SafeKillError::Denylisted("rogue\r\u{2028}proc".to_string());
+        let output = capture(|out| write_domain_error(out, &err));
+        assert_eq!(
+            output,
+            "safe-kill: Process rogue\\r\\u{2028}proc is in denylist and cannot be killed\n"
+        );
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_output_failure_sanitizes_error_text() {
+        // I/O エラーの本文は外部由来になり得るので、制御文字はエスケープして出す。
+        let output = capture(|out| {
+            write_output_failure(
+                out,
+                OutputStream::Stdout,
+                &io::Error::other("disk\x1b[2J\nerror: forged"),
+            )
+        });
+        assert_eq!(
+            output,
+            "safe-kill: failed to write to stdout: disk\\x1B[2J\\nerror: forged\n"
+        );
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_report_lost_warning_format() {
+        // 警告は他の診断と同じ `safe-kill: ` 接頭辞の 1 行で、操作が完了したこと
+        // （＝終了コードが 0 である理由）と、失われた出力先を明示する。
+        let output = capture(|out| {
+            write_report_lost_warning(
+                out,
+                OutputStream::Stdout,
+                &io::Error::from(io::ErrorKind::FileTooLarge),
+            )
+        });
+        assert!(
+            output.starts_with(
+                "safe-kill: warning: operation completed, but failed to write to stdout: "
+            ),
+            "{output}"
+        );
+        assert_eq!(output.lines().count(), 1, "{output:?}");
+    }
+
+    #[test]
+    fn test_write_report_lost_warning_sanitizes_error_text() {
+        let output = capture(|out| {
+            write_report_lost_warning(
+                out,
+                OutputStream::Stderr,
+                &io::Error::other("disk\x1b[2J\nerror: forged"),
+            )
+        });
+        assert_eq!(
+            output,
+            "safe-kill: warning: operation completed, but failed to write to stderr: \
+             disk\\x1B[2J\\nerror: forged\n"
+        );
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_kill_result_sanitizes_name_and_message() {
+        // 失敗時の `message` は `SafeKillError::to_string()` で、プロセス名を含む。
+        // `name` 列と `message` 列のどちらからサニタイズを外しても検出できるよう、
+        // 両方に ESC・CR・LF・U+2028 を混ぜて、出力全体を完全一致で固定する。
+        let name = "evil\x1b[2J\r\nname\u{2028}x";
+        let result = KillResult::failure(42, name, &SafeKillError::NotDescendant(42, name.into()));
+        let output = capture(|out| {
+            write_kill_result(
+                out,
+                &result.name,
+                result.pid,
+                result.success,
+                &result.message,
+            )
+        });
+        assert_eq!(
+            output,
+            "✗ evil\\x1B[2J\\r\\nname\\u{2028}x (PID 42): \
+             Process 42 (evil\\x1B[2J\\r\\nname\\u{2028}x) is not a descendant of the current session\n"
+        );
+        assert_eq!(output.lines().count(), 1, "{output:?}");
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_kill_result_sanitizes_message_only_hostility() {
+        // 名前は無害でも、message 側だけに制御文字が入る経路（OS 由来のエラー本文など）
+        let output = capture(|out| {
+            write_kill_result(out, "node", 7, false, "boom\x1b]0;title\x07\nerror: forged")
+        });
+        assert_eq!(
+            output,
+            "✗ node (PID 7): boom\\x1B]0;title\\x07\\nerror: forged\n"
+        );
+        assert_no_raw_controls(&output);
+    }
+
+    #[test]
+    fn test_write_kill_result_success_line_unchanged() {
+        let output = capture(|out| write_kill_result(out, "evil\x1b[2J", 7, true, "Sent SIGTERM"));
+        assert_eq!(output, "✓ evil\\x1B[2J (PID 7): Sent SIGTERM\n");
+    }
+
+    /// 一覧表示用の `ProcessInfo` を組み立てる
+    fn listed_process(pid: u32, name: &str, cmd: &[&str]) -> process_info::ProcessInfo {
+        process_info::ProcessInfo {
+            pid,
+            parent_pid: Some(1),
+            name: name.to_string(),
+            cmd: cmd.iter().map(|s| s.to_string()).collect(),
+            start_time: 0,
+        }
+    }
+
+    #[test]
+    fn test_write_killable_list_empty_output_unchanged() {
+        let output = capture(|out| write_killable_list(out, &[]));
+        assert_eq!(output, "No killable processes found.\n");
+    }
+
+    #[test]
+    fn test_write_killable_list_header_and_rows_unchanged() {
+        // 列幅（PID 右寄せ 8、NAME 左寄せ 20）と区切り線の体裁を固定する
+        let processes = [
+            listed_process(4242, "node", &["node", "server.js"]),
+            listed_process(7, "sleep", &[]),
+        ];
+        let output = capture(|out| write_killable_list(out, &processes));
+        let expected = [
+            "Killable processes (2):".to_string(),
+            format!("     PID  NAME{}  COMMAND", " ".repeat(16)),
+            "-".repeat(60),
+            format!("    4242  node{}  node server.js", " ".repeat(16)),
+            format!("       7  sleep{}  ", " ".repeat(15)),
+        ]
+        .map(|line| line + "\n")
+        .concat();
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn test_write_killable_list_sanitizes_before_truncating() {
+        // サニタイズより先に切り詰めると、エスケープ表記への展開で列幅（30）を超え、
+        // 途中で切られた ESC シーケンスが端末に残る。名前と COMMAND の両方を
+        // 「サニタイズ → 切り詰め」の順で処理していることを、実際の出力で確かめる。
+        let processes = [listed_process(
+            4242,
+            "evil\x1b[2J\u{2028}name-that-is-long",
+            &[
+                "node",
+                "\x1b]52;c;ZXZpbA==\x07",
+                "--inspect\r\nerror: forged",
+            ],
+        )];
+        let output = capture(|out| write_killable_list(out, &processes));
+        assert_no_raw_controls(&output);
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(lines.len(), 4, "見出し 3 行 + 1 行のはず: {output:?}");
+        let row = lines[3];
+        // 名前はエスケープ表記へ展開してから 20 文字に、COMMAND は 30 文字に切り詰める
+        assert_eq!(
+            row,
+            "    4242  evil\\x1B[2J\\u{202...  node \\x1B]52;c;ZXZpbA==\\x07..."
+        );
+        // 出力はすべて ASCII なのでバイト位置で列を切り出せる
+        assert!(row.is_ascii(), "{row:?}");
+        assert_eq!(&row[..10], "    4242  ");
+        assert_eq!(row[10..30].chars().count(), 20, "NAME 列の幅: {row:?}");
+        assert_eq!(
+            &row[30..32],
+            "  ",
+            "NAME 列が幅を超えてはみ出している: {row:?}"
+        );
+        assert!(
+            row[32..].chars().count() <= 30,
+            "COMMAND 列が 30 文字を超えている: {row:?}"
+        );
     }
 
     #[test]

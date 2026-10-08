@@ -359,10 +359,11 @@ mod tests {
 
     #[test]
     fn test_kill_with_result_tracks_pid_and_name() {
+        // dry-run の扱いが退行しても実在のプロセスへ SIGKILL が届かないよう、存在し得ない PID を使う
         let killer = ProcessKiller::new();
-        let result = killer.kill_with_result(12345, "myprocess", Signal::SIGKILL, true);
+        let result = killer.kill_with_result(999999999, "myprocess", Signal::SIGKILL, true);
 
-        assert_eq!(result.pid, 12345);
+        assert_eq!(result.pid, 999999999);
         assert_eq!(result.name, "myprocess");
     }
 

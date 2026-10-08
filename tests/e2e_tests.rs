@@ -1,14 +1,134 @@
 //! safe-kill CLI の E2E テスト
 //!
 //! 実バイナリを起動し、出力と終了コードを検証する。
-#![allow(deprecated)] // `cargo_bin` は非推奨だが現状のテストでは実用上問題ない
+//!
+//! バイナリは必ず `safe_kill()` / `safe_kill_std()` から起動する。開発者の実 HOME や
+//! 環境変数を引き継ぐと、手元の設定次第で結果が変わるうえ、退行時に無関係なプロセスへ
+//! 本物のシグナルが届きうる（実設定の `allowed_ports` が `--port` を許可してしまう等）。
+//!
+//! PID を引数に取るテストは、存在し得ない `999999999` を使う。`12345` のような実在し得る
+//! PID だと、引数検証や dry-run の扱いが退行して kill まで進んだときに、たまたまその PID を
+//! 持つ無関係なプロセスへシグナルが届く。
 
 use assert_cmd::Command;
 use predicates::prelude::*;
 use safe_kill::process_info::ProcessInfoProvider;
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tempfile::NamedTempFile;
+
+/// 信頼ルートを上書きする環境変数（`src/ancestry.rs` が読む名前と同じ）
+const ROOT_PID_ENV: &str = "SAFE_KILL_ROOT_PID";
+
+/// 設定ファイルを置かない HOME（全テストで共有する空ディレクトリ）
+///
+/// `/tmp` に残骸を作らないよう、Cargo が統合テストに用意する `CARGO_TARGET_TMPDIR`
+/// （`target/tmp`）の下に置く。共有するので、どれか 1 つのテストが（退行などで）ここへ
+/// 設定を書くと、以後この HOME を使う全テストの前提が黙って変わる。書き込みを拒む権限に
+/// しておき、それでも中身があれば（root 実行時や過去の実行の残骸）その場で失敗させる。
+fn empty_home() -> &'static Path {
+    static EMPTY_HOME: OnceLock<PathBuf> = OnceLock::new();
+    EMPTY_HOME.get_or_init(|| {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("e2e-empty-home");
+        std::fs::create_dir_all(&home).expect("空の HOME を作成できるべき");
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o555))
+            .expect("空の HOME を書き込み不可にできるべき");
+        let first_entry = std::fs::read_dir(&home)
+            .expect("空の HOME を読めるべき")
+            .next();
+        assert!(
+            first_entry.is_none(),
+            "空であるべき HOME に中身がある: {} ({first_entry:?})",
+            home.display()
+        );
+        home
+    })
+}
+
+/// 開発者の環境に結果を左右されない safe-kill の起動コマンド（`std::process::Command` 版）
+///
+/// - `HOME`: 空ディレクトリにして、実 HOME の `~/.config/safe-kill/config.toml` を読ませない。
+///   実設定の denylist に `sleep` があれば子プロセスを使うテストが失敗し、`allowed_ports`
+///   があれば `--port` が本当に許可されて、手元の開発サーバーを止めうる。
+/// - `SAFE_KILL_ROOT_PID`: 削除する。無関係な値を継承すると ancestry 判定が変わり、
+///   自分の子が「子孫ではない」と拒否される。
+/// - `CLICOLOR_FORCE`: 削除する。パイプ出力にも色付けが入り、`Usage: safe-kill` のような
+///   文字列一致が ANSI シーケンスで分断される。
+///
+/// HOME や `SAFE_KILL_ROOT_PID` を与えたいテストは、後から `.env(...)` すれば上書きされる。
+fn safe_kill_std() -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("safe-kill"));
+    cmd.env("HOME", empty_home())
+        .env_remove(ROOT_PID_ENV)
+        .env_remove("CLICOLOR_FORCE");
+    cmd
+}
+
+/// `safe_kill_std()` を assert_cmd の `Command` で包んだもの
+fn safe_kill() -> Command {
+    Command::from_std(safe_kill_std())
+}
+
+/// 指定内容の `config.toml` を置いた一時 HOME を作る
+fn home_with_config(content: &str) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("一時 HOME を作成できるべき");
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    std::fs::create_dir_all(&config_dir).expect("設定ディレクトリを作成できるべき");
+    std::fs::write(config_dir.join("config.toml"), content).expect("設定を書き込めるべき");
+    temp
+}
+
+static UNIQUE_SLEEP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// 一意な名前の `sleep` 子プロセスを起動する
+///
+/// `tests/integration_tests.rs` の `spawn_unique_sleep` と同じ方式。`exec -a` は argv[0] を
+/// 変えるだけでプロセス名（comm）は `sleep` のままなので、`--name` の検索には掛からない。
+/// comm は exec したパスの basename になるため、一意な名前の symlink 経由で起動する
+/// （macOS のシステムバイナリは別パスへコピーすると即時終了する環境があるので、コピーはしない）。
+/// Linux の comm は 15 バイトで切り詰められるので、名前は 14 バイトに収める。
+/// テストランナーの PID を含めて、並行する別の `cargo test` とも衝突させない。
+///
+/// 戻り値は（symlink を置いた一時ディレクトリ, 子プロセス, プロセス名）。
+fn spawn_unique_sleep() -> (tempfile::TempDir, std::process::Child, String) {
+    let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
+    let sequence = UNIQUE_SLEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!("se{:08x}{:04x}", std::process::id(), sequence & 0xffff);
+    let executable = temp.path().join(&name);
+    std::os::unix::fs::symlink("/bin/sleep", &executable)
+        .expect("/bin/sleep への symlink を作成できるべき");
+
+    let mut child = std::process::Command::new(&executable)
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("一意名の sleep プロセスを起動できるべき");
+
+    // 起動直後でもプロセス一覧に名前が載っていることを確かめてから返す
+    // （載る前に safe-kill を走らせると「見つからない」で偶発的に失敗する）。
+    let pid = child.id();
+    for _ in 0..40 {
+        if ProcessInfoProvider::new()
+            .find_by_name(&name)
+            .iter()
+            .any(|process| process.pid == pid)
+        {
+            return (temp, child, name);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // 回収前の自分の子なので、PID が再利用されている心配なく止められる
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("一意名の sleep プロセス {name} (PID {pid}) がプロセス一覧に現れない");
+}
 
 // =============================================================================
 // --list オプションの出力確認テスト
@@ -62,7 +182,7 @@ fn test_init_cannot_be_combined_with_list() {
 #[test]
 fn test_init_cannot_be_combined_with_pid() {
     let mut cmd = safe_kill();
-    cmd.arg("1234")
+    cmd.arg("999999999")
         .arg("init")
         .assert()
         .failure()
@@ -155,7 +275,7 @@ fn test_signal_option_invalid_number() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("999")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid signal"));
@@ -182,7 +302,7 @@ fn test_exit_code_invalid_signal() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("INVALID")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .code(255); // GeneralError exit code (InvalidSignal maps to this)
 }
@@ -213,9 +333,10 @@ fn test_clap_usage_error_escapes_carriage_return_in_argument() {
     // （`invalid value '<値>' for '[PID]'`）。clap 側に制御文字の除去は無く、
     // `Error::print()` は生バイトをそのまま書き出す。
     //
-    // ANSI CSI / OSC は `Error::render()` の Display（anstream の strip）が落とすが、
-    // CR は ANSI シーケンスではないので落ちない。サニタイズを外すと、CR による
-    // 行頭復帰で「偽の成功行」を元の行の上に描画できてしまう。
+    // safe-kill は色付けを無効にした `Command` で描画し直した生の文面（`render().ansi()`）を
+    // `sanitize_terminal` に通す。CR も ANSI CSI / OSC や BEL と同じく、削除されずに
+    // エスケープ表記（`\r`）で開示される。サニタイズを外すと、CR による行頭復帰で
+    // 「偽の成功行」を元の行の上に描画できてしまう。
     let output = safe_kill()
         .arg("fake\rerror: killed successfully")
         .output()
@@ -227,8 +348,10 @@ fn test_clap_usage_error_escapes_carriage_return_in_argument() {
         "生の CR が stderr へ出ている: {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // `\r` を含むかだけでは、CR の前後が欠けたり別の文字に化けたりする退行を見逃す。
+    // 引数の全体が、CR の位置にエスケープ表記を挟んだ形で開示されていることまで確かめる。
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("\\r"),
+        String::from_utf8_lossy(&output.stderr).contains(r"'fake\rerror: killed successfully'"),
         "CR がエスケープ表記で開示されていない: {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
@@ -284,25 +407,182 @@ fn test_clap_usage_error_cannot_forge_extra_lines() {
     );
 }
 
+/// 使用方法エラーになる起動を実行し、終了コードが 255 であることを確かめて stderr を返す
+///
+/// 生バイトの混入を検査できるよう、文字列へ変換せずにバイト列のまま返す。
+fn usage_error_stderr(cmd: &mut std::process::Command) -> Vec<u8> {
+    let output = cmd.output().expect("safe-kill の起動に失敗");
+    assert_eq!(
+        output.status.code(),
+        Some(255),
+        "使用方法エラーは終了コード 255 になるべき: stderr={:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stderr
+}
+
+#[test]
+fn test_clap_usage_error_escapes_bel_and_backspace_instead_of_deleting() {
+    // BEL / BS は ANSI シーケンスではない C0 制御文字。以前は clap の描画結果を anstream の
+    // strip に通しており、これらを黙って削除していた。削除でも端末は守れるが、変換が非単射に
+    // なる。`x\a\by` と `xy` の診断がバイト単位で一致し、引数に制御文字が紛れていたことを
+    // 読み手が診断から判別できない。削除せずエスケープ表記で開示することを固定する。
+    let stderr = usage_error_stderr(safe_kill_std().arg("x\u{7}\u{8}y"));
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        concat!(
+            r"safe-kill: error: invalid value 'x\x07\x08y' for '[PID]': invalid digit found in string\n\nFor more information, try '--help'.",
+            "\n"
+        )
+    );
+
+    let without_controls = usage_error_stderr(safe_kill_std().arg("xy"));
+    assert_ne!(
+        stderr, without_controls,
+        "制御文字を含む引数と含まない引数の診断が区別できない"
+    );
+}
+
+#[test]
+fn test_clap_usage_error_escapes_csi_instead_of_deleting() {
+    // CSI（`ESC [ 2 J` は画面消去）も削除せずエスケープ表記で開示する。strip で削除していた
+    // 頃は `\e[2Jx` の診断が `x` と完全に一致し、画面消去を仕込んだ引数だったことが
+    // 読み手に伝わらなかった。
+    let stderr = usage_error_stderr(safe_kill_std().arg("\u{1b}[2Jx"));
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(
+        text.contains(r"'\x1B[2Jx'"),
+        "ESC がエスケープ表記で開示されていない: {text:?}"
+    );
+    assert!(
+        !stderr.contains(&0x1b),
+        "生の ESC が stderr へ出ている: {text:?}"
+    );
+
+    let without_csi = usage_error_stderr(safe_kill_std().arg("x"));
+    assert_ne!(
+        stderr, without_csi,
+        "ESC シーケンスごと消えて `x` と同じ診断になっている"
+    );
+}
+
+#[test]
+fn test_clap_usage_error_is_plain_single_line_even_when_color_is_forced() {
+    // `CLICOLOR_FORCE=1` では anstream がパイプにも ANSI を出す（端末直結と同じ条件）。
+    // 使用方法エラーは色付けを無効にした `Command` で描画し直してからサニタイズするので、
+    // この条件でも clap 自身の装飾（`error:` の太字赤など）は出ない。装飾が混ざると、
+    // サニタイズ後に `\x1B[1m` のような表記として本文に残り、利用者の引数由来の ESC と
+    // 見分けられなくなる。clap のレイアウト改行（tip / Usage の段落）は `\n` 表記で 1 行に畳まれる。
+    let stderr = usage_error_stderr(safe_kill_std().env("CLICOLOR_FORCE", "1").arg("--bogus"));
+    let text = String::from_utf8_lossy(&stderr);
+    assert_eq!(
+        text,
+        concat!(
+            r"safe-kill: error: unexpected argument '--bogus' found\n\n  tip: to pass '--bogus' as a value, use '-- --bogus'\n\nUsage: safe-kill [OPTIONS] [PID]\n       safe-kill <COMMAND>\n\nFor more information, try '--help'.",
+            "\n"
+        )
+    );
+    assert!(
+        !text.contains(r"\x1B"),
+        "clap 自身の色付けがエスケープ表記で混入している: {text:?}"
+    );
+    assert!(
+        !stderr.contains(&0x1b),
+        "生の ESC が stderr へ出ている: {text:?}"
+    );
+}
+
+#[test]
+fn test_clap_usage_error_in_init_subcommand_escapes_control_characters() {
+    // サブコマンドのエラーはサブコマンド側の `Command` で描画される（Usage 行が
+    // `safe-kill init`）。色付けの無効化やサニタイズがトップレベルにしか効いていないと、
+    // この経路から生の ESC / BEL が端末へ漏れる。
+    let stderr = usage_error_stderr(safe_kill_std().arg("init").arg("--x\u{1b}[2J\u{7}"));
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        concat!(
+            r"safe-kill: error: unexpected argument '--x\x1B[2J\x07' found\n\nUsage: safe-kill init [OPTIONS]\n\nFor more information, try '--help'.",
+            "\n"
+        )
+    );
+}
+
+#[test]
+fn test_clap_usage_error_escapes_unicode_line_separator() {
+    // U+2028（LINE SEPARATOR）は C0 / C1 制御文字ではないが、表示系によっては改行として
+    // 描画される。生のまま出すと、LF をエスケープしていても `error: forged` を独立した行に
+    // 見せかけられる。エスケープ表記で開示し、診断を末尾の改行 1 つだけの 1 行に保つ。
+    let stderr = usage_error_stderr(safe_kill_std().arg("x\u{2028}error: forged"));
+    let text = String::from_utf8_lossy(&stderr);
+    assert!(
+        text.contains(r"x\u{2028}error: forged"),
+        "U+2028 がエスケープ表記で開示されていない: {text:?}"
+    );
+    assert!(
+        !stderr.windows(3).any(|bytes| bytes == [0xe2, 0x80, 0xa8]),
+        "生の U+2028 が stderr へ出ている: {text:?}"
+    );
+    assert_eq!(
+        stderr.iter().filter(|&&byte| byte == b'\n').count(),
+        1,
+        "診断が 1 行になっていない: {text:?}"
+    );
+    assert!(stderr.ends_with(b"\n"), "改行が行末以外にある: {text:?}");
+}
+
+#[test]
+fn test_clap_usage_error_with_invalid_utf8_argument_emits_no_raw_bytes() {
+    // UTF-8 として不正な引数は、clap が値を表示せずに拒否する。そのときも生バイト（0xFF や
+    // ESC）を診断へ流さず、panic もせずに、他の使用方法エラーと同じ固定接頭辞の 1 行と 255 で終わる。
+    use std::os::unix::ffi::OsStringExt;
+
+    let argument = std::ffi::OsString::from_vec(vec![b'x', 0xff, 0x1b, b'y']);
+    let stderr = usage_error_stderr(safe_kill_std().arg(&argument));
+    let text = String::from_utf8_lossy(&stderr);
+    assert_eq!(
+        text,
+        concat!(
+            r"safe-kill: error: invalid UTF-8 was detected in one or more arguments\n\nUsage: safe-kill [OPTIONS] [PID]\n       safe-kill <COMMAND>\n\nFor more information, try '--help'.",
+            "\n"
+        )
+    );
+    assert!(
+        !stderr.contains(&0x1b) && !stderr.contains(&0xff),
+        "引数の生バイトが stderr へ出ている: {stderr:?}"
+    );
+}
+
 #[test]
 fn test_help_does_not_leak_control_characters_from_argv0() {
     // clap は `bin_name` 未設定だと Usage 行へ `argv[0]` の basename を使う。
     // `name = "safe-kill"` では塞げず、制御文字入りの名前で起動されると
     // （symlink 経由や `exec -a`）Usage 行の上書き偽装が成立する。
     // help は静的だから安全、という前提が崩れる経路なのでここで固定する。
-    let bin = assert_cmd::cargo::cargo_bin("safe-kill");
+    //
+    // argv[0] は `sh -c 'exec -a ...'` ではなく `CommandExt::arg0` で差し替える。
+    // Ubuntu の /bin/sh（dash）には `exec -a` が無く、シェルが exit 127・stdout 空で終わる
+    // ため、以下の「含まないこと」の検査が何も起動しないまま素通りしていた。
+    // 起動の成功と Usage 行の存在も確かめて、検査対象の help が本当に出たことを保証する。
+    use std::os::unix::process::CommandExt;
+
     for args in [vec!["--help"], vec!["init", "--help"], vec!["help", "init"]] {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!(
-                "exec -a \"$(printf 'fake\\rFORGED')\" '{}' {}",
-                bin.display(),
-                args.join(" ")
-            ))
+        let output = safe_kill_std()
+            .arg0("fake\rFORGED")
+            .args(&args)
             .output()
             .expect("safe-kill の起動に失敗");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "help が成功していない ({args:?}): {:?}, stderr: {:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("Usage: safe-kill"),
+            "help の Usage 行が bin_name になっていない ({args:?}): {stdout:?}"
+        );
         assert!(
             !output.stdout.contains(&b'\r'),
             "argv[0] の生 CR が help へ漏れている ({args:?}): {stdout:?}"
@@ -329,18 +609,26 @@ fn test_exit_code_help_and_version_stay_success() {
 
 #[test]
 fn test_exit_code_suicide_prevention() {
+    // 対象はこのテストプロセス（safe-kill の親）。自殺防止は dry-run の分岐より前に
+    // 判定されるので、dry-run でも終了コードは変わらない。dry-run にしておけば、
+    // 自殺防止が退行してもテストランナー自身へ SIGTERM が届かず、失敗として報告される。
     let current_pid = std::process::id();
     let mut cmd = safe_kill();
-    cmd.arg(current_pid.to_string()).assert().code(255); // GeneralError (SuicidePrevention)
+    cmd.arg(current_pid.to_string())
+        .arg("--dry-run")
+        .assert()
+        .code(255); // GeneralError (SuicidePrevention)
 }
 
 #[test]
 fn test_exit_code_no_target() {
+    // 名前一致が 0 件（ProcessNameNotFound）は「対象プロセスなし」の終了コード 1。
+    // 対象そのものを指定していない使い方の誤り（引数なし）とは別のコードであることに注意。
     let mut cmd = safe_kill();
     cmd.arg("--name")
         .arg("__nonexistent_process_xyz__")
         .assert()
-        .code(1); // NoTarget exit code
+        .code(1); // SafeKillExitCode::NoTarget (ProcessNameNotFound)
 }
 
 #[test]
@@ -372,10 +660,14 @@ fn test_name_all_denied_reports_no_killable_target() {
     )
     .unwrap();
 
+    // 名前一致には PID 1 以外の同名プロセス（Linux の `systemd --user` 等）も含まれる。
+    // denylist の拒否は dry-run でも同じく判定されるので、退行時にそれらへ本物の
+    // シグナルが届かないよう dry-run で確かめる。
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--name")
         .arg(&pid1_name)
+        .arg("--dry-run")
         .assert()
         .code(1)
         .stderr(predicate::str::contains(
@@ -389,10 +681,63 @@ fn test_name_all_denied_reports_no_killable_target() {
 
 #[test]
 fn test_no_arguments_shows_error() {
+    // 対象の指定漏れは使用方法の誤りなので 255。`.failure()` だけでは、1（対象プロセスなし）へ
+    // 戻る退行を見逃す（以前は実際に 1 を返していた）。
     let mut cmd = safe_kill();
     cmd.assert()
-        .failure()
+        .code(255)
         .stderr(predicate::str::contains("No target").or(predicate::str::contains("--help")));
+}
+
+#[test]
+fn test_missing_target_is_usage_error_with_fixed_message() {
+    // 「CLI の使用方法エラーはすべて 255」という契約に、対象（PID / --name / --port / --list）の
+    // 指定漏れも含める。1（対象プロセスなし）を返すと、空の `$PID` をクォートせずに展開した
+    // `safe-kill $PID` を、呼び出し側が「対象は既に終了済み」と誤読して先へ進む。
+    // `--dry-run` や `--signal` を付けても対象が無いことは変わらないので、診断も終了コードも同じになる。
+    let cases: [&[&str]; 4] = [
+        &[],
+        &["--dry-run"],
+        &["-s", "9"],
+        &["--signal", "SIGKILL", "--dry-run"],
+    ];
+    for args in cases {
+        let output = safe_kill_std()
+            .args(args)
+            .output()
+            .expect("safe-kill の起動に失敗");
+        assert_eq!(
+            output.status.code(),
+            Some(255),
+            "{args:?}: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "safe-kill: No target specified. Use --help for usage.\n",
+            "{args:?}"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "{args:?}: 対象未指定なのに stdout へ出力がある: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}
+
+#[test]
+fn test_empty_pid_argument_is_usage_error() {
+    // クォートした空の `"$PID"` は、空文字列の PID 引数として届く。clap が値の形式エラーとして
+    // 拒否するので、対象未指定と同じく使用方法エラーの 255 になる
+    // （1 = 対象プロセスなし、2 = 権限不足 のどちらとも区別できる）。
+    let stderr = usage_error_stderr(safe_kill_std().arg(""));
+    assert_eq!(
+        String::from_utf8_lossy(&stderr),
+        concat!(
+            r"safe-kill: error: invalid value '' for '[PID]': cannot parse integer from empty string\n\nFor more information, try '--help'.",
+            "\n"
+        )
+    );
 }
 
 #[test]
@@ -403,6 +748,105 @@ fn test_help_option() {
             .and(predicate::str::contains("--list"))
             .and(predicate::str::contains("--signal"))
             .and(predicate::str::contains("--dry-run")),
+    );
+}
+
+/// 利用者が help を表示する各経路
+///
+/// 短い help（`-h`）、長い help（`--help` / `help`）、サブコマンドの help で、描画される文言が
+/// それぞれ違う（`help` / `long_help`、`about` / `long_about`）。どの経路にも混入が無いことを確かめる。
+const HELP_ENTRY_POINTS: [&[&str]; 6] = [
+    &["--help"],
+    &["-h"],
+    &["help"],
+    &["init", "--help"],
+    &["init", "-h"],
+    &["help", "init"],
+];
+
+#[test]
+fn test_help_is_ascii_english_on_every_entry_point() {
+    // clap derive は `///` の doc comment を help 文として取り込む。コメントを日本語化した際に、
+    // `--help` へ日本語が漏れたことがある。英語の文言は ASCII だけで書けるので、非 ASCII が
+    // 1 文字でもあれば混入とみなす。help は stdout へ出す成功扱いの出力なので、
+    // 終了コード 0・stderr 空も合わせて確かめる（使用方法エラーの経路へ落ちていないこと）。
+    for args in HELP_ENTRY_POINTS {
+        let output = safe_kill_std()
+            .args(args)
+            .output()
+            .expect("safe-kill の起動に失敗");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: stderr={:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.stdout.is_empty(), "{args:?} の help が空");
+        let non_ascii: String = stdout.chars().filter(|c| !c.is_ascii()).collect();
+        assert!(
+            output.stdout.is_ascii(),
+            "{args:?} の help に非 ASCII 文字が混入している ({non_ascii:?}):\n{stdout}"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "{args:?} の help で stderr へ出力がある: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_help_describes_every_option_in_english() {
+    // ASCII であることだけでは、文言が消えたり別の説明に置き換わったりする退行を検出できない。
+    // docs/cli-reference.md の説明と揃えた各オプションの文言を、実バイナリの `--help` で固定する。
+    let output = safe_kill_std()
+        .arg("--help")
+        .output()
+        .expect("safe-kill の起動に失敗");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "Target PID to kill",
+        "Kill processes whose name exactly matches NAME",
+        "Kill the TCP listener or UDP socket using PORT (must be listed in [allowed_ports])",
+        "Signal to send (name or number)",
+        "[default: SIGTERM]",
+        "List killable processes",
+        "Show what would be killed without sending signals",
+        "Create ~/.config/safe-kill/config.toml with a starter configuration",
+    ] {
+        assert!(
+            stdout.contains(expected),
+            "--help に {expected:?} が無い:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn test_init_help_describes_force_and_matches_help_init() {
+    // `help init` と `init --help` は、どちらもサブコマンド init の help を出す経路。
+    // 片方だけ文言や出力先が変わる退行を防ぐため、出力全体の一致まで確かめる。
+    let init_help = safe_kill_std()
+        .args(["init", "--help"])
+        .output()
+        .expect("safe-kill の起動に失敗");
+    let help_init = safe_kill_std()
+        .args(["help", "init"])
+        .output()
+        .expect("safe-kill の起動に失敗");
+    assert_eq!(init_help.status.code(), Some(0));
+    assert_eq!(help_init.status.code(), Some(0));
+
+    let init_help_text = String::from_utf8_lossy(&init_help.stdout);
+    assert!(
+        init_help_text.contains("Overwrite an existing config file without prompting"),
+        "init --help に --force の説明が無い:\n{init_help_text}"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&help_init.stdout),
+        init_help_text,
+        "`help init` と `init --help` の出力が食い違う"
     );
 }
 
@@ -418,7 +862,7 @@ fn test_version_option() {
 #[test]
 fn test_pid_and_name_mutually_exclusive() {
     let mut cmd = safe_kill();
-    cmd.arg("12345")
+    cmd.arg("999999999")
         .arg("--name")
         .arg("process_name")
         .assert()
@@ -428,7 +872,7 @@ fn test_pid_and_name_mutually_exclusive() {
 #[test]
 fn test_pid_and_list_mutually_exclusive() {
     let mut cmd = safe_kill();
-    cmd.arg("12345").arg("--list").assert().failure();
+    cmd.arg("999999999").arg("--list").assert().failure();
 }
 
 // =============================================================================
@@ -438,137 +882,115 @@ fn test_pid_and_list_mutually_exclusive() {
 #[test]
 fn test_kill_child_process_dry_run() {
     // 待機する子プロセスを起動する
-    let child = std::process::Command::new("sleep")
-        .arg("60")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if let Ok(child) = child {
-        let child_pid = child.id();
-
-        // dry-run では実際に終了せず成功する
-        let mut cmd = safe_kill();
-        let result = cmd.arg(child_pid.to_string()).arg("--dry-run").assert();
-
-        // dry-run 成功として表示される
-        result.success().stdout(predicate::str::contains("dry run"));
-
-        // プロセスが生き続けていることを確認する
-        let check = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(child_pid.to_string())
-            .status();
-
-        assert!(
-            check.is_ok() && check.unwrap().success(),
-            "Child process should still be running after dry-run"
-        );
-
-        // 後始末として実際に終了する
-        let _ = std::process::Command::new("kill")
-            .arg(child_pid.to_string())
-            .status();
-    }
-}
-
-#[test]
-fn test_kill_child_process_actually() {
-    // 待機する子プロセスを起動する
-    let child = std::process::Command::new("sleep")
-        .arg("60")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if let Ok(mut child) = child {
-        let child_pid = child.id();
-
-        // 実際に子プロセスを終了する
-        let mut cmd = safe_kill();
-        let result = cmd.arg(child_pid.to_string()).assert();
-
-        // 成功表示になる
-        result.success().stdout(predicate::str::contains("✓"));
-
-        // ゾンビ化を避けるため回収する
-        let _ = child.wait();
-
-        // OS 側の後始末待ち
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        // すでに終了済みであることを確認する
-        let check = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(child_pid.to_string())
-            .status();
-
-        // `kill -0` が失敗するか非 0 を返せば終了済み
-        let is_terminated = check.is_err() || !check.unwrap().success();
-        assert!(is_terminated, "Child process should be terminated");
-    }
-}
-
-#[test]
-fn test_kill_child_by_name_dry_run() {
-    // 一意な名前の子プロセスを起動する
-    let mut script = NamedTempFile::new().unwrap();
-    writeln!(script, "#!/bin/bash\nsleep 60").unwrap();
-
-    let script_path = script.path().to_str().unwrap();
-    let _ = std::process::Command::new("chmod")
-        .arg("+x")
-        .arg(script_path)
-        .status();
-
-    let child = std::process::Command::new("bash")
-        .arg("-c")
-        .arg("exec -a 'safe_kill_test_target' sleep 60")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-
-    if let Ok(_child) = child {
-        // 起動完了を少し待つ
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // 名前指定の dry-run を試す
-        let mut cmd = safe_kill();
-        let result = cmd
-            .arg("--name")
-            .arg("safe_kill_test_target")
-            .arg("--dry-run")
-            .assert();
-
-        // OS 実装差で見つからない場合があるため、少なくとも異常終了しないことだけ見る
-        result.try_success().ok();
-
-        // 後始末
-        let _ = std::process::Command::new("pkill")
-            .arg("-f")
-            .arg("safe_kill_test_target")
-            .status();
-    }
-}
-
-#[test]
-fn test_name_dry_run_summary_uses_would_kill() {
     let mut child = std::process::Command::new("sleep")
         .arg("60")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap();
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
 
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
+    // dry-run では実際に終了せず成功する
     let mut cmd = safe_kill();
-    cmd.arg("--name")
-        .arg("sleep")
+    let result = cmd.arg(child_pid.to_string()).arg("--dry-run").assert();
+
+    // dry-run 成功として表示される
+    result.success().stdout(predicate::str::contains("dry run"));
+
+    // 生存確認は外部の `kill -0` ではなく自分の子のハンドルで行う。回収前なので
+    // PID が別プロセスへ再利用されておらず、終了していれば終了状態が返る。
+    assert!(
+        child
+            .try_wait()
+            .expect("子プロセスの状態を確認できるべき")
+            .is_none(),
+        "Child process should still be running after dry-run"
+    );
+
+    // 後始末
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_kill_child_process_actually() {
+    // 待機する子プロセスを起動する
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("sleep プロセスの起動に失敗");
+    let child_pid = child.id();
+
+    // 実際に子プロセスを終了する
+    let mut cmd = safe_kill();
+    let result = cmd.arg(child_pid.to_string()).assert();
+
+    // 成功表示になる
+    result.success().stdout(predicate::str::contains("✓"));
+
+    // 終了の確認は回収した終了状態で行う。回収後の PID は別プロセスへ再利用され得るので、
+    // その PID へ `kill -0` を送って不在を確かめてはいけない（再利用されていれば誤判定し、
+    // シグナルを送る形の確認なら無関係なプロセスへ届く）。
+    let status = child.wait().expect("子プロセスの終了待ちに失敗");
+    assert_eq!(
+        status.signal(),
+        Some(nix::libc::SIGTERM),
+        "Child process should be terminated by SIGTERM: {status:?}"
+    );
+}
+
+#[test]
+fn test_kill_child_by_name_dry_run() {
+    // 以前は `bash -c "exec -a 'safe_kill_test_target' sleep 60"` で起動していたが、
+    // `exec -a` は argv[0] を変えるだけでプロセス名は `sleep` のまま。名前検索は常に
+    // 空振りし、それを `try_success().ok()` が握りつぶして何も検証していなかった
+    // （後始末の `pkill -f` は同じ文字列を含む無関係なプロセスまで止め得た）。
+    // 一意な名前の子を起動して、名前指定の dry-run が自分の子を対象に挙げ、
+    // かつ終了させないことを確かめる。
+    let (_temp, mut child, name) = spawn_unique_sleep();
+    let child_pid = child.id();
+
+    safe_kill()
+        .arg("--name")
+        .arg(&name)
         .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicate::str::contains("would kill"));
+        .stdout(predicate::str::contains("would kill"))
+        .stdout(predicate::str::contains(format!(
+            "(PID {child_pid}): Would send SIGTERM to process (dry run)"
+        )));
+
+    assert!(
+        child
+            .try_wait()
+            .expect("子プロセスの状態を確認できるべき")
+            .is_none(),
+        "dry-run なのに子プロセスが終了している"
+    );
+
+    // 回収前の自分の子なので、PID 再利用の心配なく止められる
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn test_name_dry_run_summary_uses_would_kill() {
+    // `--name sleep` だとシステム上の無関係な sleep も一致し件数が定まらないため、
+    // 一意な名前の子 1 件だけを対象にして、dry-run の要約行を件数まで確かめる。
+    let (_temp, mut child, name) = spawn_unique_sleep();
+
+    safe_kill()
+        .arg("--name")
+        .arg(&name)
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Matched 1 process(es), would kill 1:",
+        ));
 
     let _ = child.kill();
     let _ = child.wait();
@@ -580,11 +1002,15 @@ fn test_name_dry_run_summary_uses_would_kill() {
 
 #[test]
 fn test_denylist_prevents_kill() {
-    // launchd (macOS) または systemd (Linux) の kill を試みる - 拒否されるべき
+    // launchd (macOS) または systemd (Linux) の kill を試みる - 拒否されるべき。
+    // 拒否は dry-run の分岐より前に判定されるので、dry-run でも検証内容は変わらない。
+    // root 権限で走らせた場合（コンテナ等）に保護が退行していても、PID 1 へ本物の
+    // シグナルが届かないよう dry-run にする。
     #[cfg(target_os = "macos")]
     {
         let mut cmd = safe_kill();
         cmd.arg("1") // launchd PID
+            .arg("--dry-run")
             .assert()
             .failure()
             .stderr(
@@ -598,6 +1024,7 @@ fn test_denylist_prevents_kill() {
     {
         let mut cmd = safe_kill();
         cmd.arg("1") // systemd/init PID
+            .arg("--dry-run")
             .assert()
             .failure()
             .stderr(
@@ -653,10 +1080,14 @@ fn test_invalid_config_does_not_fall_back_for_port_kill() {
     )
     .unwrap();
 
+    // 設定エラーは kill より前に確定するので dry-run でも結果は同じ。設定の読み込みが
+    // 退行して 3000 番が許可されても、手元の開発サーバーへ本物のシグナルが届かないよう
+    // dry-run にする（--port は ancestry を確かめない）。
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--port")
         .arg("3000")
+        .arg("--dry-run")
         .assert()
         .code(3)
         .stderr(predicate::str::contains("Config parse error"));
@@ -778,37 +1209,57 @@ fn test_help_shows_port_option() {
         .stdout(predicate::str::contains("--port").and(predicate::str::contains("-p")));
 }
 
+// 待ち受けの無いはずのポートを使うテストは、すべて dry-run にする。--port は ancestry を
+// 確かめないため、たまたま同じ番号を使う無関係なプロセス（同番号の UDP ソケット等）が
+// あると、それに本物のシグナルが届く。NoProcessOnPort は対象検出の段階で決まるので、
+// dry-run でも検証内容は変わらない。
+//
+// また、ポートが許可されていなければ PortNotAllowed（終了コード 4）で止まり、
+// NoProcessOnPort（終了コード 1）の経路まで届かない。許可の有無を開発者の実設定に
+// 左右させないよう、許可したい場合は一時 HOME に設定を置く。
+
 #[test]
 fn test_port_no_process_on_port() {
     // プロセスが使用していないであろうポート番号を使用
+    let home = home_with_config("[allowed_ports]\nports = [\"59997\"]\n");
     let mut cmd = safe_kill();
-    cmd.arg("--port")
+    cmd.env("HOME", home.path())
+        .arg("--port")
         .arg("59997")
+        .arg("--dry-run")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59997")));
+        .code(1) // NoTarget (NoProcessOnPort)
+        .stderr(predicate::str::contains("No process found on port 59997"));
 }
 
 #[test]
 fn test_port_with_dry_run_no_process() {
+    // 以前は実設定のまま走らせ、「No process」か「59998」のどちらかを含めば通る判定だった。
+    // 許可されていない環境では PortNotAllowed の文面（ポート番号を含む）で素通りしており、
+    // 名前に反して NoProcessOnPort を検証していなかった。
+    let home = home_with_config("[allowed_ports]\nports = [\"59998\"]\n");
     let mut cmd = safe_kill();
-    cmd.arg("--port")
+    cmd.env("HOME", home.path())
+        .arg("--port")
         .arg("59998")
         .arg("--dry-run")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59998")));
+        .code(1) // NoTarget (NoProcessOnPort)
+        .stderr(predicate::str::contains("No process found on port 59998"));
 }
 
 #[test]
 fn test_port_short_option() {
-    // -p 短縮形のテスト
+    // -p 短縮形のテスト。--port と同じ経路（許可判定の先の対象検出）まで進むことを確かめる
+    let home = home_with_config("[allowed_ports]\nports = [\"59996\"]\n");
     let mut cmd = safe_kill();
-    cmd.arg("-p")
+    cmd.env("HOME", home.path())
+        .arg("-p")
         .arg("59996")
+        .arg("--dry-run")
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("No process").or(predicate::str::contains("59996")));
+        .code(1) // NoTarget (NoProcessOnPort)
+        .stderr(predicate::str::contains("No process found on port 59996"));
 }
 
 #[test]
@@ -816,7 +1267,7 @@ fn test_port_and_pid_mutually_exclusive() {
     let mut cmd = safe_kill();
     cmd.arg("--port")
         .arg("8080")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be combined"));
@@ -953,12 +1404,16 @@ fn test_init_creates_valid_toml() {
 
 #[test]
 fn test_exit_code_port_not_allowed_without_config() {
-    // 設定ファイルがない場合、ポートは許可されていないのでエラー
+    // 設定ファイルがない場合、ポートは許可されていないのでエラー。
+    // 許可判定は dry-run の分岐より前なので dry-run でも結果は同じ。`init` が生成する
+    // 推奨ポート（3000-3010 を含む）を既定で許可するような退行が起きても、手元で
+    // 3000 番を使う開発サーバーへ本物のシグナルが届かないよう dry-run にする。
     let temp = tempfile::tempdir().unwrap();
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--port")
         .arg("3000")
+        .arg("--dry-run")
         .assert()
         .code(4) // PortNotAllowed exit code
         .stderr(predicate::str::contains("not allowed"));
@@ -978,13 +1433,15 @@ fn test_exit_code_port_allowed_but_no_process() {
     )
     .unwrap();
 
+    // 待ち受けの無いはずのポートなので dry-run にする（理由は test_port_no_process_on_port の前の説明を参照）
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--port")
         .arg("59997")
+        .arg("--dry-run")
         .assert()
         .code(1) // NoTarget exit code (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process"));
+        .stderr(predicate::str::contains("No process found on port 59997"));
 }
 
 #[test]
@@ -1233,7 +1690,7 @@ fn test_signal_option_zero() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("0")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid signal"));
@@ -1245,7 +1702,7 @@ fn test_signal_option_negative() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("-1")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure();
 }
@@ -1256,7 +1713,7 @@ fn test_signal_option_sig_only() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("SIG")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid signal"));
@@ -1268,7 +1725,7 @@ fn test_signal_option_whitespace() {
     let mut cmd = safe_kill();
     cmd.arg("--signal")
         .arg("   ")
-        .arg("12345")
+        .arg("999999999")
         .assert()
         .failure();
 }
@@ -1313,10 +1770,17 @@ fn test_port_zero_rejected_even_when_configured() {
 
 #[test]
 fn test_port_boundary_max() {
-    // ポート65535は有効な最大値
+    // ポート 65535 は有効な最大値。引数の解析で弾かれる（255）のではなく許可判定まで進み、
+    // 許可設定が無いので PortNotAllowed（4）になることを確かめる。`safe_kill()` の HOME は
+    // 設定を置かない空ディレクトリなので、開発者の実設定がこのポートを許可していても
+    // 結果は変わらない。許可判定が退行しても本物のシグナルを送らないよう dry-run にする。
     let mut cmd = safe_kill();
-    // 許可設定されていない場合はPortNotAllowed
-    cmd.arg("--port").arg("65535").assert().failure();
+    cmd.arg("--port")
+        .arg("65535")
+        .arg("--dry-run")
+        .assert()
+        .code(4) // PortNotAllowed
+        .stderr(predicate::str::contains("Port 65535 is not allowed"));
 }
 
 // =============================================================================
@@ -1473,12 +1937,16 @@ fn test_init_uses_private_permissions_even_with_permissive_umask() {
 
     // 呼び出し元の umask が無防備でも、認可設定を他ユーザーが変更できる
     // ディレクトリ／ファイル権限で作成してはならない。
+    // umask を変えるためにシェル経由で起動するので `safe_kill()` は使えない。
+    // 同じく実環境の変数を引き継がないようにする。
     let mut cmd = Command::new("/bin/sh");
     cmd.arg("-c")
         .arg("umask 000; exec \"$1\" init --force")
         .arg("safe-kill-init-test")
         .arg(binary)
         .env("HOME", temp.path())
+        .env_remove(ROOT_PID_ENV)
+        .env_remove("CLICOLOR_FORCE")
         .assert()
         .success();
 
@@ -1557,14 +2025,16 @@ fn test_port_kill_with_config_allowed_port_range() {
     )
     .unwrap();
 
-    // 範囲内のポートでプロセスがなくても PortNotAllowed ではなく NoProcessOnPort が返る
+    // 範囲内のポートでプロセスがなくても PortNotAllowed ではなく NoProcessOnPort が返る。
+    // 待ち受けの無いはずのポートなので dry-run にする（理由は test_port_no_process_on_port の前の説明を参照）
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--port")
         .arg("59995")
+        .arg("--dry-run")
         .assert()
         .code(1) // NoTarget (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process"));
+        .stderr(predicate::str::contains("No process found on port 59995"));
 }
 
 #[test]
@@ -1581,11 +2051,13 @@ fn test_port_kill_outside_allowed_range() {
     )
     .unwrap();
 
-    // 範囲外のポートは PortNotAllowed エラー
+    // 範囲外のポートは PortNotAllowed エラー。範囲判定が退行して 4000 番が許可されても
+    // 本物のシグナルを送らないよう dry-run にする（許可判定は dry-run の分岐より前）。
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
         .arg("--port")
         .arg("4000")
+        .arg("--dry-run")
         .assert()
         .code(4) // PortNotAllowed exit code
         .stderr(predicate::str::contains("not allowed"));
@@ -1655,7 +2127,7 @@ fn test_init_twice_with_force() {
 #[test]
 fn test_pid_and_port_conflict() {
     let mut cmd = safe_kill();
-    cmd.arg("12345")
+    cmd.arg("999999999")
         .arg("--port")
         .arg("3000")
         .assert()
@@ -1666,7 +2138,7 @@ fn test_pid_and_port_conflict() {
 #[test]
 fn test_pid_and_name_conflict() {
     let mut cmd = safe_kill();
-    cmd.arg("12345")
+    cmd.arg("999999999")
         .arg("--name")
         .arg("node")
         .assert()
@@ -1677,7 +2149,7 @@ fn test_pid_and_name_conflict() {
 #[test]
 fn test_list_and_pid_conflict() {
     let mut cmd = safe_kill();
-    cmd.arg("12345")
+    cmd.arg("999999999")
         .arg("--list")
         .assert()
         .failure()
@@ -1827,9 +2299,10 @@ fn test_list_with_closed_stdout_exits_success() {
 
 #[test]
 fn test_no_target_with_closed_stderr_keeps_exit_code() {
-    // 診断が届かなくても「対象未指定」という結果自体は変わらない
+    // 診断が届かなくても「対象未指定」という結果自体は変わらない。
+    // 対象の指定漏れは使用方法の誤りなので、「対象プロセスなし」の 1 ではなく 255。
     let status = status_with_closed_output(&[], false, true);
-    assert_eq!(status.code(), Some(1));
+    assert_eq!(status.code(), Some(255));
 }
 
 #[test]
@@ -1864,11 +2337,14 @@ fn test_name_dry_run_with_closed_stdout_keeps_exit_code() {
 
 #[test]
 fn test_port_not_allowed_with_closed_stderr_keeps_exit_code() {
+    // 許可判定は dry-run の分岐より前に行われるので終了コードは変わらない。--port は
+    // ancestry を確かめないため、許可判定が退行したときに手元で 3000 番を使う開発サーバーへ
+    // 本物のシグナルが届かないよう dry-run にする。
     let temp = tempfile::tempdir().unwrap();
     let mut cmd = safe_kill_std();
     let status = cmd
         .env("HOME", temp.path())
-        .args(["--port", "3000"])
+        .args(["--port", "3000", "--dry-run"])
         .stdout(Stdio::null())
         .stderr(closed_pipe())
         .status()
@@ -1902,8 +2378,9 @@ fn test_both_streams_closed_does_not_panic() {
     let status = status_with_closed_output(&["--list"], true, true);
     assert_eq!(status.code(), Some(0));
 
+    // 対象の指定漏れは使用方法の誤り（255）
     let status = status_with_closed_output(&[], true, true);
-    assert_eq!(status.code(), Some(1));
+    assert_eq!(status.code(), Some(255));
 }
 
 #[test]
@@ -1911,23 +2388,38 @@ fn test_kill_succeeds_with_closed_stdout_and_process_is_terminated() {
     // kill はシグナル送信を終えてから結果を表示する。表示の失敗で終了コードが
     // 101 になると「実際は kill 済みなのに呼び出し側にはクラッシュに見える」ため、
     // 対象が本当に終了していることと合わせて成功（0）を保証する。
-    let child = std::process::Command::new("sleep")
-        .arg("60")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("sleep プロセスの起動に失敗");
-    let pid = child.id();
-    let pid_arg = pid.to_string();
+    //
+    // BrokenPipe は読み手が自分で出力を打ち切っただけ（`| head -1` 等）なので、EFBIG のような
+    // 本当の書き込み失敗と違って警告も出さない。ここで警告を出すと、パイプで先頭だけ読む
+    // 普通のシェル利用のたびに stderr が汚れる。警告を出す側の経路は
+    // `test_kill_by_pid_report_lost_on_write_error_keeps_success_with_warning` で確かめる。
+    let (_temp, mut child, _name) = spawn_unique_sleep();
+    let pid_arg = child.id().to_string();
 
-    let status = status_with_closed_output(&[&pid_arg], true, false);
-    assert_eq!(status.code(), Some(0));
+    let output = safe_kill_std()
+        .arg(&pid_arg)
+        .stdout(closed_pipe())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("safe-kill の起動に失敗");
+    // アサーションで止まっても子を残さないよう、検証より先に回収する
+    let exit = reap_killed_child(&mut child);
 
-    let mut child = child;
-    let exit = child.wait().expect("sleep の終了待ちに失敗");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        !exit.success(),
-        "シグナルで終了しているはずが正常終了している"
+        output.stderr.is_empty(),
+        "BrokenPipe は黙って成功にするはずが、stderr へ出力がある: {:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        exit.signal(),
+        Some(nix::libc::SIGTERM),
+        "SIGTERM で終了しているべき: {exit:?}"
     );
 }
 
@@ -1979,5 +2471,222 @@ fn test_init_prompt_with_closed_stderr_leaves_config_untouched() {
     assert_eq!(
         content, "# 既存の設定\n",
         "同意を得られていないのに既存設定が上書きされた"
+    );
+}
+
+// =============================================================================
+// stdout への書き込みが本当に失敗した場合の終了コード（BrokenPipe 以外）
+//
+// 終了コードは表示の役割で分かれる。
+// - 実際の kill: シグナルは送信済みで取り消せない。表示は済んだ操作の報告に過ぎないので、
+//   書けなくても 0 を返し、報告が失われたことだけを stderr の警告 1 行で伝える。
+//   失敗のコードを返すと、呼び出し側は kill に失敗したと誤解して再試行したり、
+//   SIGKILL などより強い手段へ進んだりする。
+// - `--list` と dry-run: 表示そのものが成果物。書けなければ呼び出し側は何も得ていないので
+//   255 にする。0 を返すと、空の一覧や確認できていない dry-run を「確認済み」と誤読させる。
+// =============================================================================
+
+/// stdout を「書き込むと EFBIG で失敗する通常ファイル」に向けて safe-kill を起動する
+///
+/// 戻り値は（safe-kill の実行結果, stdout の向け先に書かれたバイト数）。
+///
+/// 次の理由で `sh -c 'trap "" XFSZ; ulimit -f 0; exec ...'` を使う。
+/// - `ulimit -f 0`（RLIMIT_FSIZE = 0）にすると、通常ファイルを 1 バイトでも伸ばす書き込みが
+///   失敗する。既定ではその時点で SIGXFSZ によりプロセスごと終了するので、`trap "" XFSZ` で
+///   無視しておく。無視したシグナルは exec 後も無視のまま引き継がれ、safe-kill の write は
+///   EFBIG（BrokenPipe ではない I/O エラー）を返す。macOS と Linux のどちらでも同じ手順で
+///   再現できる（`/dev/full` は Linux にしか無い）。
+/// - `1</dev/null`（読み取り専用の fd）では再現できない。write は EBADF になるが、Rust の std は
+///   stdout の EBADF を「stdout が閉じている」とみなして書き込み成功として扱う。
+/// - stderr はパイプのままにする。RLIMIT_FSIZE はプロセスが書くすべての通常ファイルに効くので、
+///   stderr もファイルにすると、確かめたい警告まで書けずに消える（パイプには効かない）。
+///
+/// 環境変数は `safe_kill_std()` と同じ設定（空の HOME、`SAFE_KILL_ROOT_PID` と
+/// `CLICOLOR_FORCE` の削除）を sh 経由で引き継ぐ。sh は `exec` で safe-kill に置き換わるので、
+/// safe-kill の親はこのテストプロセスのままになる。信頼ルートの自動検出は通常のテストと同じで、
+/// このテストが起動した子は子孫として kill できる。
+fn output_with_unwritable_stdout(args: &[&str]) -> (std::process::Output, u64) {
+    let base = safe_kill_std();
+    let dir = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
+    let stdout_path = dir.path().join("stdout");
+
+    let mut cmd = std::process::Command::new("/bin/sh");
+    cmd.arg("-c")
+        .arg(r#"trap "" XFSZ; ulimit -f 0; exec "$0" "$@" >"$OUT""#)
+        .arg(base.get_program())
+        .args(args);
+    for (key, value) in base.get_envs() {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        };
+    }
+    let output = cmd
+        .env("OUT", &stdout_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("sh 経由で safe-kill を起動できるべき");
+    let written = std::fs::metadata(&stdout_path)
+        .expect("stdout の向け先のファイルが作られているべき")
+        .len();
+    (output, written)
+}
+
+/// kill されたはずの自分の子を回収し、終了状態を返す
+///
+/// シグナルが届いていなければ、`wait()` は sleep が終わるまで（最大 60 秒）戻らない。
+/// しばらく待っても終わらなければ自分で止めて回収し、SIGTERM 以外の終了としてテストを
+/// 失敗させる（回収前の自分の子なので、PID 再利用の心配なく止められる）。
+fn reap_killed_child(child: &mut std::process::Child) -> std::process::ExitStatus {
+    for _ in 0..100 {
+        if let Some(status) = child.try_wait().expect("子プロセスの状態を確認できるべき")
+        {
+            return status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    child.wait().expect("子プロセスの終了待ちに失敗")
+}
+
+/// 実 kill の報告を書けなかったときの警告が、stderr のちょうど 1 行であることを確かめる
+fn assert_single_report_lost_warning(stderr: &str) {
+    assert!(
+        stderr.starts_with(
+            "safe-kill: warning: operation completed, but failed to write to stdout: "
+        ),
+        "報告が失われた旨の警告になっていない: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "警告が 1 行になっていない: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with('\n'),
+        "警告が改行で終わっていない: {stderr:?}"
+    );
+}
+
+/// 成果物である表示を書けなかったときの診断が、stderr のちょうど 1 行であることを確かめる
+fn assert_single_output_failure(stderr: &str) {
+    assert!(
+        stderr.starts_with("safe-kill: failed to write to stdout: "),
+        "出力の失敗を報告する診断になっていない: {stderr:?}"
+    );
+    assert_eq!(
+        stderr.matches('\n').count(),
+        1,
+        "診断が 1 行になっていない: {stderr:?}"
+    );
+    assert!(
+        stderr.ends_with('\n'),
+        "診断が改行で終わっていない: {stderr:?}"
+    );
+}
+
+#[test]
+fn test_kill_by_pid_report_lost_on_write_error_keeps_success_with_warning() {
+    let (_temp, mut child, _name) = spawn_unique_sleep();
+    let pid_arg = child.id().to_string();
+
+    let (output, written) = output_with_unwritable_stdout(&[&pid_arg]);
+    // アサーションで止まっても子を残さないよう、検証より先に回収する
+    let exit = reap_killed_child(&mut child);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr:?}");
+    assert_single_report_lost_warning(&stderr);
+    assert_eq!(
+        written, 0,
+        "stdout の書き込みが失敗していない（再現の前提が崩れている）"
+    );
+    assert_eq!(
+        exit.signal(),
+        Some(nix::libc::SIGTERM),
+        "SIGTERM で終了しているべき: {exit:?}"
+    );
+}
+
+#[test]
+fn test_kill_by_name_report_lost_on_write_error_keeps_success_with_warning() {
+    // 名前指定の kill も、送信を終えてから結果を表示する点は PID 指定と同じ
+    let (_temp, mut child, name) = spawn_unique_sleep();
+
+    let (output, written) = output_with_unwritable_stdout(&["--name", &name]);
+    let exit = reap_killed_child(&mut child);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(0), "stderr: {stderr:?}");
+    assert_single_report_lost_warning(&stderr);
+    assert_eq!(
+        written, 0,
+        "stdout の書き込みが失敗していない（再現の前提が崩れている）"
+    );
+    assert_eq!(
+        exit.signal(),
+        Some(nix::libc::SIGTERM),
+        "SIGTERM で終了しているべき: {exit:?}"
+    );
+}
+
+#[test]
+fn test_dry_run_by_pid_output_failure_is_general_error() {
+    let (_temp, mut child, _name) = spawn_unique_sleep();
+    let pid_arg = child.id().to_string();
+
+    let (output, written) = output_with_unwritable_stdout(&["--dry-run", &pid_arg]);
+    // 生存の確認は回収前に行い、その後で自分の子として止めて回収する
+    let still_running = child
+        .try_wait()
+        .expect("子プロセスの状態を確認できるべき")
+        .is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(255), "stderr: {stderr:?}");
+    assert_single_output_failure(&stderr);
+    assert_eq!(
+        written, 0,
+        "stdout の書き込みが失敗していない（再現の前提が崩れている）"
+    );
+    assert!(still_running, "dry-run なのに子プロセスが終了している");
+}
+
+#[test]
+fn test_dry_run_by_name_output_failure_is_general_error() {
+    let (_temp, mut child, name) = spawn_unique_sleep();
+
+    let (output, written) = output_with_unwritable_stdout(&["--name", &name, "--dry-run"]);
+    let still_running = child
+        .try_wait()
+        .expect("子プロセスの状態を確認できるべき")
+        .is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(255), "stderr: {stderr:?}");
+    assert_single_output_failure(&stderr);
+    assert_eq!(
+        written, 0,
+        "stdout の書き込みが失敗していない（再現の前提が崩れている）"
+    );
+    assert!(still_running, "dry-run なのに子プロセスが終了している");
+}
+
+#[test]
+fn test_list_output_failure_is_general_error() {
+    let (output, written) = output_with_unwritable_stdout(&["--list"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(255), "stderr: {stderr:?}");
+    assert_single_output_failure(&stderr);
+    assert_eq!(
+        written, 0,
+        "stdout の書き込みが失敗していない（再現の前提が崩れている）"
     );
 }
