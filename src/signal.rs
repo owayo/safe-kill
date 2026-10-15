@@ -3,6 +3,7 @@
 //! nix クレートを使用した Unix シグナルの解析と送信機能を提供する。
 
 use crate::error::SafeKillError;
+use nix::errno::Errno;
 use nix::sys::signal::{self, Signal as NixSignal};
 use nix::unistd::Pid;
 
@@ -66,18 +67,30 @@ impl SignalSender {
     /// 文字列からシグナルを解析する（名前または番号）
     ///
     /// 受け付ける形式:
-    /// - シグナル名: "SIGTERM", "SIGKILL", "TERM", "KILL" など
+    /// - シグナル名: "SIGTERM", "SIGKILL", "TERM", "KILL" など（ASCII の大文字・小文字は区別しない）
     /// - シグナル番号: "15", "9" など
+    ///
+    /// 照合は ASCII だけで行う。以前の `str::to_uppercase` は Unicode の大文字化なので、
+    /// `ſ`（U+017F）が `S` に、`ı`（U+0131）が `I` になり、`ſigterm` や `sıgkıll` が
+    /// SIGTERM / SIGKILL として通っていた。前後の空白も ASCII の空白
+    /// （`char::is_ascii_whitespace`: SP / HT / LF / FF / CR）だけを除く。`str::trim` は
+    /// Unicode の White_Space（U+0085 / U+00A0 / U+2028 / U+3000 など）まで除くため、
+    /// 端末では見分けにくい文字を前置した値まで受理していた（VT も ASCII だが
+    /// `is_ascii_whitespace` に含まれないので除かない）。
+    ///
+    /// エラー（`InvalidSignal`）には入力をそのまま入れる。大文字化した値を入れると
+    /// `foo` が `FOO` と表示され、`ß` と `ss` がどちらも `SS` になって区別できない。
+    /// 制御文字は表示するときに `terminal.rs` のサニタイズがエスケープする。
     pub fn parse_signal(s: &str) -> Result<Signal, SafeKillError> {
-        let s = s.trim().to_uppercase();
+        let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
 
-        // まず番号として解析を試みる
-        if let Ok(num) = s.parse::<i32>() {
-            return Self::from_number(num);
-        }
-
-        // 名前として解析を試みる
-        Self::from_name(&s)
+        // まず番号として解析を試み、番号でなければ名前として解析する。
+        // `i32` の `FromStr` は先頭の符号と ASCII の数字だけを受け付ける。
+        let signal = match trimmed.parse::<i32>() {
+            Ok(num) => Self::from_number(num),
+            Err(_) => Self::from_name(trimmed),
+        };
+        signal.ok_or_else(|| SafeKillError::InvalidSignal(s.to_string()))
     }
 
     /// 番号からシグナルを解析する
@@ -86,58 +99,88 @@ impl SignalSender {
     /// 各 OS のネイティブな番号のみ受け付ける:
     /// - Linux: USR1=10, USR2=12
     /// - macOS: USR1=30, USR2=31
-    fn from_number(num: i32) -> Result<Signal, SafeKillError> {
+    fn from_number(num: i32) -> Option<Signal> {
         match num {
-            1 => Ok(Signal::SIGHUP),
-            2 => Ok(Signal::SIGINT),
-            3 => Ok(Signal::SIGQUIT),
-            9 => Ok(Signal::SIGKILL),
-            15 => Ok(Signal::SIGTERM),
+            1 => Some(Signal::SIGHUP),
+            2 => Some(Signal::SIGINT),
+            3 => Some(Signal::SIGQUIT),
+            9 => Some(Signal::SIGKILL),
+            15 => Some(Signal::SIGTERM),
             #[cfg(target_os = "linux")]
-            10 => Ok(Signal::SIGUSR1),
+            10 => Some(Signal::SIGUSR1),
             #[cfg(target_os = "linux")]
-            12 => Ok(Signal::SIGUSR2),
+            12 => Some(Signal::SIGUSR2),
             #[cfg(target_os = "macos")]
-            30 => Ok(Signal::SIGUSR1),
+            30 => Some(Signal::SIGUSR1),
             #[cfg(target_os = "macos")]
-            31 => Ok(Signal::SIGUSR2),
-            _ => Err(SafeKillError::InvalidSignal(num.to_string())),
+            31 => Some(Signal::SIGUSR2),
+            _ => None,
         }
     }
 
-    /// 名前からシグナルを解析する
-    fn from_name(s: &str) -> Result<Signal, SafeKillError> {
+    /// 名前からシグナルを解析する（ASCII の大文字・小文字は区別しない）
+    fn from_name(s: &str) -> Option<Signal> {
+        // ASCII の英字だけを大文字にする。非 ASCII の文字はそのまま残るので、
+        // どの名前とも一致しない。
+        let upper = s.to_ascii_uppercase();
         // SIG プレフィックスがあれば除去
-        let name = s.strip_prefix("SIG").unwrap_or(s);
+        let name = upper.strip_prefix("SIG").unwrap_or(&upper);
 
         match name {
-            "HUP" => Ok(Signal::SIGHUP),
-            "INT" => Ok(Signal::SIGINT),
-            "QUIT" => Ok(Signal::SIGQUIT),
-            "KILL" => Ok(Signal::SIGKILL),
-            "TERM" => Ok(Signal::SIGTERM),
-            "USR1" => Ok(Signal::SIGUSR1),
-            "USR2" => Ok(Signal::SIGUSR2),
-            _ => Err(SafeKillError::InvalidSignal(s.to_string())),
+            "HUP" => Some(Signal::SIGHUP),
+            "INT" => Some(Signal::SIGINT),
+            "QUIT" => Some(Signal::SIGQUIT),
+            "KILL" => Some(Signal::SIGKILL),
+            "TERM" => Some(Signal::SIGTERM),
+            "USR1" => Some(Signal::SIGUSR1),
+            "USR2" => Some(Signal::SIGUSR2),
+            _ => None,
         }
     }
 
     /// プロセスにシグナルを送信する
     pub fn send(pid: u32, signal: Signal) -> Result<(), SafeKillError> {
-        // PID 0 および i32 を超える値は nix::Pid::from_raw で安全に扱えない。
-        // PID 0 は特殊な意味（プロセスグループ）を持つため明示的に拒否する。
-        if pid == 0 || pid > i32::MAX as u32 {
-            return Err(SafeKillError::InvalidPid(pid.to_string()));
-        }
+        Self::send_with(pid, signal, signal::kill)
+    }
 
-        let nix_pid = Pid::from_raw(pid as i32);
-        let nix_signal = signal.to_nix();
+    /// `send` の本体。シグナルを実際に送る関数を引数で受け取る
+    ///
+    /// PID の検証が送信より先に行われることと、送信の失敗の対応付けを、実際の
+    /// `kill(2)` を呼ばずに単体テストで確かめるために分けている。検証が退行したときに
+    /// テスト自身が PID 0（自分のプロセスグループ）や -1（送れる全プロセス）へ
+    /// 送ってしまう形のテストを書かずに済む。
+    fn send_with(
+        pid: u32,
+        signal: Signal,
+        kill: impl FnOnce(Pid, NixSignal) -> nix::Result<()>,
+    ) -> Result<(), SafeKillError> {
+        let nix_pid = to_nix_pid(pid)?;
+        kill(nix_pid, signal.to_nix()).map_err(|errno| kill_error(pid, errno))
+    }
+}
 
-        signal::kill(nix_pid, nix_signal).map_err(|e| match e {
-            nix::errno::Errno::ESRCH => SafeKillError::ProcessNotFound(pid),
-            nix::errno::Errno::EPERM => SafeKillError::PermissionDenied(pid),
-            _ => SafeKillError::SystemError(format!("Failed to send signal: {}", e)),
-        })
+/// シグナルの送信先として安全に渡せる PID へ変換する
+///
+/// `kill(2)` は PID の値で送り先の意味が変わる。0 は自分のプロセスグループ、-1 は
+/// 送れる全プロセス、-1 未満は -pid のプロセスグループ全体になる。`u32` を `as i32` で
+/// 変換すると `i32::MAX` を超える値が負数へ折り返す（`u32::MAX` は -1 になる）ので、
+/// 1..=`i32::MAX` 以外は `InvalidPid` として送る前に拒否する。
+fn to_nix_pid(pid: u32) -> Result<Pid, SafeKillError> {
+    match i32::try_from(pid) {
+        Ok(raw) if raw > 0 => Ok(Pid::from_raw(raw)),
+        _ => Err(SafeKillError::InvalidPid(pid.to_string())),
+    }
+}
+
+/// `kill(2)` の失敗を `SafeKillError` に対応付ける
+///
+/// ESRCH（対象が居ない）は `ProcessNotFound`、EPERM（送る権限が無い）は `PermissionDenied`、
+/// それ以外は `SystemError` にする。
+fn kill_error(pid: u32, errno: Errno) -> SafeKillError {
+    match errno {
+        Errno::ESRCH => SafeKillError::ProcessNotFound(pid),
+        Errno::EPERM => SafeKillError::PermissionDenied(pid),
+        _ => SafeKillError::SystemError(format!("Failed to send signal: {}", errno)),
     }
 }
 
@@ -300,6 +343,91 @@ mod tests {
             Signal::SIGTERM
         );
         assert_eq!(SignalSender::parse_signal(" 15 ").unwrap(), Signal::SIGTERM);
+        // 前後から除くのは ASCII の空白（SP / HT / LF / FF / CR）すべて
+        assert_eq!(
+            SignalSender::parse_signal("\t\n\x0c\r sigKill \r\x0c\n\t").unwrap(),
+            Signal::SIGKILL
+        );
+        assert_eq!(
+            SignalSender::parse_signal("\t9\n").unwrap(),
+            Signal::SIGKILL
+        );
+    }
+
+    /// 以前の正規化（`str::trim` + `str::to_uppercase`）で受理されていたかを返す
+    ///
+    /// 拒否を確かめるテストの入力が、実際に修正前の実装をすり抜けていた値であることを
+    /// 先に確認するために使う（そうでなければ、何も検証しないテストになる）。
+    fn accepted_by_legacy_normalization(s: &str) -> bool {
+        SignalSender::parse_signal(&s.trim().to_uppercase()).is_ok()
+    }
+
+    #[test]
+    fn test_parse_signal_rejects_non_ascii_letters_that_uppercase_to_ascii() {
+        // `ſ`（U+017F）と `ı`（U+0131）は Unicode の大文字化で ASCII の `S` / `I` になる。
+        // 照合を ASCII だけで行うので、どのシグナル名とも一致しない。
+        for input in ["ſigterm", "sıgkıll", "SIGKıLL", "uſr1", "ſıgınt"] {
+            assert!(
+                accepted_by_legacy_normalization(input),
+                "前提: {input:?} は以前の正規化では受理されていた"
+            );
+            assert_eq!(
+                SignalSender::parse_signal(input),
+                Err(SafeKillError::InvalidSignal(input.to_string())),
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_signal_rejects_non_ascii_whitespace_around_value() {
+        // U+2028 LINE SEPARATOR / U+0085 NEL / U+00A0 NO-BREAK SPACE / U+3000 IDEOGRAPHIC SPACE は
+        // Unicode の White_Space なので `str::trim` なら除かれるが、ASCII の空白ではない。
+        for space in ['\u{2028}', '\u{0085}', '\u{00A0}', '\u{3000}'] {
+            for input in [
+                format!("{space}SIGTERM"),
+                format!("SIGTERM{space}"),
+                format!("{space}15"),
+                format!("15{space}"),
+            ] {
+                assert!(
+                    accepted_by_legacy_normalization(&input),
+                    "前提: {input:?} は以前の正規化では受理されていた"
+                );
+                assert_eq!(
+                    SignalSender::parse_signal(&input),
+                    Err(SafeKillError::InvalidSignal(input.clone())),
+                    "{input:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_signal_error_keeps_input_as_is() {
+        // エラーには大文字化した値ではなく入力そのものを入れる
+        assert_eq!(
+            SignalSender::parse_signal("foo"),
+            Err(SafeKillError::InvalidSignal("foo".to_string()))
+        );
+        assert_eq!(
+            SignalSender::parse_signal(" sigfoo\t"),
+            Err(SafeKillError::InvalidSignal(" sigfoo\t".to_string()))
+        );
+        // 番号の経路でも入力をそのまま入れる（`i32` へ変換した値に正規化しない）
+        assert_eq!(
+            SignalSender::parse_signal("+099"),
+            Err(SafeKillError::InvalidSignal("+099".to_string()))
+        );
+
+        // `ß` は Unicode の大文字化で `SS` になる。以前は `ß` と `ss` のエラーが
+        // どちらも `Invalid signal: SS` になり、何を渡したのか区別できなかった。
+        assert_eq!("ß".to_uppercase(), "ss".to_uppercase());
+        let eszett = SignalSender::parse_signal("ß").unwrap_err();
+        let double_s = SignalSender::parse_signal("ss").unwrap_err();
+        assert_eq!(eszett, SafeKillError::InvalidSignal("ß".to_string()));
+        assert_eq!(double_s, SafeKillError::InvalidSignal("ss".to_string()));
+        assert_ne!(eszett.to_string(), double_s.to_string());
     }
 
     // 無効なシグナルのテスト
@@ -406,17 +534,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_send_rejects_pid_zero() {
-        let result = SignalSender::send(0, Signal::SIGTERM);
-        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
+    // 危険な PID の拒否は `send_with` に偽の送信関数を渡して確かめる。`send` を直接呼ぶと、
+    // 検証が退行したときに PID 0（自分のプロセスグループ = テストの実行そのもの）や
+    // -1（`u32::MAX` が折り返した値。送れる全プロセス）へ本物のシグナルが届く。
+
+    /// 呼ばれたら失敗する送信関数（検証で拒否されるべき PID に使う）
+    fn kill_must_not_be_called(pid: Pid, _signal: NixSignal) -> nix::Result<()> {
+        panic!("検証で拒否されるべき PID {pid} にシグナルを送ろうとした");
     }
 
     #[test]
-    fn test_send_rejects_pid_over_i32_max() {
-        let overflow_pid = i32::MAX as u32 + 1;
-        let result = SignalSender::send(overflow_pid, Signal::SIGTERM);
-        assert!(matches!(result, Err(SafeKillError::InvalidPid(_))));
+    fn test_send_rejects_dangerous_pids_before_kill() {
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            let result = SignalSender::send_with(pid, Signal::SIGTERM, kill_must_not_be_called);
+            assert_eq!(
+                result,
+                Err(SafeKillError::InvalidPid(pid.to_string())),
+                "PID {pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_to_nix_pid_boundaries() {
+        // 1..=i32::MAX だけを受理する。0 は自分のプロセスグループ、`as i32` で負数へ
+        // 折り返す値は送れる全プロセス（-1）やプロセスグループ（-1 未満）を意味する
+        assert_eq!(to_nix_pid(1), Ok(Pid::from_raw(1)));
+        assert_eq!(to_nix_pid(i32::MAX as u32), Ok(Pid::from_raw(i32::MAX)));
+        for pid in [0, i32::MAX as u32 + 1, u32::MAX] {
+            assert_eq!(
+                to_nix_pid(pid),
+                Err(SafeKillError::InvalidPid(pid.to_string())),
+                "PID {pid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_send_passes_validated_pid_and_signal_to_kill() {
+        // PID 1 は有効な PID として送信まで進む（実際には送らない）
+        let mut sent = None;
+        let result = SignalSender::send_with(1, Signal::SIGKILL, |pid, signal| {
+            sent = Some((pid, signal));
+            Ok(())
+        });
+        assert_eq!(result, Ok(()));
+        assert_eq!(sent, Some((Pid::from_raw(1), NixSignal::SIGKILL)));
+    }
+
+    #[test]
+    fn test_send_maps_kill_errors() {
+        // ESRCH は対象が居ない、EPERM は権限が無い、それ以外は SystemError
+        let cases = [
+            (Errno::ESRCH, SafeKillError::ProcessNotFound(42)),
+            (Errno::EPERM, SafeKillError::PermissionDenied(42)),
+        ];
+        for (errno, expected) in cases {
+            let result = SignalSender::send_with(42, Signal::SIGTERM, |_, _| Err(errno));
+            assert_eq!(result, Err(expected), "{errno:?}");
+        }
+        let result = SignalSender::send_with(42, Signal::SIGTERM, |_, _| Err(Errno::EINVAL));
+        assert!(
+            matches!(result, Err(SafeKillError::SystemError(ref message)) if message.contains("Failed to send signal")),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -494,16 +675,6 @@ mod tests {
     }
 
     #[test]
-    fn test_send_rejects_u32_max() {
-        // u32::MAX は i32::MAX を超えるため拒否される
-        let result = SignalSender::send(u32::MAX, Signal::SIGTERM);
-        assert!(
-            matches!(result, Err(SafeKillError::InvalidPid(_))),
-            "u32::MAX は InvalidPid エラーになるべき"
-        );
-    }
-
-    #[test]
     fn test_send_pid_i32_max_boundary() {
         // i32::MAX はギリギリ有効な PID 値（プロセスは存在しないが InvalidPid にはならない）
         let result = SignalSender::send(i32::MAX as u32, Signal::SIGTERM);
@@ -513,17 +684,6 @@ mod tests {
                 Err(SafeKillError::ProcessNotFound(_)) | Err(SafeKillError::PermissionDenied(_))
             ),
             "i32::MAX は有効な PID 範囲だが、プロセスが存在しないためエラーになる"
-        );
-    }
-
-    #[test]
-    fn test_send_pid_1_permission_denied_or_ok() {
-        // PID 1 (init/launchd) への送信は PermissionDenied になることが多い
-        let result = SignalSender::send(1, Signal::SIGTERM);
-        // 環境依存のためエラー型は限定しないが、InvalidPid にはならないことを確認
-        assert!(
-            !matches!(result, Err(SafeKillError::InvalidPid(_))),
-            "PID 1 は有効な PID なので InvalidPid にはならない"
         );
     }
 
