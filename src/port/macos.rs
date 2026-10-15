@@ -1177,6 +1177,52 @@ mod tests {
         assert_eq!(result, Ok(vec![1, 2]));
     }
 
+    #[test]
+    fn test_fetch_growing_clamps_last_growth_to_the_limit() {
+        // 上限が初期値の 2 の累乗倍でないときも、最後は上限ちょうどまで広げてから諦める
+        let mut capacities = Vec::new();
+        let result = fetch_growing(
+            0u8,
+            (2, 5),
+            |buf| {
+                capacities.push(buf.len());
+                raw_no_errno(c_int::try_from(buf.len()).unwrap())
+            },
+            |raw| Ok(usize::try_from(raw.ret).unwrap()),
+        );
+        assert_eq!(result, Err(QueryError::Truncated));
+        assert_eq!(capacities, vec![2, 4, 5]);
+    }
+
+    #[test]
+    fn test_fetch_growing_propagates_failure_after_growth() {
+        // 1 回目は埋まり切り、広げた 2 回目の呼び出しが失敗したら、その失敗を返す
+        // （1 回目の内容を結果として返さない）
+        let mut calls = 0;
+        let result = fetch_growing(
+            0u8,
+            (2, 8),
+            |buf| {
+                calls += 1;
+                if calls == 1 {
+                    buf.fill(7);
+                    raw_no_errno(c_int::try_from(buf.len()).unwrap())
+                } else {
+                    raw(0, Errno::ESRCH)
+                }
+            },
+            |raw| {
+                if raw.ret <= 0 {
+                    Err(QueryError::from_failed_call(raw))
+                } else {
+                    Ok(usize::try_from(raw.ret).unwrap())
+                }
+            },
+        );
+        assert_eq!(result, Err(QueryError::Gone(Errno::ESRCH)));
+        assert_eq!(calls, 2);
+    }
+
     // =========================================================================
     // 実機の libproc での確認
     // =========================================================================

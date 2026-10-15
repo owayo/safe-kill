@@ -109,12 +109,7 @@ impl PortDetector {
             return Err(SafeKillError::InvalidPort(port.to_string()));
         }
 
-        let mut holders = backend::find_port_holders(port)?;
-
-        // 重複を除去（同一 PID が異なるソケットで複数回出現する場合がある）。
-        // 安定ソートなので、同一 PID では最初に見つかったソケットのプロトコルが残る。
-        holders.sort_by_key(|&(pid, _)| pid);
-        holders.dedup_by_key(|&mut (pid, _)| pid);
+        let holders = dedup_holders(backend::find_port_holders(port)?);
 
         let results = holders
             .into_iter()
@@ -186,12 +181,46 @@ impl Default for PortDetector {
     }
 }
 
+/// ポートの保持者の一覧から同じ PID の重複を除き、PID 昇順に並べる
+///
+/// 同じ PID が複数のソケット（TCP と UDP、IPv4 と IPv6）で現れることがある。`dedup_by_key` は
+/// 隣り合う要素しか見ないので、先に PID で並べる。macOS の実装は PID ごとに走査するので同じ
+/// PID は隣り合うが、Linux の netstat2 は TCPv4 → UDPv4 → TCPv6 → UDPv6 の順に返すので、
+/// 同じ PID が離れて現れる（例: `[A/TCP, B/TCP, A/UDP]`）。安定ソートなので、同じ PID では
+/// 最初に見つかったソケットのプロトコルが残る。
+fn dedup_holders(mut holders: Vec<(u32, PortProtocol)>) -> Vec<(u32, PortProtocol)> {
+    holders.sort_by_key(|&(pid, _)| pid);
+    holders.dedup_by_key(|&mut (pid, _)| pid);
+    holders
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, UdpSocket};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn test_dedup_holders_merges_non_adjacent_duplicates() {
+        // Linux の netstat2 のように、同じ PID がプロトコルごとに離れて現れる並び
+        let holders = vec![
+            (30, PortProtocol::Udp),
+            (10, PortProtocol::Tcp),
+            (30, PortProtocol::Tcp),
+            (20, PortProtocol::Udp),
+            (10, PortProtocol::Udp),
+        ];
+        assert_eq!(
+            dedup_holders(holders),
+            vec![
+                (10, PortProtocol::Tcp),
+                (20, PortProtocol::Udp),
+                (30, PortProtocol::Udp),
+            ]
+        );
+        assert!(dedup_holders(Vec::new()).is_empty());
+    }
 
     #[test]
     fn test_port_detector_new() {
@@ -488,12 +517,10 @@ mod tests {
         );
     }
 
-    // 補足: PID 昇順を直接検証するテストは置いていない。TCP と UDP を保持するのは
-    // どちらも同じテストプロセスなので、重複排除後は 1 件しか残らず、ソートを削除
-    // しても降順へ変えても assert が通ってしまう（検証にならない）。意味のある検証には
-    // 同一ポートを別プロセスで保持させる必要があり、テストの複雑さに見合わない。
-    // ソート自体は `dedup_by_key` が隣接要素しか見ないことで間接的に要求されており、
-    // 上の重複排除テストが壊れれば気付ける。
+    // 補足: 上のテストは TCP と UDP を同じテストプロセスが保持するので、重複排除後は
+    // 1 件しか残らず、並べ替えの検証にはならない（macOS では同じ PID が隣り合って現れるので、
+    // ソートを消しても通る）。並べ替えが要ることは、Linux の並びを模した
+    // `test_dedup_holders_merges_non_adjacent_duplicates` で確かめる。
 
     #[test]
     fn test_pid_holds_port_detects_current_tcp_listener() {
@@ -522,11 +549,12 @@ mod tests {
 
     #[test]
     fn test_find_by_port_detects_ipv6_tcp_listener() {
-        // find_by_port / pid_holds_port は AddressFamilyFlags::IPV4 | IPV6 を指定するが、
-        // 既存テストは 127.0.0.1 (IPv4) 束縛しか検証しておらず、IPv6 のみで待ち受ける
-        // 開発サーバー（Node.js が既定で [::] に bind する構成など）を検出できるかが
-        // 固定されていなかった。IPv6 が落ちると --port kill が黙って対象なしになるため、
-        // AddressFamilyFlags から IPV6 が外れる回帰を検出できるようにする。
+        // find_by_port / pid_holds_port は IPv4 と IPv6 の両方を対象にする（Linux は netstat2 の
+        // AddressFamilyFlags::IPV4 | IPV6、macOS は `macos.rs` の `listening_endpoint` が
+        // AF_INET / AF_INET6 を受理する）。既存テストは 127.0.0.1 (IPv4) 束縛しか検証しておらず、
+        // IPv6 のみで待ち受ける開発サーバー（Node.js が既定で [::] に bind する構成など）を
+        // 検出できるかが固定されていなかった。IPv6 が落ちると --port kill が黙って対象なしに
+        // なるため、IPv6 を外す回帰を検出できるようにする。
         let Ok(listener) = TcpListener::bind("[::1]:0") else {
             // IPv6 ループバックが無効な環境（一部のコンテナ）ではスキップする。
             return;
