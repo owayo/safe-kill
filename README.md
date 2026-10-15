@@ -39,7 +39,7 @@ It takes the place of `kill` / `pkill` / `killall` for agents such as Claude Cod
 - **PID Reuse Detection**: Re-validates target identity (`pid + start_time + name`) immediately before signaling, mitigating TOCTOU between policy decision and `kill(2)`
 - **Port Hold Re-check**: For `--port` kills, the live port-holder set is re-queried just before signaling; if the target released the port, the kill is aborted as `NoProcessOnPort`
 - **Terminal Output Sanitization**: ANSI escape sequences, newlines (including the Unicode line/paragraph separators U+2028/U+2029), C0/C1 controls, and all 170 Unicode 17.0 general-category `Cf` format controls in process names, argv, error message bodies, and config paths are escaped (`\xHH` or `\u{HHHH}`) before printing. This covers `--list`, kill result lines (both `name` and `message`), the stderr error path (`safe-kill: ...`), `safe-kill init` path output, config-load warnings, and clap usage errors (which embed the offending argument verbatim).
-- **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing
+- **Fail-closed Config Loading**: Accepts regular config files and symlinks to regular files, but rejects dangling symlinks and special files before parsing; an invalid `[allowed_ports]` entry or a relative `HOME` is a configuration error rather than a silent fallback
 - **Private Config Creation**: `safe-kill init` creates its configuration directory with mode `0700` and a new config file with mode `0600`, even under a permissive `umask`
 - **Configurable Lists**: Allowlist and denylist for fine-grained control
 - **Multiple Signals**: Support for SIGTERM, SIGKILL, SIGHUP, and more
@@ -162,7 +162,7 @@ flowchart TB
 - `safe-kill --name node`: Only `node` processes within your session (green area) are terminated. Requires ancestry check.
 - `safe-kill --port 3000`: Kills a TCP listener or UDP socket using port 3000 **regardless of ancestry** if port is in `allowed_ports`, while still respecting suicide, denylist, root PID, and port validation protections. Useful for killing orphaned dev servers started in other terminals.
 - TCP port matching ignores `ESTABLISHED` and other non-listening sockets so client connections are not selected just because their local port matches.
-- `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. Port `0` is invalid even when a configured range includes it; use `1-65535` for a full valid range.
+- `--port` option requires explicit configuration in `config.toml`. Without it, port-based killing is disabled. An entry that is not a valid port or range, including a range that contains port `0`, is a configuration error; use `1-65535` for a full valid range.
 - Without `SAFE_KILL_ROOT_PID`, the trust root is the agent that ran `safe-kill`: the parent of its shell, or its direct parent when no shell sits in between (a shell that `exec`s `sh -c 'safe-kill …'` disappears). `SAFE_KILL_ROOT_PID` overrides it, for example when `safe-kill` runs under a wrapper such as `timeout`, but that root PID itself remains protected. See [docs/cli-reference.md](docs/cli-reference.md#environment-variables).
 - When the process information for a port-bound PID cannot be resolved (e.g., the process exited between detection and policy check), `safe-kill` fails closed with `ProcessNotFound` instead of falling back to a placeholder name like `pid:<pid>`. This prevents denylist bypass when the real process name is unavailable.
 - Immediately before signaling, the live port-holder set is re-queried. If the target PID is no longer holding the port (e.g., the dev server already exited), the kill is aborted as `NoProcessOnPort` so that a same-PID process now doing unrelated work is not signaled.
@@ -189,7 +189,7 @@ processes = ["postgres"]
 ports = ["1420", "3000-3010", "5173", "8080"]
 ```
 
-User-defined `[denylist]` entries are added to the built-in protection of system processes (such as `launchd` and `WindowServer` on macOS, `systemd` and `sshd` on Linux); customizing the list never removes it. If the file exists but cannot be read or parsed, or contains unknown fields, `safe-kill` stops with a configuration error instead of falling back to defaults. Every setting, the full default denylist, and what `init` writes: [docs/configuration.md](docs/configuration.md)
+User-defined `[denylist]` entries are added to the built-in protection of system processes (such as `launchd` and `WindowServer` on macOS, `systemd` and `sshd` on Linux); customizing the list never removes it. If the file exists but cannot be read or parsed, or contains unknown fields or an invalid `[allowed_ports]` entry, `safe-kill` stops with a configuration error instead of falling back to defaults. Every setting, the full default denylist, and what `init` writes: [docs/configuration.md](docs/configuration.md)
 
 ## Claude Code Integration
 

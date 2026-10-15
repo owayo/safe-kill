@@ -16,7 +16,8 @@ processes = ["postgres"]
 
 # Allowed ports for --port option
 # If not specified, --port option is disabled (no ports can be killed)
-# Valid values are 1-65535. Port 0 is always rejected even if configured.
+# Valid values are 1-65535. An entry that is not a valid port or range (including
+# a range that contains 0) is a configuration error.
 [allowed_ports]
 ports = ["1420", "3000-3010", "5173", "8080"]
 #   - 1420: Tauri dev server
@@ -29,7 +30,7 @@ ports = ["1420", "3000-3010", "5173", "8080"]
 |-------|-----|---------|
 | `[allowlist]` | `processes` | Process names that skip the ancestry check. The denylist, the trust root, PID 1, and the suicide check still apply |
 | `[denylist]` | `processes` | Process names that can never be killed, added to the default denylist |
-| `[allowed_ports]` | `ports` | Ports that `--port` may target, as single ports (`"8080"`) or ranges (`"3000-3010"`). Port `0` is rejected even inside a range; use `1-65535` for the full valid range |
+| `[allowed_ports]` | `ports` | Ports that `--port` may target, as single ports (`"8080"`) or ranges (`"START-END"` with `1 <= START <= END <= 65535`, such as `"3000-3010"`). An entry that does not parse — a range that contains `0` (`"0-3010"`), a reversed range, a value above `65535`, or a dash other than ASCII `-` — makes the whole file invalid (configuration error, exit code 3) instead of being skipped. Use `1-65535` for the full valid range |
 
 `--port` kills bypass the ancestry check for the configured ports, which is useful for orphaned dev servers started in another terminal. Suicide prevention, the denylist, and the protection of the trust root and PID 1 still apply.
 
@@ -48,21 +49,25 @@ The allowlist and `--name` require an exact match. The allowlist bypasses the an
 
 The following system processes are protected by default:
 
-**macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`
+**macOS**: `launchd`, `kernel_task`, `WindowServer`, `loginwindow`, `Finder`, `Dock`, `SystemUIServer`, `ControlCenter`
 
 **Linux**: `systemd`, `init`, `kthreadd`, `dbus-daemon`, `gnome-shell`, `Xorg`, `sshd`
 
 User-defined `[denylist]` entries are appended to this built-in protection set. Customizing the list does not remove system safeguards.
 
+On macOS 12 and later, the AirPlay Receiver runs in `ControlCenter`, which listens on TCP ports 5000 and 7000. Port 5000 is also Flask's default, so with `5000` in `[allowed_ports]`, `safe-kill --port 5000` run after your own server has stopped would find `ControlCenter` instead. The default denylist refuses it; turn off the AirPlay Receiver in System Settings if you need those ports for development.
+
 ## How the File Is Loaded
 
-If `config.toml` exists but cannot be accessed, read, or parsed, or if it contains unknown fields, kill/list commands fail with a configuration error instead of falling back to partial defaults. Regular files and symlinks that resolve to regular files are accepted. Dangling symlinks and paths that resolve to directories, FIFOs, or devices are rejected before reading; this prevents a missing managed config from silently disabling custom protections and avoids blocking or unbounded reads from special files.
+If `config.toml` exists but cannot be accessed, read, or parsed, or if it contains unknown fields or an invalid `[allowed_ports]` entry, kill/list commands fail with a configuration error instead of falling back to partial defaults. Only a config path that does not exist at all falls back to the defaults; any other failure to reach it (a path component that is a regular file, a symlink loop, a permission error) is a configuration error. Regular files and symlinks that resolve to regular files are accepted. Dangling symlinks — the file itself or a directory above it — and paths that resolve to directories, FIFOs, or devices are rejected before reading; this prevents a missing managed config from silently disabling custom protections and avoids blocking or unbounded reads from special files.
+
+The location comes from `HOME` (or the user database when `HOME` is unset or empty). If `HOME` is a relative path, such as `HOME='~'` left unexpanded, `safe-kill` stops with a configuration error (exit code 3), and `init` creates nothing. Resolving the path against the current directory would let the repository an agent happens to be working in supply an `[allowlist]` or `[allowed_ports]`.
 
 ## Creating the File with `safe-kill init`
 
 `safe-kill init` writes a commented starter `config.toml`: `[allowed_ports]` is enabled with the ports shown above, and `[allowlist]` and `[denylist]` are left as commented-out examples.
 
-If the config file already exists, `init` prompts for confirmation before overwriting (use `--force` to skip the prompt). Declining the prompt leaves the existing file unchanged and exits successfully (code 0); only an actual write failure is reported as a configuration error (code 3).
+If the config file already exists, `init` prompts for confirmation before overwriting (use `--force` to skip the prompt). Only `y` or `yes` (case-insensitive, surrounding whitespace ignored) overwrites the file. Any other answer — including an empty line, the end of input, and input that is not valid UTF-8 — declines: the existing file stays unchanged and `init` exits successfully (code 0). Failing to create or write the file, and refusing a dangling symlink or a special file, are configuration errors (code 3); if the prompt itself cannot be written, `init` stops without reading an answer (code 255).
 
 Symlinked config files (the common dotfiles pattern, `~/.config/safe-kill/config.toml -> ~/dotfiles/safe-kill.toml`) keep working: `init` follows the link and updates the real file, leaving the symlink intact. Because the file it rewrites is *not* the path you typed, both the confirmation prompt and the success line disclose the resolved target. A **dangling** symlink is refused outright (code 3, even with `--force`) rather than silently creating a file at the link target.
 

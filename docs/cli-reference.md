@@ -37,11 +37,13 @@ Supported signals can be specified by name or number:
 | SIGUSR1 | 10 (Linux) / 30 (macOS) | User-defined signal 1 (platform-native number only) |
 | SIGUSR2 | 12 (Linux) / 31 (macOS) | User-defined signal 2 (platform-native number only) |
 
+Names are matched case-insensitively in ASCII, with or without the `SIG` prefix (`term`, `SIGTERM`), and surrounding ASCII whitespace is ignored. Nothing else is normalized: a look-alike such as `ſigterm` (with U+017F) or a value padded with a Unicode space is rejected, and the error message shows the value exactly as given.
+
 ## Choosing Targets
 
 `--name` matches the process name the OS reports exactly: the executable's file name on macOS, the kernel's `comm` (truncated to 15 bytes) on Linux — see [Process Names](configuration.md#process-names). It does not perform substring or pattern matching, so on Linux a name longer than 15 bytes never matches; pass its first 15 bytes instead.
 
-When multiple processes match `--name`, results are processed and displayed in ascending PID order so repeated runs stay stable.
+When multiple processes match `--name`, descendants are signaled before their ancestors. If a parent were killed first, a same-named child would be re-parented to init, fail the ancestry re-check that runs right before each signal, and be left running as an orphan (an `npm` → `node` chain, for example). Results are still displayed in ascending PID order so repeated runs stay stable. A supervisor that restarts its children can still leave a new child behind: only the processes found when `safe-kill` started are targeted.
 
 `--port` targets TCP sockets only when they are in `LISTEN` state. Established TCP client sockets with the same local port are ignored. UDP has no connection state, so UDP matches use the local port. Port `0` is always rejected because it is an OS auto-assignment sentinel, not a kill target. The port must be listed in `[allowed_ports]` of the configuration file; without that table, `--port` is disabled.
 
@@ -56,11 +58,11 @@ If a process matched policy checks but disappeared before signal delivery, or th
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | A specified target was not found (PID not found, no name match, no process on allowed port, or no killable match) |
+| 1 | A specified target was not found (PID not found or exited, no name match, no process on allowed port, or no killable match among the `--name` / `--port` matches) |
 | 2 | Permission denied |
 | 3 | Configuration error |
 | 4 | Port not allowed |
-| 255 | General error (invalid signal/port, suicide attempt, and all CLI usage errors) |
+| 255 | General error (invalid signal/port, suicide attempt, a PID target refused by policy — not a descendant, denylisted, the trust root, or PID 1 — and all CLI usage errors) |
 
 CLI usage errors — unknown flags, malformed option values, an out-of-range PID, a missing target (no `PID`, `--name`, `--port`, or `--list`, e.g. `safe-kill`, `safe-kill --dry-run`, or an empty unquoted `$PID`), and conflicting targets such as `--list --port 3000` — all exit with **255**, never 1 or 2. Exit code 1 is reserved for a target that was specified but not found, so a caller does not mistake a forgotten argument for "the process is already gone". Exit code 2 means *only* "permission denied", so a caller can branch on it without mistaking a typo for a real permission failure. `--help` and `--version` exit 0.
 
@@ -70,6 +72,8 @@ A reader closing the output stream does not change the exit code: `safe-kill --l
 
 | Variable | Description |
 |----------|-------------|
-| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0`, `1` (init/launchd), or invalid values are ignored; the root PID itself is not killable) |
+| `SAFE_KILL_ROOT_PID` | Override root PID for ancestry checks (`0`, `1` (init/launchd), and values that do not parse as an unsigned 32-bit integer are ignored; the root PID itself is not killable) |
+
+A value that parses but does not name a live process — including anything above `2147483647` (`i32::MAX`), which can never be a PID — is still used as the root rather than ignored. Its identity cannot be read, so nothing is killable through the ancestry check (allowlisted names and allowed ports are not affected). Falling back to auto-detection would silently widen the scope the caller asked for.
 
 Without `SAFE_KILL_ROOT_PID`, the trust root is detected automatically. When the direct parent of `safe-kill` is a shell (`sh`, `bash`, `zsh`, `dash`, `fish`, …), the root is the shell's parent — the agent that ran the shell. Otherwise the root is the direct parent: a shell that `exec`s its last command (`sh -c 'safe-kill …'`) disappears, leaving the agent itself as the parent. PID 1 and processes on the built-in denylist (such as `systemd`) are never chosen; detection falls back to the parent, then to `safe-kill` itself. If you run `safe-kill` through a wrapper such as `timeout`, `make`, or an npm script, the wrapper becomes the parent and fewer processes are killable; set `SAFE_KILL_ROOT_PID` to the agent's PID (for example `os.getpid()` in the agent process) in that case. Details: [architecture.md](architecture.md) (Safety Layers 7).
