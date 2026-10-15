@@ -19,7 +19,6 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use tempfile::NamedTempFile;
 
 /// 信頼ルートを上書きする環境変数（`src/ancestry.rs` が読む名前と同じ）
 const ROOT_PID_ENV: &str = "SAFE_KILL_ROOT_PID";
@@ -73,6 +72,32 @@ fn safe_kill_std() -> std::process::Command {
 /// `safe_kill_std()` を assert_cmd の `Command` で包んだもの
 fn safe_kill() -> Command {
     Command::from_std(safe_kill_std())
+}
+
+/// いま誰も保持していないポート番号を得る
+///
+/// 一時ポートの範囲（macOS は 49152-65535、Linux は既定で 32768-60999）にある固定番号は、
+/// ほかのアプリの UDP ソケット（QUIC など）がたまたま使っていることがあり、「ポートに誰も
+/// いない」前提が崩れる（実測で無関係なプロセスが対象に上がった）。TCP で `127.0.0.1:0` に
+/// bind して得た番号を、UDP `0.0.0.0` でも bind できたときだけ採用し、両方を閉じて返す。
+fn unused_port() -> u16 {
+    for _ in 0..20 {
+        let Ok(tcp) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            continue;
+        };
+        let Ok(port) = tcp.local_addr().map(|addr| addr.port()) else {
+            continue;
+        };
+        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("空いているポート番号を得られなかった");
+}
+
+/// 1 つのポートだけを許可した設定を置いた一時 HOME を作る
+fn home_allowing_port(port: u16) -> tempfile::TempDir {
+    home_with_config(&format!("[allowed_ports]\nports = [\"{port}\"]\n"))
 }
 
 /// 指定内容の `config.toml` を置いた一時 HOME を作る
@@ -279,6 +304,35 @@ fn test_signal_option_invalid_number() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid signal"));
+}
+
+#[test]
+fn test_invalid_signal_error_shows_value_as_given() {
+    // エラーには大文字化した値ではなく入力そのものを出す（以前は `foo` が `FOO` になり、
+    // `ß` と `ss` がどちらも `SS` と表示されて区別できなかった）。終了コードは 255
+    safe_kill()
+        .args(["--signal", "foo", "999999999"])
+        .assert()
+        .code(255)
+        .stderr("safe-kill: Invalid signal: foo\n");
+}
+
+#[test]
+fn test_signal_name_rejects_unicode_look_alikes() {
+    // Unicode の大文字化で ASCII になる文字（U+017F `ſ`、U+0131 `ı`）や、Unicode の空白を
+    // 前後に付けた値はシグナル名として受け付けない。ASCII の大小文字と空白は受け付ける
+    for signal in ["ſigterm", "sıgkıll", "\u{3000}SIGTERM"] {
+        safe_kill()
+            .args(["--signal", signal, "--dry-run", "999999999"])
+            .assert()
+            .code(255)
+            .stderr(predicate::str::contains("Invalid signal"));
+    }
+    // 存在しない PID なので、シグナル名を受理したうえで対象が見つからず 1 になる
+    safe_kill()
+        .args(["--signal", " sigTerm ", "--dry-run", "999999999"])
+        .assert()
+        .code(1);
 }
 
 // =============================================================================
@@ -1116,21 +1170,22 @@ fn test_unknown_config_field_does_not_fall_back_for_list() {
 
 #[test]
 fn test_custom_config_file_path() {
-    // 一時的な設定ファイルを作成
-    let mut config_file = NamedTempFile::new().unwrap();
-    writeln!(
-        config_file,
-        r#"
-[denylist]
-processes = ["test_denied_process"]
-"#
-    )
-    .unwrap();
+    // HOME の下の設定ファイルが実際に読まれ、その denylist が効くことを確かめる。
+    // 一意名の子を denylist に載せ、`--name` の dry-run が拒否されることで確認する
+    // （拒否されても dry-run なのでシグナルは送られない）。
+    let (_temp, mut child, name) = spawn_unique_sleep();
+    let home = home_with_config(&format!("[denylist]\nprocesses = [\"{name}\"]\n"));
 
-    // 設定の読み込みは起動時に行われるため、CLI 経由でカスタムパスを簡単にテストできない。
-    // このテストは設定ファイルが存在してもバイナリが正常に動作することを確認する。
-    let mut cmd = safe_kill();
-    cmd.arg("--list").assert().success();
+    let result = safe_kill()
+        .env("HOME", home.path())
+        .args(["--name", &name, "--dry-run"])
+        .assert();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    result
+        .code(1)
+        .stdout(predicate::str::contains("is in denylist"));
 }
 
 // =============================================================================
@@ -1220,16 +1275,17 @@ fn test_help_shows_port_option() {
 
 #[test]
 fn test_port_no_process_on_port() {
-    // プロセスが使用していないであろうポート番号を使用
-    let home = home_with_config("[allowed_ports]\nports = [\"59997\"]\n");
+    // 実行直前に誰も保持していないことを確かめたポート番号を使う
+    let port = unused_port();
+    let home = home_allowing_port(port);
     let mut cmd = safe_kill();
     cmd.env("HOME", home.path())
-        .arg("--port")
-        .arg("59997")
-        .arg("--dry-run")
+        .args(["--port", &port.to_string(), "--dry-run"])
         .assert()
         .code(1) // NoTarget (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process found on port 59997"));
+        .stderr(predicate::str::contains(format!(
+            "No process found on port {port}"
+        )));
 }
 
 #[test]
@@ -1237,29 +1293,31 @@ fn test_port_with_dry_run_no_process() {
     // 以前は実設定のまま走らせ、「No process」か「59998」のどちらかを含めば通る判定だった。
     // 許可されていない環境では PortNotAllowed の文面（ポート番号を含む）で素通りしており、
     // 名前に反して NoProcessOnPort を検証していなかった。
-    let home = home_with_config("[allowed_ports]\nports = [\"59998\"]\n");
+    let port = unused_port();
+    let home = home_allowing_port(port);
     let mut cmd = safe_kill();
     cmd.env("HOME", home.path())
-        .arg("--port")
-        .arg("59998")
-        .arg("--dry-run")
+        .args(["--port", &port.to_string(), "--dry-run"])
         .assert()
         .code(1) // NoTarget (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process found on port 59998"));
+        .stderr(predicate::str::contains(format!(
+            "No process found on port {port}"
+        )));
 }
 
 #[test]
 fn test_port_short_option() {
     // -p 短縮形のテスト。--port と同じ経路（許可判定の先の対象検出）まで進むことを確かめる
-    let home = home_with_config("[allowed_ports]\nports = [\"59996\"]\n");
+    let port = unused_port();
+    let home = home_allowing_port(port);
     let mut cmd = safe_kill();
     cmd.env("HOME", home.path())
-        .arg("-p")
-        .arg("59996")
-        .arg("--dry-run")
+        .args(["-p", &port.to_string(), "--dry-run"])
         .assert()
         .code(1) // NoTarget (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process found on port 59996"));
+        .stderr(predicate::str::contains(format!(
+            "No process found on port {port}"
+        )));
 }
 
 #[test]
@@ -1427,21 +1485,22 @@ fn test_exit_code_port_allowed_but_no_process() {
     let temp = tempfile::tempdir().unwrap();
     let config_dir = temp.path().join(".config").join("safe-kill");
     fs::create_dir_all(&config_dir).unwrap();
+    let port = unused_port();
     fs::write(
         config_dir.join("config.toml"),
-        "[allowed_ports]\nports = [\"59997\"]",
+        format!("[allowed_ports]\nports = [\"{port}\"]"),
     )
     .unwrap();
 
     // 待ち受けの無いはずのポートなので dry-run にする（理由は test_port_no_process_on_port の前の説明を参照）
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
-        .arg("--port")
-        .arg("59997")
-        .arg("--dry-run")
+        .args(["--port", &port.to_string(), "--dry-run"])
         .assert()
         .code(1) // NoTarget exit code (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process found on port 59997"));
+        .stderr(predicate::str::contains(format!(
+            "No process found on port {port}"
+        )));
 }
 
 #[test]
@@ -1867,7 +1926,9 @@ fn test_kill_child_with_sigkill() {
             .success()
             .stdout(predicate::str::contains("SIGKILL"));
 
-        let _ = child.wait();
+        // 表示だけでなく、実際に届いたシグナルを回収した終了状態で確かめる
+        let status = child.wait().expect("子プロセスの終了待ちに失敗");
+        assert_eq!(status.signal(), Some(nix::libc::SIGKILL), "{status:?}");
     }
 }
 
@@ -1890,7 +1951,9 @@ fn test_kill_child_with_signal_number() {
             .success()
             .stdout(predicate::str::contains("SIGTERM"));
 
-        let _ = child.wait();
+        // 表示だけでなく、実際に届いたシグナルを回収した終了状態で確かめる
+        let status = child.wait().expect("子プロセスの終了待ちに失敗");
+        assert_eq!(status.signal(), Some(nix::libc::SIGTERM), "{status:?}");
     }
 }
 
@@ -1980,7 +2043,33 @@ fn test_port_kill_with_real_listener() {
         .spawn();
 
     if let Ok(mut child) = child {
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // nc がポートの保持者として見えるまで待つ。nc が自分で終了した（この環境の nc が
+        // 引数を受け付けない、ポートを取られた等）ときだけ、環境要因として検証を省略する。
+        // 以前は結果を `try_success().ok()` で捨てており、検出が壊れても通っていた。
+        let child_pid = child.id();
+        let mut detected = false;
+        for _ in 0..40 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            detected = safe_kill::port::PortDetector::new()
+                .find_by_port(port)
+                .is_ok_and(|holders| holders.iter().any(|holder| holder.pid == child_pid));
+            if detected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if !detected {
+            let exited = matches!(child.try_wait(), Ok(Some(_)));
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                exited,
+                "nc (PID {child_pid}) が動いているのにポート {port} の保持者として検出できない"
+            );
+            return;
+        }
 
         // 一時設定ファイルを作成（ポートを許可）
         let temp = tempfile::tempdir().unwrap();
@@ -1992,7 +2081,7 @@ fn test_port_kill_with_real_listener() {
         )
         .unwrap();
 
-        // dry-run でプロセスが見つかることを確認
+        // dry-run で nc が対象になる（シグナルは送らない）
         let mut cmd = safe_kill();
         let result = cmd
             .env("HOME", temp.path())
@@ -2001,13 +2090,13 @@ fn test_port_kill_with_real_listener() {
             .arg("--dry-run")
             .assert();
 
-        // nc がポートをバインドできた場合は成功
-        // 環境差で見つからない場合もあるため、異常終了しないことだけ確認
-        result.try_success().ok();
-
-        // クリーンアップ
+        // クリーンアップ（回収前の自分の子なので kill してよい）
         let _ = child.kill();
         let _ = child.wait();
+
+        result.success().stdout(predicate::str::contains(format!(
+            "(PID {child_pid}): Would send SIGTERM to process (dry run)"
+        )));
     }
 }
 
@@ -2019,9 +2108,12 @@ fn test_port_kill_with_config_allowed_port_range() {
     let temp = tempfile::tempdir().unwrap();
     let config_dir = temp.path().join(".config").join("safe-kill");
     fs::create_dir_all(&config_dir).unwrap();
+    // 誰も保持していない番号を含む範囲を許可する（範囲の端ではなく内側の番号で確かめる）
+    let port = unused_port();
+    let (start, end) = (port.saturating_sub(5).max(1), port.saturating_add(4));
     fs::write(
         config_dir.join("config.toml"),
-        "[allowed_ports]\nports = [\"59990-59999\"]",
+        format!("[allowed_ports]\nports = [\"{start}-{end}\"]"),
     )
     .unwrap();
 
@@ -2029,12 +2121,12 @@ fn test_port_kill_with_config_allowed_port_range() {
     // 待ち受けの無いはずのポートなので dry-run にする（理由は test_port_no_process_on_port の前の説明を参照）
     let mut cmd = safe_kill();
     cmd.env("HOME", temp.path())
-        .arg("--port")
-        .arg("59995")
-        .arg("--dry-run")
+        .args(["--port", &port.to_string(), "--dry-run"])
         .assert()
         .code(1) // NoTarget (NoProcessOnPort)
-        .stderr(predicate::str::contains("No process found on port 59995"));
+        .stderr(predicate::str::contains(format!(
+            "No process found on port {port}"
+        )));
 }
 
 #[test]
@@ -2181,21 +2273,22 @@ fn test_dry_run_does_not_kill_child_process() {
         .success()
         .stdout(predicate::str::contains("dry run"));
 
-    // プロセスがまだ生きていることを確認（safe-kill の API を使用）
-    use safe_kill::signal::{Signal, SignalSender};
-    // SIGTERM を dry-run ではなく実際に送信して成功すれば生存している
-    // ここでは単にプロセスが存在することを ProcessInfoProvider で確認
-    use safe_kill::process_info::ProcessInfoProvider;
-    let provider = ProcessInfoProvider::new();
-    assert!(
-        provider.get(pid).is_some(),
-        "dry-run 後もプロセスは生存しているべき"
-    );
-
-    // クリーンアップ
+    // プロセスがまだ生きていることを、子の終了状態で確認する。プロセス一覧での確認は
+    // 使わない。子は回収するまでゾンビとして残り、Linux の sysinfo はゾンビも一覧に
+    // 含めるので、dry-run が誤ってシグナルを送っても「生きている」と判定してしまう。
+    // シグナルの配送を待つため少し待ってから調べる。
     let mut child = child;
-    let _ = SignalSender::send(pid, Signal::SIGTERM);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let status = child.try_wait().expect("子の状態を取得できるべき");
+
+    // クリーンアップ（回収前の自分の子なので kill してよい）
+    let _ = child.kill();
     let _ = child.wait();
+
+    assert!(
+        status.is_none(),
+        "dry-run 後もプロセスは生存しているべき（終了状態: {status:?}）"
+    );
 }
 
 // =============================================================================
@@ -2223,8 +2316,10 @@ fn test_kill_with_signal_number() {
         .success()
         .stdout(predicate::str::contains("SIGTERM"));
 
+    // 表示だけでなく、実際に届いたシグナルを回収した終了状態で確かめる
     let mut child = child;
-    let _ = child.wait();
+    let status = child.wait().expect("子プロセスの終了待ちに失敗");
+    assert_eq!(status.signal(), Some(nix::libc::SIGTERM), "{status:?}");
 }
 
 #[test]
@@ -2248,8 +2343,10 @@ fn test_kill_with_signal_name_without_prefix() {
         .success()
         .stdout(predicate::str::contains("SIGKILL"));
 
+    // 表示だけでなく、実際に届いたシグナルを回収した終了状態で確かめる
     let mut child = child;
-    let _ = child.wait();
+    let status = child.wait().expect("子プロセスの終了待ちに失敗");
+    assert_eq!(status.signal(), Some(nix::libc::SIGKILL), "{status:?}");
 }
 
 // =============================================================================
@@ -2689,4 +2786,194 @@ fn test_list_output_failure_is_general_error() {
         written, 0,
         "stdout の書き込みが失敗していない（再現の前提が崩れている）"
     );
+}
+
+// =============================================================================
+// --port の検出（外部コマンドに頼らない）
+// =============================================================================
+
+#[test]
+fn test_port_dry_run_detects_listener_held_by_test_process() {
+    // テスト自身が待ち受けるポートを許可して `--port` の dry-run を実行する。safe-kill から
+    // 見てテストプロセスは親なので、自殺防止で拒否されてシグナルは送られない。nc などの
+    // 外部コマンドが無い環境でも、検出から拒否までの経路を必ず通す。
+    // 同じ番号の UDP も自分で持ち、ほかのプロセスの UDP が混ざらないようにする。
+    let (listener, _udp, port) = (0..20)
+        .find_map(|_| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let port = listener.local_addr().ok()?.port();
+            let udp = std::net::UdpSocket::bind(("0.0.0.0", port)).ok()?;
+            Some((listener, udp, port))
+        })
+        .expect("TCP と UDP で同じ番号を確保できるべき");
+    let me = std::process::id();
+
+    safe_kill()
+        .env("HOME", home_allowing_port(port).path())
+        .args(["--port", &port.to_string(), "--dry-run"])
+        .assert()
+        .code(1)
+        .stdout(predicate::str::contains(
+            "Found 1 process(es), would kill 0:",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "(PID {me}): Cannot kill self or parent process (PID: {me})"
+        )))
+        .stderr(predicate::str::contains(format!(
+            "No killable process found for port {port}"
+        )));
+    drop(listener);
+}
+
+// =============================================================================
+// 設定の場所と内容の検証（相対 HOME・不正な [allowed_ports]）
+// =============================================================================
+
+#[test]
+fn test_relative_home_is_configuration_error() {
+    // HOME が相対パス（展開されずに残った `~` など）だと、設定の場所がカレントディレクトリで
+    // 決まってしまう。作業中のディレクトリに置かれた config.toml（allowlist / allowed_ports）を
+    // 読まないよう、設定エラー（3）で止まる
+    let work = tempfile::tempdir().unwrap();
+    let planted = work.path().join("rel").join(".config").join("safe-kill");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(
+        planted.join("config.toml"),
+        "[allowed_ports]\nports = [\"1-65535\"]\n",
+    )
+    .unwrap();
+
+    for args in [
+        &["--list"][..],
+        &["--port", "3000", "--dry-run"],
+        &["--dry-run", "999999999"],
+    ] {
+        safe_kill()
+            .current_dir(work.path())
+            .env("HOME", "rel")
+            .args(args)
+            .assert()
+            .code(3)
+            .stderr(predicate::str::contains(
+                "home directory is not an absolute path",
+            ));
+    }
+}
+
+#[test]
+fn test_init_with_relative_home_creates_nothing() {
+    // `init` もカレントディレクトリの下（`<cwd>/~/.config/...`）に設定を作らない
+    let work = tempfile::tempdir().unwrap();
+    safe_kill()
+        .current_dir(work.path())
+        .env("HOME", "~")
+        .args(["init", "--force"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains(
+            "home directory is not an absolute path",
+        ));
+    assert!(
+        std::fs::read_dir(work.path()).unwrap().next().is_none(),
+        "カレントディレクトリに何も作らないべき"
+    );
+}
+
+#[test]
+fn test_invalid_allowed_ports_entry_is_configuration_error() {
+    // 読めない指定を黙って捨てると、範囲全体が無視されたことに気付けない。
+    // `--port` だけでなく、設定を読むすべてのコマンドが設定エラー（3）で止まる
+    for ports in [r#"["0-3010"]"#, r#"["3010-3000"]"#, r#"["3000", "65536"]"#] {
+        let home = home_with_config(&format!("[allowed_ports]\nports = {ports}\n"));
+        for args in [&["--list"][..], &["--port", "3000", "--dry-run"]] {
+            safe_kill()
+                .env("HOME", home.path())
+                .args(args)
+                .assert()
+                .code(3)
+                .stderr(predicate::str::contains("Invalid [allowed_ports] entry"));
+        }
+    }
+}
+
+// =============================================================================
+// init の上書き確認への応答
+// =============================================================================
+
+/// 既存の設定ファイルを置いた HOME で、確認への応答 `answer` を与えて `init` を実行する
+fn init_with_answer(answer: Vec<u8>) -> (assert_cmd::assert::Assert, String) {
+    let home = home_with_config("# existing config\n");
+    let assert = safe_kill()
+        .env("HOME", home.path())
+        .arg("init")
+        .write_stdin(answer)
+        .assert();
+    let content =
+        std::fs::read_to_string(home.path().join(".config/safe-kill/config.toml")).unwrap();
+    (assert, content)
+}
+
+#[test]
+fn test_init_treats_non_utf8_answer_and_eof_as_decline() {
+    // EUC-JP や Shift_JIS の端末で「いいえ」と打った場合のような UTF-8 でない応答と、
+    // 入力の終わり（応答なし）は、どちらも拒否として正常終了する（以前は前者が 3 だった）
+    for answer in [vec![0xa4, 0xa4, 0xa4, 0xa4, b'\n'], Vec::new()] {
+        let (assert, content) = init_with_answer(answer.clone());
+        assert.code(0).stderr(predicate::str::contains("Skipped"));
+        assert_eq!(content, "# existing config\n", "{answer:?}");
+    }
+}
+
+// =============================================================================
+// PID 指定のポリシー拒否の終了コード
+// =============================================================================
+
+#[test]
+fn test_pid_policy_denials_exit_255() {
+    // PID 指定でポリシーに拒否された場合（PID 1 の保護 / denylist）は 255。
+    // `--name` / `--port` の全件拒否（1）とは別。dry-run なので、保護が退行しても送信しない
+    safe_kill().args(["--dry-run", "1"]).assert().code(255);
+
+    let (_temp, mut child, name) = spawn_unique_sleep();
+    let home = home_with_config(&format!("[denylist]\nprocesses = [\"{name}\"]\n"));
+    let result = safe_kill()
+        .env("HOME", home.path())
+        .args(["--dry-run", &child.id().to_string()])
+        .assert();
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+        .code(255)
+        .stderr(predicate::str::contains("is in denylist"));
+}
+
+// =============================================================================
+// SAFE_KILL_ROOT_PID の解釈
+// =============================================================================
+
+#[test]
+fn test_unparsable_root_pid_is_ignored_but_unusable_number_allows_nothing() {
+    // u32 として読めない値は無視して自動検出（テストプロセスがルートになり、その子は対象）。
+    // 読めても生きたプロセスを指さない値は、自動検出に置き換えずにルートとして使うので、
+    // 親子関係では何も kill できない
+    let (_temp, mut child, name) = spawn_unique_sleep();
+    let pid = child.id().to_string();
+
+    let ignored = safe_kill()
+        .env(ROOT_PID_ENV, "not-a-pid")
+        .args(["--dry-run", &pid])
+        .assert();
+    let unusable = safe_kill()
+        .env(ROOT_PID_ENV, "4294967295")
+        .args(["--dry-run", &pid])
+        .assert();
+    let _ = child.kill();
+    let _ = child.wait();
+
+    ignored
+        .code(0)
+        .stdout(predicate::str::contains(name.as_str()));
+    unusable
+        .code(255)
+        .stderr(predicate::str::contains("is not a descendant"));
 }

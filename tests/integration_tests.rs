@@ -111,6 +111,26 @@ fn spawn_unique_sleep_with_orphan_twin() -> (tempfile::TempDir, std::process::Ch
     (temp, child, process_name)
 }
 
+/// いま誰も保持していないポート番号を得る
+///
+/// 一時ポートの範囲にある固定番号（59990 など）は、ほかのアプリの UDP ソケット（QUIC など）が
+/// たまたま使っていることがあり、「ポートに誰もいない」前提が崩れる。TCP で `127.0.0.1:0` に
+/// bind して得た番号を、UDP `0.0.0.0` でも bind できたときだけ採用し、両方を閉じて返す。
+fn unused_port() -> u16 {
+    for _ in 0..20 {
+        let Ok(tcp) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            continue;
+        };
+        let Ok(port) = tcp.local_addr().map(|addr| addr.port()) else {
+            continue;
+        };
+        if std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok() {
+            return port;
+        }
+    }
+    panic!("空いているポート番号を得られなかった");
+}
+
 /// 指定名のプロセスが `expected` 件見つかるまで短く待って PID を返す
 fn wait_for_processes_by_name(name: &str, expected: usize) -> Vec<u32> {
     for _ in 0..40 {
@@ -236,16 +256,6 @@ fn test_real_process_tree_grandparent_ancestor() {
         // 現在のプロセスは祖父プロセスの子孫であるべき
         assert!(checker.is_descendant_of(current_pid, grandparent_pid));
     }
-}
-
-#[test]
-fn test_real_process_tree_env_var_override() {
-    // ルート PID 環境変数が尊重されることをテスト
-    // （副作用を避けるため実際には設定せず、パースロジックのみ検証）
-    let env_value = "12345";
-    let parsed: Result<u32, _> = env_value.parse();
-    assert!(parsed.is_ok());
-    assert_eq!(parsed.unwrap(), 12345);
 }
 
 // =============================================================================
@@ -375,21 +385,29 @@ fn test_config_nonexistent_file_uses_defaults() {
 
 #[test]
 fn test_config_denylist_precedence_over_allowlist() {
-    use safe_kill::config::ProcessList;
-
+    // 同じ名前を allowlist と denylist の両方に載せた実プロセスは、`can_kill` の判定順で
+    // denylist が先に効いて拒否される（allowlist による ancestry の迂回より優先する）
+    let (_temp, mut child, name) = spawn_unique_sleep();
     let config = Config {
         allowlist: Some(ProcessList {
-            processes: vec!["conflict".to_string()],
+            processes: vec![name.clone()],
         }),
         denylist: Some(ProcessList {
-            processes: vec!["conflict".to_string()],
+            processes: vec![name.clone()],
         }),
         allowed_ports: None,
     };
+    let engine = PolicyEngine::new(config);
+    let process = wait_for_processes_by_name(&name, 1)
+        .first()
+        .and_then(|&pid| ProcessInfoProvider::new().get(pid))
+        .expect("一意名の子を取得できるべき");
 
-    // denylist が優先される
-    assert!(config.is_denied("conflict"));
-    // allowlist に含まれていても、denylist のチェックが先に行われる
+    let permission = engine.can_kill(&process);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(permission, KillPermission::DeniedByDenylist(name));
 }
 
 // =============================================================================
@@ -661,12 +679,13 @@ fn test_process_info_current_has_parent() {
 fn test_end_to_end_workflow_dry_run() {
     // dry_run での完全なワークフローをシミュレート
 
-    // 1. 設定を読み込み
-    let config = Config::load();
-    assert!(config.denylist.is_some());
+    // 1. 設定を用意する（`Config::load()` は開発者の実 HOME の設定を読み、
+    //    allowed_ports や allowlist の内容で結果が変わるので使わない）
+    let config = Config::default();
 
-    // 2. PolicyEngine を作成
+    // 2. PolicyEngine を作成（既定の denylist は new で合流される）
     let engine = PolicyEngine::new(config);
+    assert!(engine.config().denylist.is_some());
     assert!(engine.root_pid() > 0);
 
     // 3. kill 可能なプロセスを一覧表示
@@ -851,7 +870,10 @@ fn test_policy_engine_kill_by_port_not_allowed_default() {
     };
     let engine = PolicyEngine::new(config);
 
-    let result = engine.kill_by_port(3000, Signal::SIGTERM, false);
+    // 許可判定は dry-run の分岐より前（check_port_allowed）で決まるので、dry-run でも
+    // 検証内容は変わらない。実 kill にすると、許可判定が退行したときに手元の 3000 番の
+    // 開発サーバーへ本物の SIGTERM が届く（ポート指定は ancestry を通らない）。
+    let result = engine.kill_by_port(3000, Signal::SIGTERM, true);
     assert!(matches!(result, Err(SafeKillError::PortNotAllowed { .. })));
 }
 
@@ -859,11 +881,12 @@ fn test_policy_engine_kill_by_port_not_allowed_default() {
 fn test_policy_engine_kill_by_port_allowed_but_empty() {
     use safe_kill::config::AllowedPorts;
 
+    let port = unused_port();
     let config = Config {
         allowlist: None,
         denylist: None,
         allowed_ports: Some(AllowedPorts {
-            ports: vec!["59990".to_string()],
+            ports: vec![port.to_string()],
         }),
     };
     let engine = PolicyEngine::new(config);
@@ -872,8 +895,8 @@ fn test_policy_engine_kill_by_port_allowed_but_empty() {
     // ポート指定 kill は ancestry を確かめないので、たまたま同じ番号を使う無関係な
     // プロセス（同番号の UDP ソケット等）があれば、それに本物のシグナルが届く。
     // NoProcessOnPort は対象検出の段階で決まり dry-run の有無に依存しないため、dry-run で確かめる。
-    let result = engine.kill_by_port(59990, Signal::SIGTERM, true);
-    assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(59990))));
+    let result = engine.kill_by_port(port, Signal::SIGTERM, true);
+    assert!(matches!(result, Err(SafeKillError::NoProcessOnPort(p)) if p == port));
 }
 
 // =============================================================================
@@ -1583,9 +1606,8 @@ fn test_policy_engine_kill_by_port_with_real_listener() {
         .arg(port.to_string())
         .spawn();
 
-    if let Ok(child) = child {
+    if let Ok(mut child) = child {
         let child_pid = child.id();
-        std::thread::sleep(std::time::Duration::from_millis(200));
 
         let config = Config {
             allowlist: None,
@@ -1596,19 +1618,49 @@ fn test_policy_engine_kill_by_port_with_real_listener() {
         };
         let engine = PolicyEngine::new(config);
 
-        let result = engine.kill_by_port(port, Signal::SIGTERM, true);
-        // nc がポートをバインドできた場合はプロセスが見つかるはず
-        // 環境により見つからない場合もあるので、エラーでも OK
-        if let Ok(batch) = result
-            && batch.total_matched > 0
-        {
-            assert!(batch.any_success(), "dry-run では成功扱いになるべき");
+        // nc が listen を始めて保持者に現れるまで待つ（dry-run なのでシグナルは送らない）。
+        // 以前は「見つからなくても、エラーでも OK」で、検出が壊れても通っていた。
+        // nc が自分で終了した（この環境の nc が引数を受け付けない等）ときだけ省略する。
+        let mut found = None;
+        for _ in 0..40 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            match engine.kill_by_port(port, Signal::SIGTERM, true) {
+                Ok(batch) if batch.results.iter().any(|r| r.pid == child_pid) => {
+                    found = Some(batch);
+                    break;
+                }
+                Ok(_) | Err(SafeKillError::NoProcessOnPort(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("予期しないエラー: {e:?}");
+                }
+            }
         }
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
 
-        // クリーンアップ
-        let mut child = child;
-        let _ = SignalSender::send(child_pid, Signal::SIGTERM);
+        // クリーンアップ（回収前の自分の子なので kill してよい）
+        let _ = child.kill();
         let _ = child.wait();
+
+        let Some(batch) = found else {
+            assert!(
+                exited,
+                "nc (PID {child_pid}) が動いているのにポート {port} の保持者として検出できない"
+            );
+            return;
+        };
+        let result = batch
+            .results
+            .iter()
+            .find(|r| r.pid == child_pid)
+            .expect("nc の結果があるはず");
+        assert!(result.success, "dry-run では成功扱いになるべき: {batch:?}");
+        assert!(result.message.contains("dry run"), "{batch:?}");
     }
 }
 
@@ -1840,25 +1892,44 @@ fn test_policy_engine_kill_by_port_actual_kill() {
     let engine = PolicyEngine::new(config);
 
     // dry-run で保持者を確かめる。nc が listen を始めるまでは NoProcessOnPort になるので待つ。
-    let mut only_child_holds_port = false;
+    let mut holders = None;
     for _ in 0..40 {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
         match engine.kill_by_port(port, Signal::SIGTERM, true) {
-            Ok(batch) => {
-                only_child_holds_port =
-                    batch.total_matched > 0 && batch.results.iter().all(|r| r.pid == child_pid);
+            Ok(batch) if batch.results.iter().any(|r| r.pid == child_pid) => {
+                holders = Some(batch.results.iter().map(|r| r.pid).collect::<Vec<_>>());
                 break;
             }
-            Err(SafeKillError::NoProcessOnPort(_)) => {
+            Ok(_) | Err(SafeKillError::NoProcessOnPort(_)) => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => break,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("予期しないエラー: {e:?}");
+            }
         }
     }
-    if !only_child_holds_port {
-        // 自分の子以外も同じ番号を保持している（または nc が listen できなかった）。
-        // このまま実 kill へ進むと無関係なプロセスまで止めるので、自分の子だけ片付けて終える。
+    let Some(holders) = holders else {
+        // nc が自分で終了した（この環境の nc が引数を受け付けない等）ときだけ省略する。
+        // 動いているのに検出できないのは、ポート検出の退行なので失敗にする。
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            exited,
+            "nc (PID {child_pid}) が動いているのにポート {port} の保持者として検出できない"
+        );
+        eprintln!("nc が listen しないまま終了したため、ポート指定の実 kill の検証を省略する");
+        return;
+    };
+    if holders.iter().any(|&pid| pid != child_pid) {
+        // 自分の子以外も同じ番号を保持している。このまま実 kill へ進むと無関係なプロセスまで
+        // 止めるので、自分の子だけ片付けて終える。
         eprintln!(
-            "ポート {port} を自分の子だけが保持している状態を作れなかったため、実 kill の検証を省略する"
+            "ポート {port} を自分の子以外も保持しているため、実 kill の検証を省略する: {holders:?}"
         );
         let _ = child.kill();
         let _ = child.wait();
@@ -1909,8 +1980,11 @@ fn test_kill_by_name_all_denied_returns_batch_with_failures() {
     };
     let engine = PolicyEngine::new(config);
 
-    // 現在のプロセス名で kill を試みる（全て拒否されるはず）
-    let result = engine.kill_by_name(&current_info.name, Signal::SIGTERM, false);
+    // 現在のプロセス名で kill を試みる（全て拒否されるはず）。拒否は denylist で
+    // dry-run の分岐より前に決まるので dry-run で確かめる。実 kill にすると、denylist の
+    // 判定が退行したときに、同じ名前のテストバイナリ（並行する別の cargo test 等）へ
+    // 本物の SIGTERM が届く。
+    let result = engine.kill_by_name(&current_info.name, Signal::SIGTERM, true);
     assert!(
         result.is_ok(),
         "kill_by_name はプロセスが見つかれば Ok を返す"
@@ -1923,36 +1997,32 @@ fn test_kill_by_name_all_denied_returns_batch_with_failures() {
 /// kill_by_name の dry-run で成功するケースのテスト
 #[test]
 fn test_kill_by_name_dry_run_child_process() {
-    use std::process::Command;
-
-    let child = Command::new("sleep")
-        .arg("60")
-        .spawn()
-        .expect("sleep プロセスの起動に失敗");
-    let _pid = child.id();
-
+    // 一意名の子を 1 つだけ起動し、dry-run で「対象になるがシグナルは送られない」ことを
+    // 確かめる（`sleep` のような共通の名前だと、他のテストの子まで一致して検証にならない）。
     // `with_defaults()` は実設定（~/.config/safe-kill/config.toml）を読むため、設定は明示する
+    let (_temp, mut child, name) = spawn_unique_sleep();
+    let pid = child.id();
+    wait_for_processes_by_name(&name, 1);
+
     let engine = PolicyEngine::new(Config::default());
-    let result = engine.kill_by_name("sleep", Signal::SIGTERM, true);
+    let result = engine.kill_by_name(&name, Signal::SIGTERM, true);
 
-    // sleep プロセスが見つかり、dry-run で成功するはず
-    match result {
-        Ok(batch) => {
-            if batch.any_success() {
-                // dry-run なので実際にはプロセスは生きている
-                assert!(batch.total_killed > 0);
-            }
-        }
-        Err(SafeKillError::ProcessNameNotFound(_)) => {
-            // プロセス名が異なる場合（環境依存）
-        }
-        Err(e) => panic!("予期しないエラー: {:?}", e),
-    }
-
-    // クリーンアップ
-    let mut child = child;
-    let _ = SignalSender::send(child.id(), Signal::SIGTERM);
+    // シグナルの配送を待ってから、子がまだ生きているか（終了状態が無いか）を確かめる
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let status = child.try_wait().expect("子の状態を取得できるべき");
+    let _ = child.kill();
     let _ = child.wait();
+
+    let batch = result.expect("一意名の子は一致するはず");
+    assert_eq!(batch.total_matched, 1, "{:?}", batch.results);
+    assert_eq!(batch.total_killed, 1, "{:?}", batch.results);
+    assert_eq!(batch.results[0].pid, pid);
+    assert!(
+        batch.results[0].message.contains("dry run"),
+        "{:?}",
+        batch.results
+    );
+    assert!(status.is_none(), "dry-run で子が終了した: {status:?}");
 }
 
 // =============================================================================
@@ -2046,11 +2116,14 @@ fn test_config_load_returns_valid_config() {
 fn test_kill_by_port_allowed_range_without_listener_returns_no_process() {
     use safe_kill::config::AllowedPorts;
 
+    // 誰も保持していない番号を含む範囲を許可する（範囲の端ではなく内側の番号で確かめる）
+    let port = unused_port();
+    let (start, end) = (port.saturating_sub(5).max(1), port.saturating_add(4));
     let config = Config {
         allowlist: None,
         denylist: None,
         allowed_ports: Some(AllowedPorts {
-            ports: vec!["59980-59989".to_string()],
+            ports: vec![format!("{start}-{end}")],
         }),
     };
     let engine = PolicyEngine::new(config);
@@ -2058,10 +2131,10 @@ fn test_kill_by_port_allowed_range_without_listener_returns_no_process() {
     // 未使用ポートでは NoProcessOnPort エラー。ポート指定 kill は ancestry を確かめないので、
     // たまたま同じ番号を使う無関係なプロセスがあれば本物のシグナルが届く。NoProcessOnPort は
     // 対象検出の段階で決まり dry-run の有無に依存しないため、dry-run で確かめる。
-    let result = engine.kill_by_port(59985, Signal::SIGTERM, true);
+    let result = engine.kill_by_port(port, Signal::SIGTERM, true);
     assert!(
-        matches!(result, Err(SafeKillError::NoProcessOnPort(59985))),
-        "未使用ポートでは NoProcessOnPort エラーが返るべき"
+        matches!(result, Err(SafeKillError::NoProcessOnPort(p)) if p == port),
+        "未使用ポートでは NoProcessOnPort エラーが返るべき: {result:?}"
     );
 }
 
@@ -2136,5 +2209,82 @@ processes = ["my_app"]
             "デフォルト denylist の {} が含まれるべき",
             process
         );
+    }
+}
+
+// =============================================================================
+// 名前指定 kill で同名の親子が一致したときの処理順
+// =============================================================================
+
+/// 同じ一意名の親と子を起動する（親 → 子 → `sleep 3`）
+///
+/// `/bin/bash` への一意名の symlink で起動する（macOS の `/bin/sh` は実体のシェルを exec し
+/// 直すので名前が変わる）。親は同じ symlink で子を `&` で起動して `wait` し、子は
+/// `sleep 3; true` を実行する（最後が組み込みコマンドなので exec されず、名前を保ったまま
+/// sleep の終了を待つ）。孫の sleep は 3 秒で自然に終わるので、シグナルを送らない。
+///
+/// 戻り値は（symlink を置いた一時ディレクトリ, 親プロセス, プロセス名）。
+fn spawn_same_named_parent_and_child() -> (tempfile::TempDir, std::process::Child, String) {
+    let temp = tempfile::tempdir().expect("一時ディレクトリを作成できるべき");
+    let id = UNIQUE_SLEEP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = unique_sleep_process_name(std::process::id(), id);
+    let shell = temp.path().join(&name);
+    std::os::unix::fs::symlink("/bin/bash", &shell)
+        .expect("/bin/bash への symlink を作成できるべき");
+
+    let parent = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(format!("'{}' -c 'sleep 3; true' & wait", shell.display()))
+        .spawn()
+        .expect("同名の親を起動できるべき");
+
+    (temp, parent, name)
+}
+
+#[test]
+fn test_kill_by_name_does_not_orphan_same_named_child() {
+    // 同名の親子が一致したとき、親を先に kill すると子が init に付け替えられ、
+    // kill 直前の ancestry 再評価で「セッション外」として拒否されて孤児のまま残っていた
+    // （SIGKILL では毎回）。子孫から先に処理するので、NotDescendant の失敗は出ず、
+    // 同名のプロセスは残らない。親が子の終了を見て先に自分で終わった場合は、親の行が
+    // ProcessNotFound になることがある（孤児は残らない）。
+    for signal in [Signal::SIGKILL, Signal::SIGTERM] {
+        let (_temp, mut parent, name) = spawn_same_named_parent_and_child();
+        wait_for_processes_by_name(&name, 2);
+
+        let engine = PolicyEngine::new(Config::default());
+        let result = engine.kill_by_name(&name, signal, false);
+        let _ = parent.wait();
+
+        // 子と孫が消えるのを待ってから、同名のプロセスが残っていないことを確かめる
+        let mut remaining = Vec::new();
+        for _ in 0..40 {
+            remaining = ProcessInfoProvider::new().find_by_name(&name);
+            if remaining.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let batch = result.expect("同名の親子は一致するはず");
+        assert_eq!(batch.total_matched, 2, "{signal:?}: {:?}", batch.results);
+        assert!(
+            batch
+                .results
+                .iter()
+                .all(|r| !matches!(r.error, Some(SafeKillError::NotDescendant(..)))),
+            "{signal:?}: 子が孤児になって拒否された: {:?}",
+            batch.results
+        );
+        assert!(batch.any_success(), "{signal:?}: {:?}", batch.results);
+        assert!(
+            remaining.is_empty(),
+            "{signal:?}: 同名のプロセスが残っている: {remaining:?}"
+        );
+        // 表示は PID 昇順
+        let pids: Vec<u32> = batch.results.iter().map(|r| r.pid).collect();
+        let mut sorted = pids.clone();
+        sorted.sort_unstable();
+        assert_eq!(pids, sorted, "{signal:?}");
     }
 }
