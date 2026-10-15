@@ -2,6 +2,9 @@
 //!
 //! ancestry、config、自殺防止を組み合わせた kill 許可判定を統括する。
 
+use std::cmp::Reverse;
+use std::collections::HashSet;
+
 use crate::ancestry::AncestryChecker;
 use crate::config::Config;
 use crate::error::SafeKillError;
@@ -31,7 +34,9 @@ pub enum KillPermission {
 /// 意図を明示的に表現できるようにする（安全側に倒すデフォルトを取り違えにくくする）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FinalAncestryCheck {
-    /// 信頼ルート配下に「今も」あるかを fresh provider snapshot で再評価する。
+    /// 信頼ルート配下に「今も」あるかを再評価する。対象から信頼ルートまでの親チェーンを
+    /// `fetch_fresh` で 1 プロセスずつ往復して取り直す（`AncestryChecker::is_descendant_fresh`。
+    /// 全プロセスの snapshot は作らない）。
     /// PID/名前指定で `KillPermission::Allowed`（ancestry 経由）で許可された場合に使う。
     Required,
     /// ancestry 再評価をバイパスする。設計上 ancestry を適用しない経路で使う:
@@ -97,9 +102,10 @@ impl KillPermission {
 /// kill 許可判定を統括するポリシーエンジン
 pub struct PolicyEngine {
     config: Config,
+    /// 子孫判定と、対象の取得・一覧・名前検索に共用するプロセスの snapshot を持つ
+    /// （[`PolicyEngine::provider`] を参照）
     ancestry: AncestryChecker,
     killer: ProcessKiller,
-    provider: ProcessInfoProvider,
     port_detector: PortDetector,
 }
 
@@ -108,7 +114,6 @@ impl PolicyEngine {
     pub fn new(mut config: Config) -> Self {
         config.merge_defaults();
 
-        let provider = ProcessInfoProvider::new();
         let ancestry = AncestryChecker::new(ProcessInfoProvider::new());
         let killer = ProcessKiller::new();
         let port_detector = PortDetector::new();
@@ -117,9 +122,18 @@ impl PolicyEngine {
             config,
             ancestry,
             killer,
-            provider,
             port_detector,
         }
+    }
+
+    /// 対象の取得・一覧・名前検索に使うプロセスの snapshot
+    ///
+    /// 子孫判定 (`AncestryChecker`) と同じ snapshot を使う。以前は対象の取得用に別の
+    /// snapshot を取っていたため、2 回の取得の間に終了した子孫が「取得用には居るが
+    /// 子孫判定用には居ない」状態になり、消えただけの対象を `NotDescendant`
+    /// （終了コード 255、セッション外）と報告していた。正しくは `ProcessNotFound`（1）。
+    fn provider(&self) -> &ProcessInfoProvider {
+        self.ancestry.provider()
     }
 
     /// デフォルト設定で PolicyEngine を生成する
@@ -133,8 +147,10 @@ impl PolicyEngine {
     }
 
     /// プロセス情報を更新する
+    ///
+    /// 対象の取得にも子孫判定の snapshot を使うので、snapshot の取り直しは ancestry 側の
+    /// `refresh()` だけで済む（信頼ルートの identity が変わっていれば以後は fail-closed）。
     pub fn refresh(&mut self) {
-        self.provider.refresh();
         self.ancestry.refresh();
         self.port_detector.refresh();
     }
@@ -192,7 +208,7 @@ impl PolicyEngine {
 
         // プロセス情報を取得
         let process = self
-            .provider
+            .provider()
             .get(pid)
             .ok_or(SafeKillError::ProcessNotFound(pid))?;
 
@@ -208,8 +224,28 @@ impl PolicyEngine {
                 .killer
                 .kill_with_result(pid, &process.name, signal, dry_run))
         } else {
-            Err(permission.to_error(pid, &process.name))
+            Err(self.denial_error(&process, &permission))
         }
+    }
+
+    /// PID 指定・名前指定の経路で、拒否系の判定結果を返すエラーに変える
+    ///
+    /// `DeniedNotDescendant` のときだけ、先に対象の同一性（`pid + start_time + name`）を
+    /// OS から取り直して確かめ、判定に使った snapshot の後で対象が終了した（または PID が
+    /// 別プロセスへ再利用された）なら `ProcessNotFound`（終了コード 1）を返す。消えただけの
+    /// 対象を `NotDescendant`（終了コード 255、セッション外）と報告すると、呼び出し側が
+    /// 権限の問題と誤解する。kill 直前の ancestry 再評価（`verify_final_safety_before_kill`）
+    /// と同じ分類にそろえる。
+    ///
+    /// この確認で拒否を許可に変えたりシグナルを送ったりはしない。denylist と自殺防止の
+    /// 拒否は対象の生死に関係なく保護の理由なので、分類し直さない。
+    fn denial_error(&self, process: &ProcessInfo, permission: &KillPermission) -> SafeKillError {
+        if *permission == KillPermission::DeniedNotDescendant
+            && let Err(e) = self.verify_identity_before_kill(process)
+        {
+            return e;
+        }
+        permission.to_error(process.pid, &process.name)
     }
 
     /// kill 直前のプロセス同一性検証
@@ -293,9 +329,10 @@ impl PolicyEngine {
     /// fail-closed を保証する:
     /// 1. 自殺防止（最新の親 PID 解決による自プロセス・親プロセス保護）
     /// 2. ancestry 再評価（`ancestry_check == Required` のときのみ）
-    ///    信頼ルートの identity 同一性と、新しい provider snapshot での子孫判定を
-    ///    やり直す。`PolicyEngine` 構築時の親子関係 snapshot に依存しないため、
-    ///    判定〜kill 間の対象プロセス再ペアレントを捕捉できる。
+    ///    対象から信頼ルートまでの親チェーンを `fetch_fresh` で往復して取り直し、各ノードの
+    ///    identity と親子関係、到達した信頼ルートの identity を確かめる
+    ///    （`AncestryChecker::is_descendant_fresh`）。`PolicyEngine` 構築時の snapshot に
+    ///    依存しないため、判定〜kill 間の対象プロセス再ペアレントを捕捉できる。
     /// 3. PID 再利用検出（`pid + start_time + name` の同一性）
     ///
     /// 順序は「自殺防止 → ancestry 再評価 → 同一性」とし、もっとも重要な保護を
@@ -333,16 +370,23 @@ impl PolicyEngine {
         signal: Signal,
         dry_run: bool,
     ) -> Result<BatchKillResult, SafeKillError> {
-        let processes = self.provider.find_by_name(name);
+        let processes = self.provider().find_by_name(name);
 
         if processes.is_empty() {
             return Err(SafeKillError::ProcessNameNotFound(name.to_string()));
         }
 
-        let mut batch_result = BatchKillResult::new();
+        // 同名の親子が一致したときに子を孤児として残さないよう、子孫から先に処理する
+        // （理由と限界は `order_descendants_first` を参照）
+        let provider = self.provider();
+        let order = order_descendants_first(&processes, |pid| {
+            provider.get(pid).and_then(|process| process.parent_pid)
+        });
 
-        for process in processes {
-            let permission = self.can_kill(&process);
+        let mut results = Vec::with_capacity(processes.len());
+        for index in order {
+            let process = &processes[index];
+            let permission = self.can_kill(process);
 
             let result = if permission.is_allowed() {
                 // kill 直前の最終ガード（自殺防止の再確認 + ancestry 再評価 +
@@ -350,7 +394,7 @@ impl PolicyEngine {
                 // 拒否系の permission が紛れ込んでも try_from_permission が
                 // SystemError として失敗扱いにするため、バッチ全体は壊れない。
                 match FinalAncestryCheck::try_from_permission(&permission)
-                    .and_then(|check| self.verify_final_safety_before_kill(&process, check))
+                    .and_then(|check| self.verify_final_safety_before_kill(process, check))
                 {
                     Ok(()) => {
                         self.killer
@@ -360,10 +404,17 @@ impl PolicyEngine {
                 }
             } else {
                 // 拒否されたプロセスの失敗結果を生成
-                let error = permission.to_error(process.pid, &process.name);
+                let error = self.denial_error(process, &permission);
                 KillResult::failure(process.pid, &process.name, &error)
             };
 
+            results.push(result);
+        }
+
+        // 処理は子孫からでも、表示は従来どおり PID 昇順にする（繰り返し実行しても同じ並び）
+        results.sort_by_key(|result| result.pid);
+        let mut batch_result = BatchKillResult::new();
+        for result in results {
             batch_result.add(result);
         }
 
@@ -372,9 +423,10 @@ impl PolicyEngine {
 
     /// ポートを指定してプロセスを kill する
     ///
-    /// 注意: ancestry チェックは適用しない。denylist のみ適用される。
-    /// ポート指定の kill はプロセスの ancestry に関係なく
-    /// 特定のサービスを対象とするため。
+    /// 注意: ancestry チェックと allowlist は適用しない。ポート指定の kill はプロセスの
+    /// ancestry に関係なく特定のサービスを対象とするため。自殺防止・denylist・PID 1 の保護・
+    /// 信頼ルートの保護（`can_kill_for_port`）と、kill 直前のポート保持の再確認・同一性の
+    /// 検証は適用する。
     pub fn kill_by_port(
         &self,
         port: u16,
@@ -407,19 +459,20 @@ impl PolicyEngine {
     ) -> BatchKillResult {
         let mut batch_result = BatchKillResult::new();
 
-        // 各プロセスに対して自殺防止と denylist チェックのみ適用
+        // 各プロセスに対して、ancestry と allowlist を除いた保護（自殺防止・denylist・
+        // PID 1・信頼ルート）を適用する
         for pp in port_processes {
             // プロセス情報が取得できない PID は denylist 名前一致を回避するために
             // 即座に失敗扱いにする（fail-closed）。
             // PortDetector のフォールバック名（"pid:<pid>"）で denylist 判定すると
             // 名前不明なプロセスがバイパスされてしまうため。
-            let Some(process) = self.provider.get(pp.pid) else {
+            let Some(process) = self.provider().get(pp.pid) else {
                 let error = SafeKillError::ProcessNotFound(pp.pid);
                 batch_result.add(KillResult::failure(pp.pid, &pp.name, &error));
                 continue;
             };
 
-            // 許可判定（自殺防止と denylist のみ）
+            // 許可判定（自殺防止・denylist・PID 1・信頼ルート。ancestry と allowlist は見ない）
             let permission = self.can_kill_for_port(pp.pid, &process.name);
 
             let result = if permission.is_allowed() {
@@ -496,7 +549,7 @@ impl PolicyEngine {
 
     /// kill 可能な全プロセスを一覧する
     pub fn list_killable(&self) -> Vec<ProcessInfo> {
-        self.provider
+        self.provider()
             .all()
             .into_iter()
             .filter(|p| self.can_kill(p).is_allowed())
@@ -512,6 +565,44 @@ impl PolicyEngine {
     pub fn config(&self) -> &Config {
         &self.config
     }
+}
+
+/// 名前指定の kill で一致したプロセスを、子孫から先に処理する順に並べる（`processes` の添字を返す）
+///
+/// 同名の親子が一致したとき、親を先に kill すると子が init（や subreaper）に付け替えられ、
+/// 子は kill 直前の ancestry 再評価で「セッション外」として拒否されて孤児のまま残る
+/// （npm → node、jest のワーカーなど。実測で SIGKILL では毎回起きた）。判定時の snapshot の
+/// 親チェーン（`parent_of`）から各対象の深さを求め、深い順に、同じ深さは PID 昇順に処理する。
+/// 一致しない中間の祖先がいてもチェーンをたどる。循環は訪問済みの PID で止め、親が分からない
+/// ところで止める。深さは並べ替えにだけ使い、認可の根拠にはしない（認可は各対象の kill 直前の
+/// `can_kill` と `verify_final_safety_before_kill` が行う）。
+///
+/// 子を再起動するスーパーバイザーの完全停止までは保証しない。最初の snapshot に無い新しい子は
+/// 対象にならず、再走査や再試行もしない（対象を広げ、再起動との競争が終わらなくなるため）。
+fn order_descendants_first(
+    processes: &[ProcessInfo],
+    parent_of: impl Fn(u32) -> Option<u32>,
+) -> Vec<usize> {
+    let depth = |pid: u32| {
+        let mut visited = HashSet::new();
+        let mut current = pid;
+        while visited.insert(current) {
+            match parent_of(current) {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+        // 訪問したのは自分と祖先なので、祖先の数が深さになる
+        visited.len() - 1
+    };
+
+    let mut keyed: Vec<(usize, usize)> = processes
+        .iter()
+        .enumerate()
+        .map(|(index, process)| (index, depth(process.pid)))
+        .collect();
+    keyed.sort_by_key(|&(index, depth)| (Reverse(depth), processes[index].pid));
+    keyed.into_iter().map(|(index, _)| index).collect()
 }
 
 #[cfg(test)]
@@ -665,7 +756,6 @@ mod tests {
             config,
             ancestry: AncestryChecker::with_root_pid(ProcessInfoProvider::new(), root_pid),
             killer: ProcessKiller::new(),
-            provider: ProcessInfoProvider::new(),
             port_detector: PortDetector::new(),
         }
     }
@@ -676,7 +766,7 @@ mod tests {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(process) = engine.provider.get(current_pid) {
+        if let Some(process) = engine.provider().get(current_pid) {
             let permission = engine.can_kill(&process);
             assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
         }
@@ -687,9 +777,9 @@ mod tests {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(current) = engine.provider.get(current_pid)
+        if let Some(current) = engine.provider().get(current_pid)
             && let Some(parent_pid) = current.parent_pid
-            && let Some(parent) = engine.provider.get(parent_pid)
+            && let Some(parent) = engine.provider().get(parent_pid)
         {
             let permission = engine.can_kill(&parent);
             assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
@@ -859,7 +949,7 @@ mod tests {
         assert!(!killable.iter().any(|p| p.pid == current_pid));
 
         // 親プロセスを含まないこと
-        if let Some(current) = engine.provider.get(current_pid)
+        if let Some(current) = engine.provider().get(current_pid)
             && let Some(parent_pid) = current.parent_pid
         {
             assert!(!killable.iter().any(|p| p.pid == parent_pid));
@@ -908,7 +998,7 @@ mod tests {
         let engine = PolicyEngine::new(config);
         let current_pid = ProcessInfoProvider::current_pid();
 
-        if let Some(process) = engine.provider.get(current_pid) {
+        if let Some(process) = engine.provider().get(current_pid) {
             let permission = engine.can_kill(&process);
             // 自殺防止が優先されるべき
             assert_eq!(permission, KillPermission::DeniedSuicidePrevention);
@@ -1129,7 +1219,7 @@ mod tests {
     fn test_can_kill_for_port_suicide_prevention_parent() {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
-        if let Some(current) = engine.provider.get(current_pid)
+        if let Some(current) = engine.provider().get(current_pid)
             && let Some(parent_pid) = current.parent_pid
         {
             let permission = engine.can_kill_for_port(parent_pid, "parent_process");
@@ -1208,7 +1298,7 @@ mod tests {
         let root_pid = engine.root_pid();
 
         // root PID のプロセス情報が取得できる場合のみ検証（環境依存）
-        if let Some(process) = engine.provider.get(root_pid) {
+        if let Some(process) = engine.provider().get(root_pid) {
             let permission = engine.can_kill(&process);
             assert!(
                 permission.is_denied(),
@@ -1384,7 +1474,7 @@ mod tests {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let process = engine
-            .provider
+            .provider()
             .get(current_pid)
             .expect("現在プロセスが取得できるべき");
 
@@ -1422,7 +1512,7 @@ mod tests {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let mut tampered = engine
-            .provider
+            .provider()
             .get(current_pid)
             .expect("現在プロセスが取得できるべき");
         tampered.start_time = tampered.start_time.wrapping_add(1);
@@ -1441,7 +1531,7 @@ mod tests {
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
         let mut tampered = engine
-            .provider
+            .provider()
             .get(current_pid)
             .expect("現在プロセスが取得できるべき");
         tampered.name = format!("{}_pretender", tampered.name);
@@ -1505,7 +1595,7 @@ mod tests {
             .expect("現在プロセスには親が存在するべき");
 
         // 親のスナップショット情報が取得できる場合のみ検証する
-        if let Some(parent_info) = engine.provider.get(parent_pid) {
+        if let Some(parent_info) = engine.provider().get(parent_pid) {
             let result =
                 engine.verify_final_safety_before_kill(&parent_info, FinalAncestryCheck::Required);
             assert!(
@@ -1616,7 +1706,7 @@ mod tests {
         let sibling = spawn_sleeper();
         let engine = engine_with_root_pid(Config::default(), root.id());
         let target = engine
-            .provider
+            .provider()
             .get(sibling.id())
             .expect("起動直後の兄弟プロセスは snapshot に含まれるはず");
 
@@ -1640,7 +1730,7 @@ mod tests {
         let child = spawn_sleeper();
         let engine = engine_with_root_pid(Config::default(), ProcessInfoProvider::current_pid());
         let target = engine
-            .provider
+            .provider()
             .get(child.id())
             .expect("起動直後の子プロセスは snapshot に含まれるはず");
         reap(child);
@@ -1662,7 +1752,7 @@ mod tests {
         let child = spawn_sleeper();
         let pid = child.id();
         let engine = engine_with_root_pid(Config::default(), ProcessInfoProvider::current_pid());
-        assert!(engine.provider.get(pid).is_some());
+        assert!(engine.provider().get(pid).is_some());
         reap(child);
 
         let result = engine.kill_by_pid(pid, Signal::SIGTERM, true);
@@ -1700,7 +1790,7 @@ mod tests {
         // ancestry_check=Bypassed でも自殺防止は引き続き適用される。
         let engine = PolicyEngine::new(Config::default());
         let current_pid = ProcessInfoProvider::current_pid();
-        if let Some(process) = engine.provider.get(current_pid) {
+        if let Some(process) = engine.provider().get(current_pid) {
             let result =
                 engine.verify_final_safety_before_kill(&process, FinalAncestryCheck::Bypassed);
             assert!(
@@ -1812,5 +1902,300 @@ mod tests {
 
         let permission = engine.can_kill(&process);
         assert_eq!(permission, KillPermission::DeniedNotDescendant);
+    }
+
+    // =========================================================================
+    // 名前指定 kill の処理順（子孫から先に処理する）のテスト
+    //
+    // 親を先に kill すると子が init に付け替えられ、kill 直前の ancestry 再評価で
+    // 拒否されて孤児として残る。実プロセスでは PID の大小や付け替えの時機を作れないので、
+    // 固定のツリーで並べ方そのものを確かめる。
+    // =========================================================================
+
+    /// 一致した PID と (子, 親) の組から、`order_descendants_first` の処理順を PID で返す
+    fn order_of(matches: &[u32], parent_links: &[(u32, u32)]) -> Vec<u32> {
+        let parents: std::collections::HashMap<u32, u32> = parent_links.iter().copied().collect();
+        let processes: Vec<ProcessInfo> = matches
+            .iter()
+            .map(|&pid| ProcessInfo {
+                pid,
+                parent_pid: parents.get(&pid).copied(),
+                name: "node".to_string(),
+                cmd: vec![],
+                start_time: 0,
+            })
+            .collect();
+        order_descendants_first(&processes, |pid| parents.get(&pid).copied())
+            .into_iter()
+            .map(|index| processes[index].pid)
+            .collect()
+    }
+
+    #[test]
+    fn test_order_descendants_first_processes_children_before_parents() {
+        // 親 100 → 子 200 → 孫 300 がすべて一致する。PID 昇順のままだと親から処理してしまう
+        assert_eq!(
+            order_of(&[100, 200, 300], &[(300, 200), (200, 100), (100, 1)]),
+            vec![300, 200, 100]
+        );
+    }
+
+    #[test]
+    fn test_order_descendants_first_ignores_pid_magnitude() {
+        // PID が周回すると、子の PID が親より小さくなる
+        assert_eq!(order_of(&[900, 50], &[(50, 900), (900, 1)]), vec![50, 900]);
+    }
+
+    #[test]
+    fn test_order_descendants_first_follows_non_matching_ancestors() {
+        // 親 100（一致）→ 中間 150（別名で一致しない）→ 子 200（一致）。
+        // 中間の祖先が一致しなくても、チェーンをたどって子を先にする
+        assert_eq!(
+            order_of(&[100, 200], &[(200, 150), (150, 100), (100, 1)]),
+            vec![200, 100]
+        );
+    }
+
+    #[test]
+    fn test_order_descendants_first_breaks_ties_by_pid() {
+        // 同じ深さの兄弟と、別のツリーの一致は PID 昇順
+        assert_eq!(
+            order_of(&[30, 10, 20], &[(30, 5), (10, 5), (20, 7), (5, 1), (7, 1)]),
+            vec![10, 20, 30]
+        );
+    }
+
+    #[test]
+    fn test_order_descendants_first_terminates_on_cycle_and_unknown_parent() {
+        // 親 PID の循環（壊れた snapshot）と、親が分からないプロセスが混ざっても止まり、
+        // すべての一致を 1 回ずつ返す
+        assert_eq!(
+            order_of(&[30, 10, 20], &[(10, 20), (20, 10)]),
+            vec![10, 20, 30]
+        );
+        assert_eq!(order_of(&[7], &[(7, 7)]), vec![7]);
+        assert!(order_of(&[], &[]).is_empty());
+    }
+
+    // =========================================================================
+    // 拒否をエラーに変えるときの分類（denial_error）のテスト
+    // =========================================================================
+
+    /// 存在しない PID を持つプロセス情報（判定の後で終了した対象の代わり）
+    fn vanished_process() -> ProcessInfo {
+        ProcessInfo {
+            pid: 999_999_999,
+            parent_pid: Some(1),
+            name: "vanished".to_string(),
+            cmd: vec![],
+            start_time: 1,
+        }
+    }
+
+    #[test]
+    fn test_denial_error_reports_vanished_target_as_process_not_found() {
+        // セッション外という判定の後で対象が消えていれば、ProcessNotFound（終了コード 1）
+        let engine = PolicyEngine::new(Config::default());
+        assert_eq!(
+            engine.denial_error(&vanished_process(), &KillPermission::DeniedNotDescendant),
+            SafeKillError::ProcessNotFound(999_999_999)
+        );
+    }
+
+    #[test]
+    fn test_denial_error_keeps_not_descendant_for_live_target() {
+        // 兄弟プロセスの一方を信頼ルートにし、生きている非子孫を作る
+        let root = spawn_sleeper();
+        let sibling = spawn_sleeper();
+        let engine = engine_with_root_pid(Config::default(), root.id());
+        let target = engine
+            .provider()
+            .get(sibling.id())
+            .expect("起動直後の兄弟プロセスは snapshot に含まれるはず");
+
+        let error = engine.denial_error(&target, &KillPermission::DeniedNotDescendant);
+
+        reap(root);
+        reap(sibling);
+        assert_eq!(
+            error,
+            SafeKillError::NotDescendant(target.pid, target.name.clone())
+        );
+    }
+
+    #[test]
+    fn test_denial_error_does_not_reclassify_denylist_or_suicide() {
+        // denylist と自殺防止は対象の生死に関係なく保護の理由なので、消えた対象でも変えない
+        let engine = PolicyEngine::new(Config::default());
+        assert_eq!(
+            engine.denial_error(
+                &vanished_process(),
+                &KillPermission::DeniedByDenylist("vanished".to_string())
+            ),
+            SafeKillError::Denylisted("vanished".to_string())
+        );
+        assert_eq!(
+            engine.denial_error(
+                &vanished_process(),
+                &KillPermission::DeniedSuicidePrevention
+            ),
+            SafeKillError::SuicidePrevention(999_999_999)
+        );
+    }
+
+    #[test]
+    fn test_kill_by_pid_reports_non_descendant_that_exited_as_not_found() {
+        // snapshot の時点では生きていたセッション外の対象が、判定の前に終了した状況。
+        // can_kill は snapshot で DeniedNotDescendant を返すが、消えただけの対象を
+        // NotDescendant（255）と報告せず ProcessNotFound（1）にする。dry-run なので、
+        // 万一 PID が再利用されていてもシグナルは送らない。
+        let root = spawn_sleeper();
+        let sibling = spawn_sleeper();
+        let pid = sibling.id();
+        let engine = engine_with_root_pid(Config::default(), root.id());
+        assert!(engine.provider().get(pid).is_some());
+        reap(sibling);
+
+        let result = engine.kill_by_pid(pid, Signal::SIGTERM, true);
+
+        reap(root);
+        assert!(
+            matches!(result, Err(SafeKillError::ProcessNotFound(p)) if p == pid),
+            "判定の前に終了したセッション外の対象は ProcessNotFound になるべき、実際: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_target_lookup_and_ancestry_share_one_snapshot() {
+        // 対象の取得と子孫判定が同じ snapshot を見ていること。別々に取ると、
+        // その間に終了した子孫が NotDescendant（255）と誤って報告される。
+        let engine = PolicyEngine::new(Config::default());
+        assert!(std::ptr::eq(engine.provider(), engine.ancestry.provider()));
+    }
+
+    // =========================================================================
+    // ポート指定 kill でポリシーが実際に適用されることのテスト
+    //
+    // 現状のポート経路のテストは、自殺防止以外の拒否を実際にポートを持つプロセスで
+    // 確かめていない（`can_kill_for_port` を常に許可にしても通ってしまう）。
+    // リスナーを継承した子プロセスを作り、dry-run で判定だけを確かめる。
+    // =========================================================================
+
+    /// TCP リスナーを FD 3 として継承させた `sleep 60` を起動する
+    ///
+    /// 子は exec 後もソケットを保持するので、ポート保持の再確認に通る。テスト側の
+    /// リスナーは返り値で保持し続ける（同じポートの保持者にテスト自身も加わるが、
+    /// `kill_port_processes` には子の PID だけを渡す）。
+    fn spawn_listener_holder() -> (std::process::Child, std::net::TcpListener, u16) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("TCP リスナーの作成に失敗");
+        let port = listener.local_addr().unwrap().port();
+        let fd = listener.as_raw_fd();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("60");
+        // SAFETY: pre_exec のクロージャは fork 後・exec 前の子で動く。呼ぶのは
+        // async-signal-safe な dup2(2) / fcntl(2) だけで、メモリの確保もロックの取得もしない。
+        unsafe {
+            command.pre_exec(move || {
+                // dup2 は複製先の FD_CLOEXEC を外すので、FD 3 は exec 後も残る。ただし複製元と
+                // 複製先が同じ番号だと dup2 は何もせずフラグも外れない。リスナーがたまたま
+                // FD 3 のときは、exec で閉じられないようフラグを直接外す。
+                let result = if fd == 3 {
+                    let flags = nix::libc::fcntl(3, nix::libc::F_GETFD);
+                    if flags == -1 {
+                        -1
+                    } else {
+                        nix::libc::fcntl(3, nix::libc::F_SETFD, flags & !nix::libc::FD_CLOEXEC)
+                    }
+                } else {
+                    nix::libc::dup2(fd, 3)
+                };
+                if result == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().expect("sleep の起動に失敗");
+        (child, listener, port)
+    }
+
+    /// ポートを持つ子プロセスに対して、ポート指定 kill を dry-run で実行した結果
+    fn dry_run_port_kill_on_holder(
+        engine: &PolicyEngine,
+        child: &std::process::Child,
+        port: u16,
+    ) -> KillResult {
+        assert!(
+            engine
+                .port_detector
+                .pid_holds_port(child.id(), port, crate::port::PortProtocol::Tcp),
+            "前提: 子プロセスがポート {port} を保持している"
+        );
+        let holder = crate::port::PortProcess {
+            pid: child.id(),
+            name: "sleep".to_string(),
+            port,
+            protocol: crate::port::PortProtocol::Tcp,
+        };
+        let mut batch = engine.kill_port_processes(port, vec![holder], Signal::SIGTERM, true);
+        assert_eq!(batch.results.len(), 1);
+        batch.results.remove(0)
+    }
+
+    #[test]
+    fn test_kill_port_processes_dry_run_reaches_holder() {
+        // 対照: 拒否する理由が無ければ、ポートを持つ子は dry-run で対象になる。
+        // 下の 2 つのテストが「ポート保持の再確認で落ちただけ」で通らないための確認。
+        let (child, _listener, port) = spawn_listener_holder();
+        let engine = engine_with_root_pid(Config::default(), ProcessInfoProvider::current_pid());
+
+        let result = dry_run_port_kill_on_holder(&engine, &child, port);
+
+        reap(child);
+        assert!(result.success, "{result:?}");
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn test_kill_port_processes_applies_denylist_to_real_holder() {
+        let (child, _listener, port) = spawn_listener_holder();
+        let config = Config {
+            denylist: Some(ProcessList {
+                processes: vec!["sleep".to_string()],
+            }),
+            ..Default::default()
+        };
+        let engine = engine_with_root_pid(config, ProcessInfoProvider::current_pid());
+
+        let result = dry_run_port_kill_on_holder(&engine, &child, port);
+
+        reap(child);
+        assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(SafeKillError::Denylisted("sleep".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_kill_port_processes_protects_trust_root_holding_port() {
+        // ポートを持つプロセスが信頼ルートそのものなら、ancestry を迂回する `--port` でも拒否する
+        let (child, _listener, port) = spawn_listener_holder();
+        let engine = engine_with_root_pid(Config::default(), child.id());
+
+        let result = dry_run_port_kill_on_holder(&engine, &child, port);
+
+        let pid = child.id();
+        reap(child);
+        assert!(!result.success);
+        assert_eq!(
+            result.error,
+            Some(SafeKillError::NotDescendant(pid, "sleep".to_string()))
+        );
     }
 }
