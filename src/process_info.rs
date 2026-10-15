@@ -78,10 +78,16 @@ impl ProcessInfoProvider {
         Self { system }
     }
 
-    /// プロセスリストを更新
+    /// プロセスリストを取り直す
+    ///
+    /// 保持している `System` を差分更新せず、snapshot を作り直す。sysinfo の差分更新は、
+    /// 起動時刻が変わらない（同じプロセスとみなした）PID の名前を読み直さない。Linux は
+    /// comm を新しいエントリを作るときにしか読まず、macOS も名前が空のときだけ設定する。
+    /// `cmd` も `UpdateKind::OnlyIfNotSet` なので読み直されない。exec は PID と起動時刻を
+    /// 変えないため、差分更新のままだと exec した後も `get` / `find_by_name` / `all` が
+    /// exec 前の名前と cmd を返し続け、`--name` の検索や denylist の判定が古い名前で行われる。
     pub fn refresh(&mut self) {
-        self.system
-            .refresh_processes_specifics(ProcessesToUpdate::All, true, Self::refresh_kind());
+        *self = Self::new();
     }
 
     /// スレッド（Linux の TID エントリ）でない実プロセスかを判定する
@@ -336,6 +342,60 @@ mod tests {
         // プロセス数が妥当であること（ゼロでない）
         assert!(before > 0);
         assert!(after > 0);
+    }
+
+    #[test]
+    fn test_refresh_rereads_name_and_cmd_after_exec() {
+        // exec は PID と起動時刻を変えずに名前と cmd だけを変える。refresh 後に古い名前が
+        // 残ると、`--name` の検索・denylist の判定・identity の照合が exec 前の名前で行われる。
+        // exec の時機は標準入力で渡し、snapshot を取る前に exec してしまわないようにする。
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "read _; exec sleep 30"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh を起動できるべき");
+        let pid = child.id();
+        let mut provider = ProcessInfoProvider::new();
+        let before = provider.get(pid).map(|info| info.name);
+
+        let exec_requested = child
+            .stdin
+            .take()
+            .expect("sh の標準入力を取れるべき")
+            .write_all(b"\n");
+        // exec が終わるまで待つ（fresh な取得は名前を毎回読み直す）
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut execed = false;
+        while !execed && Instant::now() < deadline {
+            execed = ProcessInfoProvider::fetch_fresh(pid).is_some_and(|info| info.name == "sleep");
+            if !execed {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        provider.refresh();
+        let after = provider.get(pid);
+
+        let _ = child.kill();
+        let _ = child.wait();
+        exec_requested.expect("sh へ exec の合図を書けるべき");
+        assert!(execed, "10 秒以内に sleep へ exec しなかった");
+        assert!(
+            before.is_some_and(|name| name != "sleep"),
+            "exec 前の名前を取れていない"
+        );
+        let after = after.expect("refresh 後も子プロセスを取得できるべき");
+        assert_eq!(
+            after.name, "sleep",
+            "refresh 後も exec 前の名前が残っている"
+        );
+        assert_eq!(
+            after.cmd,
+            ["sleep", "30"],
+            "refresh 後も exec 前のコマンドラインが残っている"
+        );
     }
 
     #[test]
@@ -743,18 +803,23 @@ mod tests {
     #[test]
     fn test_all_excludes_threads_of_current_process() {
         // sysinfo の既定 refresh は `with_tasks()` を含み、Linux では
-        // `/proc/<pid>/task/<tid>` のスレッドが「親 = 自 PID の別プロセス」として
-        // 一覧に現れる。スレッドは自分の comm を自由に変えられるうえ、TID への
-        // kill(2) はスレッドグループ全体へ配送されるため、これを一覧に含めると
-        // denylist をスレッド名で迂回できてしまう。
+        // `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に現れる。
+        // スレッドは自分の comm を自由に変えられるうえ、TID への kill(2) はスレッド
+        // グループ全体へ配送されるため、これを一覧に含めると denylist をスレッド名で
+        // 迂回できてしまう。
         //
-        // テストプロセス自身は子プロセスを生成しないので、「親が自 PID のエントリ」が
-        // 存在すればそれはスレッドの混入を意味する。複数スレッドを生存させたまま
-        // 検証することで、Linux CI で tasks 混入の回帰を検出する
-        // （macOS ではスレッドがそもそも列挙されないため常に空になる）。
+        // 固有の名前を付けたスレッドを生かしたまま、各スレッドの TID（Linux）とスレッド名が
+        // どの参照経路（all / get / fetch_fresh / find_by_name）にも現れないことを確かめる。
+        // 「親が自 PID のエントリ」をスレッドとみなす判定は使わない。同じテストバイナリの
+        // ほかのテストが並行して起動する子プロセス（`sleep` など）まで誤検出して、
+        // テストが不定期に失敗していた。macOS はスレッドを列挙しないので TID は集めず、
+        // 名前の経路だけを確かめる。
         use std::sync::mpsc;
 
-        let (ready_tx, ready_rx) = mpsc::channel();
+        let current = ProcessInfoProvider::current_pid();
+        // Linux の comm の上限（15 バイト）に収まる名前
+        let thread_name = format!("skthr{current:08x}");
+        let (ready_tx, ready_rx) = mpsc::channel::<Option<u32>>();
         let (stop_tx, stop_rx) = mpsc::channel::<()>();
         let stop_rx = std::sync::Arc::new(std::sync::Mutex::new(stop_rx));
 
@@ -762,25 +827,38 @@ mod tests {
             .map(|_| {
                 let ready_tx = ready_tx.clone();
                 let stop_rx = std::sync::Arc::clone(&stop_rx);
-                std::thread::spawn(move || {
-                    ready_tx.send(()).ok();
-                    // 検証が終わるまでスレッドを生かしておく。
-                    let _ = stop_rx.lock().unwrap().recv();
-                })
+                std::thread::Builder::new()
+                    .name(thread_name.clone())
+                    .spawn(move || {
+                        #[cfg(target_os = "linux")]
+                        let tid = u32::try_from(nix::unistd::gettid().as_raw()).ok();
+                        #[cfg(not(target_os = "linux"))]
+                        let tid = None;
+                        ready_tx.send(tid).ok();
+                        // 検証が終わるまでスレッドを生かしておく。
+                        let _ = stop_rx.lock().unwrap().recv();
+                    })
+                    .expect("スレッドを起動できるべき")
             })
             .collect();
         drop(ready_tx);
-        for _ in 0..4 {
-            ready_rx.recv().expect("スレッドの起動を待てるべき");
-        }
-
-        let current = ProcessInfoProvider::current_pid();
-        let provider = ProcessInfoProvider::new();
-        let leaked_threads: Vec<_> = provider
-            .all()
-            .into_iter()
-            .filter(|p| p.parent_pid == Some(current) && p.pid != current)
+        let tids: Vec<u32> = (0..4)
+            .filter_map(|_| ready_rx.recv().expect("スレッドの起動を待てるべき"))
             .collect();
+
+        let provider = ProcessInfoProvider::new();
+        let all = provider.all();
+        let leaked_tids: Vec<u32> = tids
+            .iter()
+            .copied()
+            .filter(|&tid| {
+                tid != current
+                    && (all.iter().any(|p| p.pid == tid)
+                        || provider.get(tid).is_some()
+                        || ProcessInfoProvider::fetch_fresh(tid).is_some())
+            })
+            .collect();
+        let leaked_by_name = provider.find_by_name(&thread_name);
 
         // スレッドを解放してから assert する（失敗時もハングしないように）。
         drop(stop_tx);
@@ -788,14 +866,20 @@ mod tests {
             handle.join().ok();
         }
 
+        #[cfg(target_os = "linux")]
+        assert_eq!(tids.len(), 4, "スレッドの TID を集められるべき: {tids:?}");
         assert!(
-            leaked_threads.is_empty(),
-            "自プロセスのスレッドが独立したプロセスとして一覧に混入している: {leaked_threads:?}"
+            leaked_tids.is_empty(),
+            "スレッドの TID が独立したプロセスとして取得できてしまう: {leaked_tids:?}"
+        );
+        assert!(
+            leaked_by_name.is_empty(),
+            "スレッド名でプロセスとして一致してしまう: {leaked_by_name:?}"
         );
 
         // 自プロセス自身は当然一覧に載る（フィルタが効きすぎていないことの確認）。
         assert!(
-            provider.all().iter().any(|p| p.pid == current),
+            all.iter().any(|p| p.pid == current),
             "自プロセスは一覧に含まれるべき"
         );
     }
