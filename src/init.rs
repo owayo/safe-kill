@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::os::fd::AsFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -88,14 +88,34 @@ impl InitCommand {
     /// * `Ok(InitOutcome::SkippedExisting)` - ユーザーが上書きを拒否し、既存ファイルを残した
     /// * `Err(SafeKillError)` - 生成に失敗した場合
     pub fn execute(force: bool) -> Result<InitOutcome, SafeKillError> {
-        let config_dir = Config::config_dir().ok_or_else(|| {
+        // ホームが相対パスのときの設定エラーは、そのまま返す。`Config::config_dir()` の
+        // `None` と同じ扱いにすると理由が伝わらず、join したままのパスを使えば
+        // カレントディレクトリの下（`<cwd>/~/.config/safe-kill/`）に設定を作ってしまう。
+        let config_dir = Config::resolve_config_dir()?.ok_or_else(|| {
             SafeKillError::ConfigCreationError("Unable to determine config directory".to_string())
         })?;
+        let config_path = Config::config_file_in(&config_dir);
 
-        let config_path = Config::config_path().ok_or_else(|| {
-            SafeKillError::ConfigCreationError("Unable to determine config path".to_string())
-        })?;
+        Self::execute_in(
+            &config_dir,
+            config_path,
+            force,
+            &mut io::stdin().lock(),
+            &mut io::stderr(),
+        )
+    }
 
+    /// 設定ディレクトリと設定ファイルのパスを受け取って init を実行する（[`InitCommand::execute`] の本体）
+    ///
+    /// 上書き確認の入力元（`answer`）とプロンプトの出力先（`prompt`）も引数で受け取るので、
+    /// 実 HOME や端末に触れずに、新規作成・`--force`・確認の各経路を検証できる。
+    fn execute_in(
+        config_dir: &Path,
+        config_path: PathBuf,
+        force: bool,
+        answer: &mut impl BufRead,
+        prompt: &mut impl Write,
+    ) -> Result<InitOutcome, SafeKillError> {
         // 既存エントリの有無は `symlink_metadata` で判定する。
         // `Path::exists()` は symlink を追従するため、リンク先が存在しない「壊れた
         // symlink」を「存在しない」と誤判定し、上書き確認を一切出さないままリンク先の
@@ -119,7 +139,7 @@ impl InitCommand {
             // 他ユーザーが設定ファイルを作成・差し替えできない権限で生成する。
             let mut builder = fs::DirBuilder::new();
             builder.recursive(true).mode(0o700);
-            builder.create(&config_dir).map_err(|e| {
+            builder.create(config_dir).map_err(|e| {
                 SafeKillError::ConfigCreationError(format!(
                     "Failed to create directory {}: {}",
                     config_dir.display(),
@@ -141,7 +161,13 @@ impl InitCommand {
         // 終了コード 0 で正常終了させる。
         if existing.is_some()
             && !force
-            && !Self::confirm_overwrite(&config_path, &write_target.path, write_target.via_symlink)?
+            && !Self::confirm_overwrite(
+                &config_path,
+                &write_target.path,
+                write_target.via_symlink,
+                answer,
+                prompt,
+            )?
         {
             return Ok(InitOutcome::SkippedExisting {
                 config_path,
@@ -388,44 +414,61 @@ ports = ["1420", "3000-3010", "5173", "8080"]
     /// 理解したまま、実際にはまったく別のファイルが破壊される。
     ///
     /// 分岐条件にパス比較を使わないのは `ResolvedWriteTarget::via_symlink` のコメント参照。
+    ///
+    /// プロンプトは `prompt`（実行時は stderr）へ書き、応答は `answer`（実行時は stdin）から
+    /// 1 行読む。
     fn confirm_overwrite(
         path: &Path,
         write_target: &Path,
         via_symlink: bool,
+        answer: &mut impl BufRead,
+        prompt: &mut impl Write,
     ) -> Result<bool, SafeKillError> {
         // `eprint!` は書き込み失敗で panic するため使わない。プロンプトが利用者へ
         // 届かないまま stdin を読むと、「見えていない質問」への同意として既存設定を
         // 破壊しかねない。書き込みに失敗したら BrokenPipe も含めて fail-closed で
         // 中断する（結果表示と違い、これは操作前の確認であり省略できない）。
-        let mut stderr = io::stderr();
         let written = if via_symlink {
             write!(
-                stderr,
+                prompt,
                 "Config file already exists at {} (symlink to {}). Overwrite the symlink target? [y/N]: ",
                 sanitize_path(path),
                 sanitize_path(write_target)
             )
         } else {
             write!(
-                stderr,
+                prompt,
                 "Config file already exists at {}. Overwrite? [y/N]: ",
                 sanitize_path(path)
             )
         };
-        written.and_then(|()| stderr.flush()).map_err(|e| {
+        written.and_then(|()| prompt.flush()).map_err(|e| {
             SafeKillError::SystemError(format!(
                 "Failed to write overwrite confirmation prompt: {}",
                 e
             ))
         })?;
 
-        let mut input = String::new();
-        io::stdin().read_line(&mut input).map_err(|e| {
+        // `read_line` は UTF-8 でない入力（EUC-JP や Shift_JIS の端末で「いいえ」と
+        // 打った場合など）を `InvalidData` のエラーにし、拒否のつもりの応答が設定作成
+        // エラー（終了コード 3）になっていた。バイト列のまま 1 行読み、判定は
+        // `is_affirmative_answer` に任せる。EOF は空の応答（拒否）として扱う。
+        let mut line = Vec::new();
+        answer.read_until(b'\n', &mut line).map_err(|e| {
             SafeKillError::ConfigCreationError(format!("Failed to read input: {}", e))
         })?;
 
-        let input = input.trim().to_lowercase();
-        Ok(input == "y" || input == "yes")
+        Ok(Self::is_affirmative_answer(&line))
+    }
+
+    /// 上書き確認への応答が同意（y / yes）か判定する
+    ///
+    /// `[y/N]` の既定は N なので、前後の空白を除いて大文字小文字を区別せずに y / yes と
+    /// 一致するときだけ同意とみなし、それ以外（空行・EOF・UTF-8 でないバイト列を含む）は
+    /// すべて拒否する。UTF-8 でないバイトは置換文字になるので、同意と誤認することはない。
+    fn is_affirmative_answer(line: &[u8]) -> bool {
+        let answer = String::from_utf8_lossy(line).trim().to_lowercase();
+        answer == "y" || answer == "yes"
     }
 }
 
@@ -484,23 +527,39 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_force_creates_config_in_temp_dir() {
-        // テスト用の一時ディレクトリを使って execute(force=true) を検証
-        // 実際の HOME を変更できないため、default_config_content の内容が
-        // 有効な TOML であり Config としてパースできることを確認する
-        let content = InitCommand::default_config_content();
-        let parsed: Result<crate::config::Config, _> = toml::from_str(&content);
-        assert!(parsed.is_ok());
-        let config = parsed.unwrap();
-        // allowed_ports セクションが含まれること
-        assert!(config.allowed_ports.is_some());
-        let ports = config.allowed_ports.unwrap();
-        assert!(!ports.ports.is_empty());
-        // デフォルトのポート設定が含まれていること
-        assert!(ports.ports.contains(&"1420".to_string()));
-        assert!(ports.ports.contains(&"3000-3010".to_string()));
-        assert!(ports.ports.contains(&"5173".to_string()));
-        assert!(ports.ports.contains(&"8080".to_string()));
+    fn test_execute_in_force_overwrites_existing_without_prompt() {
+        // `--force` は確認を出さずに既存の設定を上書きする（実 HOME と端末には触れない）
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config").join("safe-kill");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "old").unwrap();
+        let mut prompt = Vec::new();
+
+        let outcome = InitCommand::execute_in(
+            &config_dir,
+            config_path.clone(),
+            true,
+            &mut io::empty(),
+            &mut prompt,
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                InitOutcome::Created {
+                    via_symlink: false,
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).unwrap(),
+            InitCommand::default_config_content()
+        );
+        assert!(prompt.is_empty(), "--force では確認を出さない");
     }
 
     #[test]
@@ -525,23 +584,216 @@ mod tests {
     }
 
     #[test]
-    fn test_execute_creates_file_in_temp_dir() {
+    fn test_execute_in_creates_private_config_in_new_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // 設定ディレクトリも設定ファイルも無い状態から作る。確認は出さず、ディレクトリは
+        // 0700、ファイルは 0600 で作る（認可設定を他ユーザーに書き換えさせない）
         let temp = tempfile::tempdir().unwrap();
         let config_dir = temp.path().join(".config").join("safe-kill");
-        std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
+        let mut prompt = Vec::new();
 
-        // execute と同じロジックで直接書き込み
-        let content = InitCommand::default_config_content();
-        std::fs::write(&config_path, &content).unwrap();
+        let outcome = InitCommand::execute_in(
+            &config_dir,
+            config_path.clone(),
+            false,
+            &mut io::empty(),
+            &mut prompt,
+        )
+        .unwrap();
 
-        // ファイルが存在し、有効な TOML であることを確認
-        assert!(config_path.exists());
-        let read_content = std::fs::read_to_string(&config_path).unwrap();
-        assert_eq!(read_content, content);
+        assert!(
+            matches!(&outcome, InitOutcome::Created { config_path: created, via_symlink: false, .. } if created == &config_path),
+            "{outcome:?}"
+        );
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(content, InitCommand::default_config_content());
+        assert!(toml::from_str::<crate::config::Config>(&content).is_ok());
+        assert_eq!(
+            fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777 & !0o700,
+            0,
+            "設定ディレクトリは所有者だけのはず"
+        );
+        assert_eq!(
+            fs::metadata(&config_path).unwrap().permissions().mode() & 0o777 & !0o600,
+            0,
+            "設定ファイルは所有者の読み書きだけのはず"
+        );
+        assert!(prompt.is_empty(), "新規作成では確認を出さない");
+    }
 
-        let parsed: Result<crate::config::Config, _> = toml::from_str(&read_content);
-        assert!(parsed.is_ok());
+    /// 既存の設定ファイルに対して、確認への応答 `answer` を与えて `execute_in` を実行する
+    ///
+    /// 戻り値は (結果, 実行後のファイルの内容, 確認の文面)。
+    fn execute_with_answer(answer: &[u8]) -> (Result<InitOutcome, SafeKillError>, String, String) {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config").join("safe-kill");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "old").unwrap();
+        let mut prompt = Vec::new();
+
+        let outcome = InitCommand::execute_in(
+            &config_dir,
+            config_path.clone(),
+            false,
+            &mut io::Cursor::new(answer.to_vec()),
+            &mut prompt,
+        );
+        (
+            outcome,
+            fs::read_to_string(&config_path).unwrap(),
+            String::from_utf8(prompt).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_execute_in_skips_existing_config_when_declined() {
+        // 拒否・空行・EOF（入力なし）・UTF-8 でない応答はすべて「上書きしない」。
+        // UTF-8 でない応答（EUC-JP や Shift_JIS の端末で「いいえ」と打った場合など）は、
+        // 以前は読み込みエラー（終了コード 3）になっていた
+        for answer in [
+            &b"n\n"[..],
+            b"no\n",
+            b"\n",
+            b"",
+            b"nope\n",
+            &[0xa4, 0xa4, 0xa4, 0xa4, b'\n'],
+        ] {
+            let (outcome, content, prompt) = execute_with_answer(answer);
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(InitOutcome::SkippedExisting {
+                        via_symlink: false,
+                        ..
+                    })
+                ),
+                "{answer:?}: {outcome:?}"
+            );
+            assert_eq!(content, "old", "{answer:?}");
+            assert!(prompt.contains("Overwrite? [y/N]: "), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn test_execute_in_overwrites_existing_config_when_confirmed() {
+        for answer in [&b"y\n"[..], b"YES\n", b" yes \r\n", b"y"] {
+            let (outcome, content, _) = execute_with_answer(answer);
+            assert!(
+                matches!(outcome, Ok(InitOutcome::Created { .. })),
+                "{answer:?}: {outcome:?}"
+            );
+            assert_eq!(content, InitCommand::default_config_content(), "{answer:?}");
+        }
+    }
+
+    /// 書き込みが常に失敗する出力先
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    #[test]
+    fn test_execute_in_aborts_when_prompt_cannot_be_written() {
+        // 確認が利用者に届かないまま応答を読むと、見えていない質問への同意として既存の
+        // 設定を壊しかねない。プロンプトを書けなければ中断し、応答は読まない
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join(".config").join("safe-kill");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        fs::write(&config_path, "old").unwrap();
+        let mut answer = io::Cursor::new(b"y\n".to_vec());
+
+        let outcome = InitCommand::execute_in(
+            &config_dir,
+            config_path.clone(),
+            false,
+            &mut answer,
+            &mut FailingWriter,
+        );
+
+        assert!(
+            matches!(outcome, Err(SafeKillError::SystemError(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(fs::read_to_string(&config_path).unwrap(), "old");
+        assert_eq!(answer.position(), 0, "応答を読む前に中断するべき");
+    }
+
+    #[test]
+    fn test_is_affirmative_answer() {
+        for answer in [
+            &b"y"[..],
+            b"Y",
+            b"yes",
+            b"YES",
+            b"Yes\n",
+            b"  y  \n",
+            b"yes\r\n",
+        ] {
+            assert!(InitCommand::is_affirmative_answer(answer), "{answer:?}");
+        }
+        for answer in [
+            &b""[..],
+            b"\n",
+            b"n",
+            b"no",
+            b"yess",
+            b"y es",
+            b"\xa4\xa4",
+            b"y\xff",
+            "はい".as_bytes(),
+        ] {
+            assert!(!InitCommand::is_affirmative_answer(answer), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn test_write_config_file_does_not_block_on_fifo_swapped_in_after_resolution() {
+        // 書き込み先を解決した後で通常ファイルが FIFO に差し替えられても、open で読み手を
+        // 待たずに失敗する（O_NONBLOCK。読み手のいない FIFO を書き込み用に開くと ENXIO）。
+        // 退行して待つようになってもテストがハングしないよう、別スレッドで書き込む。
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "original").unwrap();
+        let metadata = fs::symlink_metadata(&config_path).unwrap();
+        let write_target =
+            InitCommand::resolve_write_target(&config_path, Some(&metadata)).unwrap();
+        fs::rename(&config_path, temp.path().join("original-config.toml")).unwrap();
+        nix::unistd::mkfifo(&config_path, Mode::S_IRWXU).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(InitCommand::write_config_file(&write_target, "replacement"));
+        });
+        // 期限内に結果が来なければ失敗させる。後始末に FIFO の相手側をブロッキングで開くと、
+        // スレッドが既に FIFO を閉じていた（あるいは panic した）場合に相手が現れず、
+        // テスト自体が止まる。待ったままのスレッドは切り離し、テストの終了とともに消える。
+        let result = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("期限内に書き込みが終わらなかった（FIFO の読み手を待っているか、スレッドが panic した）");
+        handle.join().expect("書き込みのスレッドが panic した");
+
+        assert!(
+            matches!(result, Err(SafeKillError::ConfigCreationError(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(temp.path().join("original-config.toml")).unwrap(),
+            "original"
+        );
     }
 
     #[test]
