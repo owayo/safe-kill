@@ -8,8 +8,17 @@ use std::path::Path;
 /// 改行・ANSI escape（`\x1b[2J` で画面消去等）・双方向テキスト制御文字が
 /// 含まれ得る。
 /// それらを無加工で表示すると、出力行を上書き／消去する偽装表示や、
-/// 端末状態の改ざんが可能。表示の安全性のため、印字可能文字以外は
-/// `\xHH` または `\u{HHHH}` 形式にエスケープする。
+/// 端末状態の改ざんが可能。表示の安全性のため、次の文字を `\xHH` または
+/// `\u{HHHH}` 形式（改行・復帰・タブは `\n` / `\r` / `\t`）にエスケープする。
+///
+/// - 制御文字（Unicode の general category `Cc`。C0 / DEL / C1）
+/// - Unicode 17.0 の format 文字（`Cf`）全 170 文字と、不可視の U+034F / U+2065
+///   （[`is_format_control`]）
+/// - Unicode の改行 U+2028 / U+2029（[`is_unicode_line_separator`]）
+/// - エスケープの導入文字 `\` 自身（`\\`。変換を単射に保つ）
+///
+/// これ以外の文字はそのまま出す。たとえば不可視の Lo 文字（U+3164 HANGUL FILLER など）や
+/// 異体字セレクタはエスケープしない。
 pub fn sanitize_terminal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -46,7 +55,11 @@ fn is_unicode_line_separator(c: char) -> bool {
 /// 端末表示を偽装できる非印字の Unicode format 文字か判定する。
 ///
 /// Rust 標準ライブラリには Unicode general category の `Cf` 判定 API がないため、
-/// Unicode 17.0 で `Cf` に分類される format/control code point を明示的に扱う。
+/// Unicode 17.0 で `Cf` に分類される format/control code point 全 170 文字を明示的に扱う。
+/// あわせて、`Cf` ではないが不可視の 2 文字もエスケープする（不可視の混入を可視化する安全側の
+/// 扱い）。U+034F COMBINING GRAPHEME JOINER（`Mn`）と、`2060..=206F` の範囲にある未割り当ての
+/// U+2065 で、どちらも Default_Ignorable_Code_Point に属する。範囲は
+/// `test_escaped_set_matches_unicode_17_cf_and_documented_extras` が全 code point で確かめる。
 fn is_format_control(c: char) -> bool {
     matches!(
         c,
@@ -328,5 +341,82 @@ mod tests {
         assert!(sanitized.contains("\\nconfig.toml"));
         assert!(!sanitized.contains('\x1b'));
         assert!(!sanitized.contains('\n'));
+    }
+
+    /// Unicode 17.0 の general category `Cf`（format 文字）の全範囲（両端を含む）
+    ///
+    /// <https://www.unicode.org/Public/17.0.0/ucd/extracted/DerivedGeneralCategory.txt> の
+    /// `; Cf` の行を写したもの（全 170 文字）。実装の表（`is_format_control`）とは別に持ち、
+    /// 表の漏れと余分の両方を検出する。
+    const UNICODE_17_CF: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD),
+        (0x0600, 0x0605),
+        (0x061C, 0x061C),
+        (0x06DD, 0x06DD),
+        (0x070F, 0x070F),
+        (0x0890, 0x0891),
+        (0x08E2, 0x08E2),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x206F),
+        (0xFEFF, 0xFEFF),
+        (0xFFF9, 0xFFFB),
+        (0x110BD, 0x110BD),
+        (0x110CD, 0x110CD),
+        (0x13430, 0x1343F),
+        (0x1BCA0, 0x1BCA3),
+        (0x1D173, 0x1D17A),
+        (0xE0001, 0xE0001),
+        (0xE0020, 0xE007F),
+    ];
+
+    #[test]
+    fn test_escaped_set_matches_unicode_17_cf_and_documented_extras() {
+        // エスケープされる文字の集合が、ドキュメントに書いた範囲（Cc・Cf・U+2028 / U+2029・
+        // `\`・不可視の U+034F / U+2065）と完全に一致することを全 Unicode スカラー値で確かめる。
+        let cf_total: u32 = UNICODE_17_CF
+            .iter()
+            .map(|&(start, end)| end - start + 1)
+            .sum();
+        assert_eq!(cf_total, 170, "Unicode 17.0 の Cf は 170 文字");
+        let is_cf = |code: u32| {
+            UNICODE_17_CF
+                .iter()
+                .any(|&(start, end)| (start..=end).contains(&code))
+        };
+
+        let mut missing = Vec::new();
+        let mut unexpected = Vec::new();
+        let mut buf = [0u8; 4];
+        for c in (0..=0x10FFFF).filter_map(char::from_u32) {
+            // `char::is_control` は general category `Cc` と一致する
+            let expected = c.is_control()
+                || is_cf(c as u32)
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\\' | '\u{034F}' | '\u{2065}');
+            let s: &str = c.encode_utf8(&mut buf);
+            let escaped = sanitize_terminal(s) != s;
+            match (expected, escaped) {
+                (true, false) => missing.push(format!("U+{:04X}", c as u32)),
+                (false, true) => unexpected.push(format!("U+{:04X}", c as u32)),
+                _ => {}
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "エスケープされない文字がある: {missing:?}"
+        );
+        assert!(
+            unexpected.is_empty(),
+            "ドキュメントに無い文字までエスケープしている: {unexpected:?}"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_terminal_escapes_documented_non_cf_invisibles() {
+        // Cf ではないが不可視の 2 文字（U+034F は Mn、U+2065 は未割り当て）も開示する
+        assert_eq!(sanitize_terminal("a\u{034F}b"), "a\\u{034F}b");
+        assert_eq!(sanitize_terminal("a\u{2065}b"), "a\\u{2065}b");
     }
 }

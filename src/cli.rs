@@ -167,7 +167,8 @@ impl CliArgs {
                 let line = usage_error_line(&argv);
                 let mut stderr = io::stderr();
                 // 診断が届かなくても終了コードは変えない（`main()` のエラー出力と同じ方針）。
-                // `exit()` はバッファを flush しないため明示的に flush する。
+                // stderr はバッファを持たず（`exit()` も終了前に stdout を flush する）、
+                // flush は書き込み先が変わっても診断を失わないための念のための処理。
                 let _ = writeln!(stderr, "{line}");
                 let _ = stderr.flush();
                 std::process::exit(i32::from(SafeKillExitCode::GeneralError as u8));
@@ -319,9 +320,11 @@ fn render_usage_error(argv: &[OsString]) -> Option<String> {
     let rendered = err.render().ansi().to_string();
     // 他の診断（`main()` の `safe-kill: ...`）と同じ接頭辞に揃える。行頭が
     // 常に固定文字列になるので、本文側に `error:` が現れても行の出自を誤れない。
-    // `trim_end()` で落とすのは clap が付ける末尾の改行。このコマンドは `--help` を
-    // 持つので、使用方法エラーの末尾は clap 固定の `For more information, try '--help'.`
-    // になり、引数値の末尾の空白や改行が削られて開示から漏れることはない。
+    // `trim_end()` で落とすのは clap が付ける末尾の改行。使用方法エラーの末尾は clap が
+    // 付ける固定の行で、引数値の末尾の空白や改行が削られて開示から漏れることはない。
+    // 通常は `For more information, try '--help'.` で終わる。自動生成の `help`
+    // サブコマンドの文脈（`safe-kill help help x`）では help フラグが無いので案内行は
+    // 付かないが、`Usage: safe-kill help [COMMAND]...` の行が必ず最後に付く。
     Some(format!(
         "safe-kill: {}",
         sanitize_terminal(rendered.trim_end())
@@ -994,6 +997,30 @@ mod tests {
                 "末尾が clap 固定の文言で終わっていない ({args:?}): {line}"
             );
         }
+    }
+
+    #[test]
+    fn test_render_usage_error_in_help_subcommand_context_ends_with_usage_line() {
+        // 自動生成の `help` サブコマンドは help フラグを持たないので、clap は
+        // `For more information` の案内行を付けない。それでも末尾は clap 固定の Usage 行で、
+        // 引数値が最後に来て `trim_end()` で削られることはない。制御文字を混ぜた引数でも
+        // エスケープ表記で開示される。
+        let line = render(&["safe-kill", "help", "help", "x"]);
+        assert!(
+            line.ends_with("Usage: safe-kill help [COMMAND]..."),
+            "{line}"
+        );
+        assert!(line.contains("'x'"), "{line}");
+        assert!(!line.contains("\\x1B"), "{line}");
+        assert_no_raw_controls(&line);
+
+        let line = render(&["safe-kill", "help", "help", "x \x1b[2J\r"]);
+        assert!(line.contains("'x \\x1B[2J\\r'"), "{line}");
+        assert!(
+            line.ends_with("Usage: safe-kill help [COMMAND]..."),
+            "{line}"
+        );
+        assert_no_raw_controls(&line);
     }
 
     #[test]
