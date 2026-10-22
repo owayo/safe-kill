@@ -2019,6 +2019,38 @@ fn test_init_uses_private_permissions_even_with_permissive_umask() {
     assert_eq!(file_mode, 0o600);
 }
 
+#[test]
+fn test_init_preserves_more_restrictive_umask() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config_dir = temp.path().join(".config").join("safe-kill");
+    // ディレクトリは事前に用意し、ファイルへの書き込み権限を落とす umask を検証する。
+    // プロセス全体の umask を変更せず、他の並列テストに影響させない。
+    fs::create_dir_all(&config_dir).unwrap();
+    let config_path = config_dir.join("config.toml");
+    let binary = assert_cmd::cargo::cargo_bin!("safe-kill");
+
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg("umask 200; exec \"$1\" init --force")
+        .arg("safe-kill-init-test")
+        .arg(binary)
+        .env("HOME", temp.path())
+        .env_remove(ROOT_PID_ENV)
+        .env_remove("CLICOLOR_FORCE")
+        .assert()
+        .success();
+
+    // 作成時の FD には書けるが、後から権限を 0600 へ広げてはならない。
+    let file_mode = fs::metadata(&config_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(file_mode, 0o400);
+    let config = safe_kill::config::Config::try_load_from_path(Some(config_path)).unwrap();
+    assert!(config.is_port_allowed(5173));
+    assert!(!config.is_port_allowed(0));
+}
+
 // =============================================================================
 // --port での実 kill テスト
 // =============================================================================

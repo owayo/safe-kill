@@ -21,7 +21,7 @@ make release            # リリースビルド
 make install            # /usr/local/bin にインストール (INSTALL_PATH で変更可)
 
 # テスト
-make test               # 全テスト実行 (macOS で lib 569 + bin 58 + E2E 133 + integration 80。lib は OS 固有のテストを含むので Linux では件数が変わる)
+make test               # 全テスト実行 (macOS で lib 571 + bin 58 + E2E 134 + integration 80。lib は OS 固有のテストを含むので Linux では件数が変わる)
 make test-e2e           # E2Eテストのみ
 make test-integration   # 統合テストのみ
 # 直接 cargo test を呼ぶときも SAFE_KILL_ROOT_PID は外す（make のターゲットと同じ。Testing Notes 参照）
@@ -114,4 +114,5 @@ YY.M.COUNTER 形式（例: 26.1.105。採番は JST）。リリースは GitHub 
 - 危険な PID の拒否は `SignalSender::send` を直接呼ばず、`send_with` に「呼ばれたら失敗する」送信関数を渡して確かめる（検証が退行したときに PID 0 や -1 へ本物のシグナルが届かない）
 - 「誰も持っていないポート」には固定番号（59990 など）を使わず、実行直前に `unused_port()` で得る（一時ポートの範囲の固定番号は、ほかのアプリの UDP がたまたま使っていることがある）。外部コマンド（nc）のリスナーを使うテストは、nc が自分で終了したときだけ省略し、動いているのに検出できなければ失敗にする
 - FIFO を開いても待たないことを確かめるテストは、別スレッドで実行して `recv_timeout` の期限を過ぎたら失敗させる。後始末に FIFO の相手側をブロッキングで開いてはいけない（スレッドが既に閉じていたり panic していたりすると相手が現れず、テスト自体が止まる）
+- init の競合テストでは、親ディレクトリが同じ inode を指す symlink に置換された場合も拒否し、検証済みの既存ファイルが消えても新規作成しないことを確かめる。権限の E2E テストは子シェルだけで umask を変更し、緩い値でも権限上限を守り、厳しい値では権限を広げないことを確認する
 - プロセス一覧での生存確認は使わない。回収前の子はゾンビとして残り、Linux の sysinfo はゾンビも一覧に含めるので、終了していても「生きている」と判定してしまう。`Child::try_wait()` で確かめる

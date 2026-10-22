@@ -54,7 +54,7 @@ Claude Code などのエージェントに、`kill` / `pkill` / `killall` の代
 <!-- standard:install:start -->
 ### Cargo
 
-Rust 1.98 以上が必要です。
+Rust 1.99 以上が必要です。
 
 ```bash
 cargo install --git https://github.com/owayo/safe-kill --locked

@@ -35,7 +35,7 @@ flowchart TB
 
 12. **スレッド（TID）除外**: `sysinfo` は既定でタスク（スレッド）も列挙するため、Linux では `/proc/<pid>/task/<tid>` のスレッドが独立したプロセスとして一覧に載る。スレッドは `prctl(PR_SET_NAME)` / `pthread_setname_np` で自分の名前を自由に変更でき、TID への `kill(2)` はスレッドグループ全体へ配送される。そのため防御しないと、denylist に載せたプロセスでも「そのスレッド名」を `--name` に渡せば名前一致を回避して本体を落とせてしまう。プロセス一覧の refresh は `without_tasks()` を明示し、`ProcessesToUpdate::Some` はこの設定に関わらず TID を返すため、参照側でも `thread_kind()` が `Some` のエントリを一律に拒否する。macOS は `proc_listallpids` がプロセスのみ返すため影響を受けない。
 
-13. **設定ファイル種別と書き込みの検証**: 厳格設定読み込みと `safe-kill init` は、通常ファイルまたは通常ファイルへ解決できる symlink だけを受け入れる。壊れた symlink と特殊ファイルは I/O 前に拒否する。初期化時は検証済みの親ディレクトリを device/inode 照合後のFDで固定し、そこから `openat(O_NONBLOCK | O_NOFOLLOW)` で書き込み先を開く。取得した通常ファイルの device/inode は truncate 前に再検証し、検証時に存在しなかったパスは `O_CREAT | O_EXCL` による原子的な新規作成に限定する。FIFO での無期限待機とデバイスへの書き込みを拒否し、open 前の symlink・通常ファイル・親ディレクトリ置換は fail-closed、open 後の置換は固定済みFDへの書き込みでリダイレクトを防ぐ。
+13. **設定ファイル種別と書き込みの検証**: 厳格設定読み込みと `safe-kill init` は、通常ファイルまたは通常ファイルへ解決できる symlink だけを受け入れる。壊れた symlink と特殊ファイルは内容の読み書き前に拒否する。厳格読み込みは `O_NONBLOCK` で開いた FD が通常ファイルかを確認してから内容を読む。初期化時は検証済みの親ディレクトリを device/inode 照合後のFDで固定し、そこから `openat(O_NONBLOCK | O_NOFOLLOW)` で書き込み先を開く。取得した通常ファイルの device/inode は truncate 前に再検証し、検証時に存在しなかったパスは `O_CREAT | O_EXCL` による原子的な新規作成に限定する。FIFO での無期限待機とデバイスへの書き込みを拒否し、open 前の symlink・通常ファイル・親ディレクトリ置換は fail-closed、open 後の置換は固定済みFDへの書き込みでリダイレクトを防ぐ。
 
 14. **設定ファイルの非公開権限**: 新規設定ディレクトリは `0700`、新規 `config.toml` は `0600` を上限として作成する。権限は作成時に指定するため、`umask 000` でも allowlist・denylist・許可ポートの認可設定を他ユーザーが変更できる状態にしない。
 

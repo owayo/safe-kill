@@ -926,4 +926,43 @@ mod tests {
         assert!(!config_path.exists());
         assert!(!original_dir.join("config.toml").exists());
     }
+
+    #[test]
+    fn test_write_config_file_rejects_symlink_to_original_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_dir = temp.path().join("safe-kill");
+        let original_dir = temp.path().join("original-safe-kill");
+        fs::create_dir(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        let write_target = InitCommand::resolve_write_target(&config_path, None).unwrap();
+
+        // 同じ inode のディレクトリを指していても、検証後に symlink へ置き換わった
+        // パスは拒否する。device/inode の比較だけではこの置換を検出できない。
+        fs::rename(&config_dir, &original_dir).unwrap();
+        std::os::unix::fs::symlink(&original_dir, &config_dir).unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert!(!original_dir.join("config.toml").exists());
+    }
+
+    #[test]
+    fn test_write_config_file_does_not_recreate_removed_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.toml");
+        fs::write(&config_path, "original").unwrap();
+        let metadata = fs::symlink_metadata(&config_path).unwrap();
+        let write_target =
+            InitCommand::resolve_write_target(&config_path, Some(&metadata)).unwrap();
+
+        // 上書き対象が確認後に消えた場合は、新規作成へ切り替えない。
+        // エラーを返す前に空の設定を作ると、後続の読み込みで既定値が有効になる。
+        fs::remove_file(&config_path).unwrap();
+
+        let result = InitCommand::write_config_file(&write_target, "replacement");
+
+        assert!(matches!(result, Err(SafeKillError::ConfigCreationError(_))));
+        assert!(!config_path.exists());
+    }
 }

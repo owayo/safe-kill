@@ -54,7 +54,7 @@ It takes the place of `kill` / `pkill` / `killall` for agents such as Claude Cod
 <!-- standard:install:start -->
 ### Cargo
 
-Requires Rust 1.98 or later.
+Requires Rust 1.99 or later.
 
 ```bash
 cargo install --git https://github.com/owayo/safe-kill --locked
